@@ -103,6 +103,7 @@ fn authenticated_cli_shutdown_stops_controller_and_allows_restart() {
     let first_status = wait_until_ready(state_dir);
     let first_json: serde_json::Value = serde_json::from_slice(&first_status.stdout).unwrap();
     let first_instance = first_json["instance_id"].as_str().unwrap().to_owned();
+    let first_controller_id = first_json["controller_id"].as_str().unwrap().to_owned();
 
     let shutdown = run_shutdown(state_dir);
     assert!(
@@ -120,6 +121,10 @@ fn authenticated_cli_shutdown_stops_controller_and_allows_restart() {
         restarted_json["instance_id"].as_str().unwrap(),
         first_instance
     );
+    assert_eq!(
+        restarted_json["controller_id"].as_str().unwrap(),
+        first_controller_id
+    );
 }
 
 #[test]
@@ -131,6 +136,7 @@ fn second_controller_becomes_client_and_crash_recovery_reclaims_ownership() {
     let first_status = wait_until_ready(state_dir);
     let first_json: serde_json::Value = serde_json::from_slice(&first_status.stdout).unwrap();
     let first_instance = first_json["instance_id"].as_str().unwrap().to_owned();
+    let first_controller_id = first_json["controller_id"].as_str().unwrap().to_owned();
 
     let devices = run_devices(state_dir);
     assert!(
@@ -166,4 +172,8 @@ fn second_controller_becomes_client_and_crash_recovery_reclaims_ownership() {
         serde_json::from_slice(&recovered_status.stdout).unwrap();
     let recovered_instance = recovered_json["instance_id"].as_str().unwrap();
     assert_ne!(recovered_instance, first_instance);
+    assert_eq!(
+        recovered_json["controller_id"].as_str().unwrap(),
+        first_controller_id
+    );
 }

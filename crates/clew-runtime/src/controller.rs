@@ -6,6 +6,7 @@ use std::{
 };
 
 use clew_core::STATE_SCHEMA_VERSION;
+use clew_identity::{ControllerIdentityStore, DeviceIdentityStoreError};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
@@ -121,6 +122,9 @@ pub async fn start_controller(
         }
     };
 
+    let controller_identity = ControllerIdentityStore::new(layout.clone()).load_or_create()?;
+    let controller_id = controller_identity.identity().controller_id();
+
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
     let started_unix_ms = SystemTime::now()
@@ -133,6 +137,7 @@ pub async fn start_controller(
     let state = Arc::new(LocalApiState {
         status: ControllerStatus {
             ready: true,
+            controller_id,
             pid: std::process::id(),
             instance_id,
             started_unix_ms,
@@ -155,6 +160,8 @@ pub async fn start_controller(
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
+    #[error(transparent)]
+    IdentityStore(#[from] DeviceIdentityStoreError),
     #[error("controller I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]

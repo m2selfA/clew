@@ -110,6 +110,28 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn pending_device_identity_path(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("device-key.pending.json")
+    }
+
+    #[must_use]
+    pub fn active_device_identity_path(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("device-key.json")
+    }
+
+    #[must_use]
     pub fn device_record_path(
         &self,
         controller_id: ControllerId,
@@ -233,6 +255,26 @@ mod tests {
             PathBuf::from("state-root")
                 .join("v1")
                 .join("controller.sock")
+        );
+        assert_eq!(
+            layout.pending_device_identity_path(controller, site),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("memberships")
+                .join(controller.to_string())
+                .join(site.to_string())
+                .join("host")
+                .join("device-key.pending.json")
+        );
+        assert_eq!(
+            layout.active_device_identity_path(controller, site),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("memberships")
+                .join(controller.to_string())
+                .join(site.to_string())
+                .join("host")
+                .join("device-key.json")
         );
         assert_eq!(
             layout.device_record_path(controller, site, device),

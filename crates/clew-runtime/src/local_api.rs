@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use clew_core::{DeviceSummary, StateLayout};
+use clew_core::{ControllerId, DeviceSummary, StateLayout};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -28,6 +28,7 @@ const SECRET_LOAD_RETRY_DELAY: Duration = Duration::from_millis(25);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControllerStatus {
     pub ready: bool,
+    pub controller_id: ControllerId,
     pub pid: u32,
     pub instance_id: String,
     pub started_unix_ms: u64,
@@ -402,6 +403,7 @@ mod tests {
         LocalApiState {
             status: ControllerStatus {
                 ready: true,
+                controller_id: ControllerId::new(),
                 pid: 42,
                 instance_id: "instance".into(),
                 started_unix_ms: 1,
