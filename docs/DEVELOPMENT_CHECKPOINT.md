@@ -49,7 +49,7 @@
 |---|---|---|---|
 | P0 | 开工前仓库/文档基线 | DONE | checkpoint、repo hygiene、Rust baseline validation、首个基线 commit |
 | V0.1 | Stable IDs / state / proto skeleton | DONE | 类型与 schema 可编译、序列化边界有测试 |
-| V0.2 | Controller single-instance + Local API | TODO | 第二进程能查询状态，不能产生第二份 ownership |
+| V0.2 | Controller single-instance + Local API | DONE | 第二进程能查询状态，不能产生第二份 ownership |
 | V0.3 | Controller GUI shell | TODO | GUI 空列表/ready 状态来自 Local API，不直接持有网络状态 |
 | V1.1 | ControllerKey / DeviceKey / enrollment | TODO | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
 | V1.2 | Site Kit / Host lifecycle / naming | TODO | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
@@ -160,23 +160,57 @@ V0.1 至此允许进入 V0.2。
 
 ### V0.2 — Controller Single Instance + Local API
 
-**Status：TODO**
+**Status：DONE**
 
-计划：
+**Date：2026-09-01**
 
-- Controller runtime 唯一 ownership；
-- 本机 state lock/single-instance；
-- Local API transport 与权限边界；
-- `controller.status`、`device.list` 等第一批 read-only API；
-- CLI 第二进程自动连接已有 Controller，而不是另建 runtime；
-- graceful shutdown / stale-lock recovery。
+实际落地：
+
+- 新增真正进入 vertical slice 的 `clew-runtime` crate；Controller runtime 成为 Local API listener 与本机 ownership 的唯一 owner，没有提前引入 iroh/session/GUI；
+- 使用 Rust 标准库跨平台 file lock 持有 `v1/controller.lock`；lock 文件可以残留，但进程退出/崩溃后内核锁自动释放，下一实例可安全重新取得 ownership；
+- shutdown 析构顺序显式保证 Local API listener/state 先销毁，`ControllerOwnership` 最后释放，避免新实例在旧 endpoint 尚未完全关闭时抢到 owner；
+- Windows Local API 使用 `\\.\\pipe\\clew-controller-<state-root-hash>` named pipe，并显式 `reject_remote_clients(true)` / first-pipe-instance；
+- Unix Local API 使用 `v1/controller.sock` UDS，state version dir 设为 `0700`、socket/credential 设为 `0600`；
+- Local API 再叠加每次 Controller 启动随机轮换的 256-bit credential；secret `Debug` 固定脱敏，默认放在 OS-user state scope；
+- Local API v1 使用 4-byte length-prefixed bounded JSON frame，hard frame limit 1 MiB、最多 16 个并发 connection、单次 I/O 2 秒 timeout；未认证/半帧连接不能无界占用 handler；
+- 第一批只读方法落地为 `controller.status` / `device.list`；当前 DeviceRegistry 尚未进入 V1，因此 `device.list` 正确返回空列表；
+- 根 `clew` CLI 落地 `controller` / `status` / `devices`：第二个 `clew controller` 遇到已有 owner 时转为 Local API client，查询同一个 instance 后退出，不创建第二份 runtime；
+- graceful shutdown 会停止 listener/handler 并释放 ownership；异常 kill 后同一 state dir 可以直接重启。
+
+主要路径：
+
+- `crates/clew-runtime/src/{config,lock,transport,local_api,controller}.rs`
+- `crates/clew-core/src/state.rs`
+- `src/main.rs`
+- `tests/controller_cli.rs`
+- `Cargo.toml` / `Cargo.lock`
 
 Acceptance：
 
-- 启动第二个 Controller 不能形成平行 state owner；
-- 第二进程可以通过 Local API 查询 ready/status；
-- Local API 默认只绑定本机且有平台权限边界；
-- stale lock/异常退出有回归测试。
+- [x] 启动第二个 Controller 不能形成平行 state owner；
+- [x] 第二进程可以通过 Local API 查询 ready/status，并可查询 `device.list`；
+- [x] Local API 默认只使用本机 IPC；Windows 拒绝 remote named-pipe client，Unix 使用 private UDS；两侧均叠加 state-scope credential；
+- [x] graceful shutdown 后可重新取得 owner；stale lock/异常 kill 后可恢复；
+- [x] Local API frame/concurrency/I-O 全部有硬边界。
+
+Validation evidence：
+
+- Windows/cap00 真实跨进程 integration：PASS；第一个 `clew controller` 启动后 `clew status` / `clew devices` 通过，第二个 `clew controller` 返回 `already running` 且 instance id 与第一实例一致；
+- 同一 integration 强制 kill 第一 Controller 后，复用同一 state dir 再启动：PASS，新 instance id 正常生成，证明 stale lock file 不保留 ownership；
+- runtime 单测覆盖 graceful shutdown/reacquire、parallel ownership rejection、stale lock recovery、Local API auth、oversized frame、Windows local pipe name；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS：root integration 1 + `clew-core` 14 + `clew-proto` 6 + `clew-runtime` 7 = **28 tests passed**；
+- `cargo check --workspace --all-targets --target x86_64-linux-android`：PASS，用现有 Unix target 静态覆盖 `cfg(unix)` UDS/permission 路径；
+- 独立 review 后补上两处 hardening：16-connection/2s-I/O bound，以及 listener-before-ownership 的 shutdown drop ordering。
+
+Known / deferred：
+
+- 本轮实际运行 smoke 是 **Windows named pipe**；cap00 没有 Linux/macOS desktop runner。Unix 路径已有 cross-target compile gate，但 Linux/macOS 的真实 UDS runtime smoke 仍缺失，后续拿到对应 runner 时补证据；
+- Windows credential 的默认权限边界依赖 `%LOCALAPPDATA%` 当前 OS user 的 ACL，再配合 local-only named pipe 与随机 credential；显式 `--state-dir` 是开发/测试 override，调用者应放在受当前用户保护的目录；
+- 本块没有实现自动拉起 Controller、GUI/tray、ControllerKey、DeviceRegistry 持久化或远端网络；GUI 属于 V0.3，身份/设备/网络属于 V1；
+- commit subject：`feat: add v0.2 controller local api`。
+
+V0.2 至此允许进入 V0.3。
 
 ### V0.3 — Controller GUI Shell
 
@@ -449,13 +483,14 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V0.1 — Stable IDs / State / Proto Skeleton（DONE）**
+**Current block：V0.2 — Controller Single Instance + Local API（DONE）**
 
-**Next block：V0.2 — Controller Single Instance + Local API**
+**Next block：V0.3 — Controller GUI Shell**
 
-V0.1 已把身份/设备/Site/state/wire 的最小稳定骨架收口。下一块只进入 Controller 单实例与本机 API，不穿插 GUI、iroh、Connector、Studio、Service Runtime 或第二 transport。
+V0.2 已把 Controller 唯一 ownership、本机 IPC、第一批 read-only Local API 和 crash/stale-lock recovery 收口。下一块只建立 Controller GUI shell，并坚持 GUI 只消费 Local API；不提前把 iroh/session state 塞进 GUI。
 
 ### Change log
 
+- **2026-09-01** — V0.2 DONE：新增 `clew-runtime`、跨平台 single-owner file lock、Windows named pipe/Unix UDS Local API、local auth + bounds、CLI client 化与真实 Windows 跨进程 crash-recovery smoke；下一块冻结为 V0.3。
 - **2026-09-01** — V0.1 DONE：建立 `clew-core` / `clew-proto`、稳定 ID/DeviceTag/state layout/proto skeleton 与 20 个边界测试；下一块冻结为 V0.2。
 - **2026-09-01** — 建立 Architecture v1.5 正式开发计划；登记 P0 基线维护；下一块冻结为 V0.1。

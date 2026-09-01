@@ -87,6 +87,21 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn controller_lock_path(&self) -> PathBuf {
+        self.version_root().join("controller.lock")
+    }
+
+    #[must_use]
+    pub fn local_api_secret_path(&self) -> PathBuf {
+        self.version_root().join("local-api.secret")
+    }
+
+    #[must_use]
+    pub fn local_api_socket_path(&self) -> PathBuf {
+        self.version_root().join("controller.sock")
+    }
+
+    #[must_use]
     pub fn membership_dir(&self, controller_id: ControllerId, site_id: SiteId) -> PathBuf {
         self.version_root()
             .join("memberships")
@@ -200,6 +215,24 @@ mod tests {
             PathBuf::from("state-root")
                 .join("v1")
                 .join("controller.json")
+        );
+        assert_eq!(
+            layout.controller_lock_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("controller.lock")
+        );
+        assert_eq!(
+            layout.local_api_secret_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("local-api.secret")
+        );
+        assert_eq!(
+            layout.local_api_socket_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("controller.sock")
         );
         assert_eq!(
             layout.device_record_path(controller, site, device),
