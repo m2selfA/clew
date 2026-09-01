@@ -132,6 +132,17 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn host_membership_marker_path(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("membership.json")
+    }
+
+    #[must_use]
     pub fn device_record_path(
         &self,
         controller_id: ControllerId,

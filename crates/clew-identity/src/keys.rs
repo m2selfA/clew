@@ -6,6 +6,7 @@ use thiserror::Error;
 use clew_core::{ControllerId, StableIdError};
 
 const CONTROLLER_ID_DOMAIN: &[u8] = b"clew/controller-id/v1\0";
+const SITE_CONFIG_SIGNATURE_DOMAIN: &[u8] = b"clew/site-config-signature/v1\0";
 
 #[derive(Clone)]
 pub struct ControllerIdentity {
@@ -74,6 +75,10 @@ impl ControllerIdentity {
         }
     }
 
+    pub fn sign_site_config<T: Serialize>(&self, payload: &T) -> Result<Vec<u8>, IdentityError> {
+        self.sign_payload(SITE_CONFIG_SIGNATURE_DOMAIN, payload)
+    }
+
     pub(crate) fn secret_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
@@ -100,6 +105,14 @@ impl ControllerPublicIdentity {
             return Err(IdentityError::WeakPublicKey);
         }
         Ok(())
+    }
+
+    pub fn verify_site_config<T: Serialize>(
+        &self,
+        payload: &T,
+        signature: &[u8],
+    ) -> Result<(), IdentityError> {
+        self.verify_payload(SITE_CONFIG_SIGNATURE_DOMAIN, payload, signature)
     }
 
     pub(crate) fn verify_payload<T: Serialize>(

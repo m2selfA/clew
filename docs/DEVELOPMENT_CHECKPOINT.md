@@ -52,7 +52,7 @@
 | V0.2 | Controller single-instance + Local API | DONE | 第二进程能查询状态，不能产生第二份 ownership |
 | V0.3 | Controller GUI shell | DONE | GUI 空列表/ready 状态来自 Local API，不直接持有网络状态 |
 | V1.1 | ControllerKey / DeviceKey / enrollment | DONE | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
-| V1.2 | Site Kit / Host lifecycle / naming | TODO | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
+| V1.2 | Site Kit / Host lifecycle / naming | DONE | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
 | V1.3 | Direct iroh + InnerSession E2E | TODO | Controller/Target 双向认证，业务 payload 全部在 inner ciphertext |
 | V1.4 | Bounded Read + v1 control plane | TODO | 两台真实机器 Read；Activity/revoke/backup 最小闭环 |
 | V1.25 | Distribution Studio foundation | TODO | preset → preview → branded Site Kit，不增加朋友步骤 |
@@ -302,26 +302,51 @@ V1.1 至此允许进入 V1.2。
 
 ### V1.2 — Site Kit + Host Lifecycle + Naming
 
-**Status：TODO**
+**Status：DONE**
 
-计划：
+**Date：2026-09-01**
 
-- per-platform Site Kit contract；
-- stable runtime + signed `site.clew` sidecar；
-- sidecar 固定查找/恢复顺序；
-- OS-user state store 与 membership reuse；
-- Host 单实例；第二次启动只唤起已有窗口；
-- hostname default name + 5-char DeviceTag collision handling；
-- Windows/macOS Host window + tray/menu bar 基础状态；
-- Linux `--foreground` 基础路径；
-- Clew Original `UiResources/OutfitRuntimeView` 抽象，不做 Studio。
+实际落地：
+
+- 新增 `clew-host` crate，建立 per-platform Site Kit contract：Windows `Clew.exe + site.clew`、macOS `Clew.app + site.clew`、Linux `Clew + site.clew`，并以 `ClientFlavor(runtime/platform/arch/outfit/revision)` fingerprint 防止 sidecar 被错误 runtime/outfit 消费；
+- `site.clew` 使用 ControllerKey domain-separated Ed25519 signature，并嵌套 V1.1 signed bootstrap；读取前有 1 MiB hard bound、版本 header 预检、ClientFlavor fingerprint 与 Controller signature 双重校验；
+- Host 固定查找顺序落地为：显式 `--site`/GUI 拖入或选择 → executable/app sibling `site.clew` → 当前 OS-user state 中唯一可恢复 membership → 固定 MissingInvite recovery UI；不扫描全盘、不猜 cwd；
+- active membership 保存 Controller pin、Site/Invite、DeviceId、ClientFlavor 与 DeviceRecord，并与 V1.1 active DeviceKey/DeviceRecord 交叉校验；sidecar 丢失时可由唯一 membership 恢复，同 machine/user/site 重开复用原 DeviceId/DeviceKey；
+- Host single-instance 使用 `(ControllerId, SiteId)` domain-separated instance key + 内核 file lock + local-only named pipe/UDS wake channel；第二次启动只向现有实例发 authenticated `wake`，不形成第二个长期 owner；
+- Windows named pipe 明确 `reject_remote_clients(true)`，Unix runtime dir/socket/secret 使用 0700/0600；wake frame 4 KiB、I/O 2 秒、retry window 5 秒，避免本机 IPC 无界阻塞；
+- 默认设备名取 hostname；generic hostname 使用平台人话 fallback。自动 hostname 发生碰撞时整个 collision group 切换到稳定 5-char Crockford DeviceTag；已 tagged 名称即使 peer 消失也保持 tagged，不退回裸 hostname，也不使用 `(2)`；显式 rename 不被自动 collision policy 覆盖；
+- executable selector 支持 DeviceId、`SiteName/DeviceName`、唯一 short name；只在 online + executable 集合中匹配，helper-only 明确返回 `NotExecutable`，歧义返回候选而不是取第一个；
+- 根 CLI 新增 `clew host --site ... [--foreground]`；Windows/macOS 使用可见 Host GUI + tray，关闭窗口只隐藏，第二次启动唤醒/聚焦已有窗口，显式“退出并断开”才结束；Linux 默认/`--foreground` 走可观察终端路径；
+- 建立 `UiResources` / `OutfitRuntimeView::clew_original()`，MissingInvite/解压提示/Host 基础文案从资源层读取，为 V1.25 Studio 留接口但不提前实现 Studio。
 
 Acceptance：
 
-- 程序与 `site.clew` 被拆开时出现固定人话恢复页；
-- 同 machine/user/site 重开不产生第二个 DeviceId；
-- 同 hostname 冲突显示稳定 `GPU-01-K7M4Q` 类名字而非序号；
-- helper-only capability 不进入 executable selector。
+- [x] 程序与 `site.clew` 被拆开时进入固定 MissingInvite 人话恢复页；archive-temp 检测时额外提示“先全部解压”；
+- [x] 同 machine/user/site 重开 pending/active identity 均复用，不产生第二个 DeviceId/DeviceKey；
+- [x] 同 hostname collision 显示稳定 `GPU-01-XXXXX` 形式 5-char DeviceTag，不使用序号后缀；peer 消失后仍保持 tagged；
+- [x] helper-only capability 不进入 executable selector；DeviceId 直选 helper 也 fail closed；
+- [x] 第二 Host 在 primary ready 后只发送 authenticated wake，primary 退出后才可重新取得 owner；
+- [x] Windows Host GUI/tray 实机 smoke 通过，关闭/第二启动生命周期与设计一致。
+
+Validation evidence：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**60 tests passed**，另 1 个 Windows interactive smoke 默认 ignored；其中 `clew-host` 14 tests，root Host/Controller integration 3 tests；
+- Host 覆盖：signed sidecar roundtrip/tamper、per-platform Site Kit、fixed lookup order、missing-invite copy、unique membership recovery、membership/DeviceId reuse、hostname collision/tag persistence/rename、helper-only selector、single-instance wake/reacquire；
+- Windows/cap00 真实 GUI smoke：`windows_host_gui_and_tray_smoke` 使用 `--ignored --exact` 单独执行，**1/1 PASS**；Host window/tray 初始化后第二 `clew host` 返回 already running 并唤醒已有实例；
+- `cargo check --workspace --all-targets --target x86_64-linux-android`：PASS，Unix Host foreground/UDS/state permission cfg 路径 **0 warnings**；
+- integration 初版曾把 pending DeviceKey 当作 primary-ready 同步点，暴露并发 launch test race；已改为等待 Host runtime secret/lock ready，再验证 second-instance wake，focused regression PASS。
+
+Known / deferred：
+
+- V1.2 只完成 Site Kit/Host lifecycle 与本机 identity reuse；Host 还不会主动连接远端 Controller 或完成真实 network enrollment，网络与 InnerSession 属于 V1.3；
+- macOS GUI/menu-bar 代码已按相同 desktop cfg 编译结构实现，但当前 cap00 没有 macOS 真机 runner，仍需后续平台 smoke；
+- Windows/macOS 当前 Clew 图标仍是程序生成 placeholder；正式 branding/outfit asset pipeline 属于 V1.25/V6；
+- Host GUI 的 invitation enrollment 状态目前停留在“signed invitation verified / waiting Controller”，直到 V1.3 data plane 接入；
+- commit subject：`feat: add v1.2 host site kit lifecycle`。
+
+V1.2 至此允许进入 V1.3。
 
 ### V1.3 — Direct iroh + InnerSession E2E
 
@@ -531,14 +556,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.1 — Identity + Enrollment（DONE）**
+**Current block：V1.2 — Site Kit + Host Lifecycle + Naming（DONE）**
 
-**Next block：V1.2 — Site Kit + Host Lifecycle + Naming**
+**Next block：V1.3 — Direct iroh + InnerSession E2E**
 
-V1.1 已把 Controller/Device 长期身份、signed bootstrap、claim/半提交恢复与 encrypted backup/Recovery Review 核心收口。下一块立即把这些能力接到真实 Site Kit/Host lifecycle：sidecar lookup、membership reuse、Host 单实例、稳定命名与基础 Host UI；仍不提前进入 iroh data plane。
+V1.2 已把 V1.1 identity 接到真实 Host/Site Kit lifecycle：signed sidecar、固定恢复顺序、membership reuse、Host 单实例/唤醒、稳定命名、helper-only selector 与 Windows GUI/tray 均已闭环。下一块立即进入 direct iroh outer transport + Target↔Controller InnerSession；Connector 仍不提前介入。
 
 ### Change log
 
+- **2026-09-01** — V1.2 DONE：新增 `clew-host`、signed `site.clew`/ClientFlavor、fixed sidecar recovery、OS-user membership reuse、Host single-instance wake、stable DeviceTag naming、helper-safe selector、Windows Host GUI/tray 与 Linux foreground；下一块冻结为 V1.3。
 - **2026-09-01** — V1.1 DONE：新增 `clew-identity`、Ed25519 Controller/Device identity、signed bootstrap/enrollment、half-commit recovery、Argon2id + XChaCha20-Poly1305 backup skeleton，并把稳定 ControllerId 接入 runtime/Local API；下一块冻结为 V1.2。
 - **2026-09-01** — V0.3 DONE：新增 Controller GUI/tray shell、GUI auto-start + Local API adapter、authenticated `controller.shutdown` 与 Windows desktop runtime smoke；下一块冻结为 V1.1。
 - **2026-09-01** — V0.2 DONE：新增 `clew-runtime`、跨平台 single-owner file lock、Windows named pipe/Unix UDS Local API、local auth + bounds、CLI client 化与真实 Windows 跨进程 crash-recovery smoke；下一块冻结为 V0.3。
