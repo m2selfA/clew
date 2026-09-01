@@ -48,7 +48,7 @@
 | Block | 目标 | Status | 核心验收 |
 |---|---|---|---|
 | P0 | 开工前仓库/文档基线 | DONE | checkpoint、repo hygiene、Rust baseline validation、首个基线 commit |
-| V0.1 | Stable IDs / state / proto skeleton | TODO | 类型与 schema 可编译、序列化边界有测试 |
+| V0.1 | Stable IDs / state / proto skeleton | DONE | 类型与 schema 可编译、序列化边界有测试 |
 | V0.2 | Controller single-instance + Local API | TODO | 第二进程能查询状态，不能产生第二份 ownership |
 | V0.3 | Controller GUI shell | TODO | GUI 空列表/ready 状态来自 Local API，不直接持有网络状态 |
 | V1.1 | ControllerKey / DeviceKey / enrollment | TODO | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
@@ -108,28 +108,55 @@ P0 至此允许进入 V0.1。
 
 ### V0.1 — Stable IDs / State / Proto Skeleton
 
-**Status：TODO**
+**Status：DONE**
+
+**Date：2026-09-01**
 
 目标是先建立后面所有 vertical slice 共用、但不掺入网络实现的最小数据骨架。
 
-计划：
+实际落地：
 
-- 只在真实需要时拆 compact workspace/crates，优先保持：`clew`、`clew-core`、`clew-proto`、`clew-runtime`、`clew-mcp`；
-- 禁止此时创建 `transport-ts`、`directory`、`gw` 等空抽象；
-- `ControllerId` / `SiteId` / `DeviceId` 强类型；
-- `SiteMember` + `EXECUTE/CONNECTOR` capabilities；
-- `DeviceSummary` / `DeviceRecord`，包含 `enrolled_via_invite_id`；
-- 5 字符 `DeviceTag` 派生与冲突重派规则；
-- state-store layout/version skeleton；
-- wire major / capability version / Hello / Envelope / Error proto skeleton；
-- schema/serialization roundtrip 与 malformed-input 测试。
+- 根包升级为 compact Cargo workspace；本块只新增真实需要的 `crates/clew-core` 与 `crates/clew-proto`，没有提前创建 `runtime` / `mcp` / transport / directory / gw 空 crate；
+- `clew-core` 建立 `ControllerId` / `SiteId` / `DeviceId` / `InviteId` 强类型 UUID 边界，拒绝 nil / 错误长度输入；
+- 建立 `SiteMember`、`MemberCapabilities { execute, connector }`、`DeviceRecord` / `DeviceSummary`，并保留 `enrolled_via_invite_id` provenance；
+- 建立 domain-separated 5 字符 Crockford Base32 `DeviceTag`：仅由 `DeviceId + tag_generation` 派生，不读取 hostname/MAC/序列号等信息；碰撞时确定性递增 generation，显示长度不变；
+- 建立 versioned state envelope 与 `v1/` state layout skeleton，membership 路径显式按 Controller/Site/Device scope；同 schema version 容忍未知字段，未知 schema version fail closed；
+- state JSON encode/decode 在 serde 前后都有 16 MiB document hard limit；
+- `clew-proto` 使用 `proto3 + prost` 建立 `clew/1` 的 Hello、PeerRole、Feature、Request/Response Envelope、Error/ErrorCode skeleton；
+- wire validator 固化 wire-major、ID、role、peer-advertised frame/concurrency bounds；未知正数 feature 保留以支持同一 wire major 内前向兼容；
+- protobuf decode/encode 入口在 prost 前执行 16 MiB hard frame limit；build 使用 vendored `protoc`，不依赖开发机全局安装版本。
+
+主要路径：
+
+- `crates/clew-core/src/{id,device,naming,state}.rs`
+- `crates/clew-proto/proto/clew/v1/clew.proto`
+- `crates/clew-proto/src/validate.rs`
+- `crates/clew-proto/build.rs`
+- `Cargo.toml` / `Cargo.lock`
 
 Acceptance：
 
-- IDs 不以 hostname/IP 充当身份；
-- DeviceTag 定长、稳定、非安全凭据，冲突路径有确定性测试；
-- wire/state schema 可演进字段有版本边界；
-- `cargo fmt/check/test` 全通过。
+- [x] IDs 不以 hostname/IP 充当身份；
+- [x] DeviceTag 定长、稳定、非安全凭据，冲突路径有确定性测试；
+- [x] wire/state schema 有明确版本边界与前向兼容测试；
+- [x] malformed/truncated/oversized serialization input 有 fail-closed 测试；
+- [x] workspace `fmt/check/test` 全通过。
+
+Validation evidence：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，`clew-core` 14 + `clew-proto` 6 = **20 tests passed**；根 binary 仍为 0 tests；
+- 覆盖：typed ID roundtrip/nil/length、helper-only capability projection、DeviceTag 稳定性/碰撞重派/字符集、state version/unknown field/malformed/oversize、Hello unknown feature roundtrip、wire major/ID/bounds、truncated/oversize protobuf；
+- 独立 review 后补上 state/proto **decode-before-parse size guard**，避免只验证字段却允许无界 document/frame 先进入 parser。
+
+Known / deferred：
+
+- 本块刻意没有实现 Controller runtime、Local API、持久锁、GUI、iroh、enrollment 或 Connector；这些分别属于 V0.2+ / V1+；
+- `src/main.rs` 仍是占位入口，V0.2 才开始把根 `clew` 接到 Controller/Local API vertical slice；
+- commit subject：`feat: establish v0.1 data and protocol skeleton`。
+
+V0.1 至此允许进入 V0.2。
 
 ### V0.2 — Controller Single Instance + Local API
 
@@ -407,11 +434,11 @@ Packaging smoke 应在早期按需进行；V6 是发布级收口，不是第一�
 
 ```text
 cargo fmt -- --check
-cargo check --all-targets
-cargo test --all-targets
+cargo check --workspace --all-targets
+cargo test --workspace --all-targets
 ```
 
-随着 workspace/crate 增加，升级为 workspace/all-targets 对应命令。涉及平台、网络和 GUI 的 block 必须增加实际平台 smoke，不能用 unit test 代替全部验收。
+V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/all-targets。涉及平台、网络和 GUI 的 block 必须增加实际平台 smoke，不能用 unit test 代替全部验收。
 
 提交前还要完成：
 
@@ -422,11 +449,13 @@ cargo test --all-targets
 
 ## 17. 当前 checkpoint
 
-**Current block：P0 — 正式开发前基线维护（DONE，本次 baseline commit）**
-**Next block：V0.1 — Stable IDs / State / Proto Skeleton**
+**Current block：V0.1 — Stable IDs / State / Proto Skeleton（DONE）**
 
-尚未开始功能实现。首个 baseline commit 完成后，正式开发从 V0.1 开始；不要在 V0/V1 direct Read 之前穿插 Connector、Studio、Service Runtime 或第二 transport。
+**Next block：V0.2 — Controller Single Instance + Local API**
+
+V0.1 已把身份/设备/Site/state/wire 的最小稳定骨架收口。下一块只进入 Controller 单实例与本机 API，不穿插 GUI、iroh、Connector、Studio、Service Runtime 或第二 transport。
 
 ### Change log
 
+- **2026-09-01** — V0.1 DONE：建立 `clew-core` / `clew-proto`、稳定 ID/DeviceTag/state layout/proto skeleton 与 20 个边界测试；下一块冻结为 V0.2。
 - **2026-09-01** — 建立 Architecture v1.5 正式开发计划；登记 P0 基线维护；下一块冻结为 V0.1。

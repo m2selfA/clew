@@ -1,0 +1,14 @@
+[package]
+name = "clew-proto"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+clew-core = { path = "../clew-core" }
+prost.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true

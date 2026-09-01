@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package clew.v1;
+
+message Hello {
+  uint32 wire_major = 1;
+  uint64 capability_version = 2;
+  string software_version = 3;
+  PeerRole role = 4;
+  optional bytes device_id = 5;
+  repeated Feature features = 6;
+  uint32 max_frame_size = 7;
+  uint32 max_concurrent_requests = 8;
+}
+
+enum PeerRole {
+  PEER_ROLE_UNSPECIFIED = 0;
+  PEER_ROLE_HOST = 1;
+  PEER_ROLE_CONTROLLER = 2;
+}
+
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+  FEATURE_TOOL_RPC = 1;
+  FEATURE_SHELL_TASK = 2;
+  FEATURE_FORWARD = 3;
+  FEATURE_SOCKS5 = 4;
+  FEATURE_HTTP_CONNECT = 5;
+  FEATURE_FILE_RESUME = 6;
+}
+
+message RequestEnvelope {
+  bytes request_id = 1;
+  optional bytes trace_id = 2;
+  optional uint64 deadline_ms = 3;
+
+  oneof body {
+    PingRequest ping = 10;
+  }
+}
+
+message PingRequest {}
+
+message ResponseEnvelope {
+  bytes request_id = 1;
+
+  oneof result {
+    Success success = 10;
+    Error error = 11;
+  }
+}
+
+message Success {}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  ERROR_CODE_UNSUPPORTED_VERSION = 2;
+  ERROR_CODE_NOT_FOUND = 3;
+  ERROR_CODE_CONFLICT = 4;
+  ERROR_CODE_PERMISSION_DENIED = 5;
+  ERROR_CODE_DEVICE_NOT_EXECUTABLE = 6;
+  ERROR_CODE_DEADLINE_EXCEEDED = 7;
+  ERROR_CODE_CANCELLED = 8;
+  ERROR_CODE_INTERNAL = 9;
+}
