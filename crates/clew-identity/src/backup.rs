@@ -53,7 +53,7 @@ impl ControllerBackupPayload {
         }
         Ok(Self {
             controller_secret_key: stored.identity().secret_bytes(),
-            transport_identity_secret: stored.transport_identity_secret(),
+            transport_identity_secret: stored.noise_static_secret(),
             registry,
             created_unix_ms,
         })

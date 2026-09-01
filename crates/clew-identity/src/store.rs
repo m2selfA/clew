@@ -44,7 +44,8 @@ impl StoredControllerIdentity {
         self.identity.public_identity()
     }
 
-    pub(crate) fn transport_identity_secret(&self) -> [u8; 32] {
+    #[must_use]
+    pub fn noise_static_secret(&self) -> [u8; 32] {
         self.transport_identity_secret
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "clew-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clew-core = { path = "../clew-core" }
+clew-identity = { path = "../clew-identity" }
+clew-proto = { path = "../clew-proto" }
+iroh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

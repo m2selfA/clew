@@ -1,4 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -7,6 +8,8 @@ use clew_core::{ControllerId, StableIdError};
 
 const CONTROLLER_ID_DOMAIN: &[u8] = b"clew/controller-id/v1\0";
 const SITE_CONFIG_SIGNATURE_DOMAIN: &[u8] = b"clew/site-config-signature/v1\0";
+const SESSION_BINDING_SIGNATURE_DOMAIN: &[u8] = b"clew/inner-session-binding/v1\0";
+const DEVICE_NOISE_STATIC_INFO: &[u8] = b"clew/device-noise-static/v1";
 
 #[derive(Clone)]
 pub struct ControllerIdentity {
@@ -79,6 +82,13 @@ impl ControllerIdentity {
         self.sign_payload(SITE_CONFIG_SIGNATURE_DOMAIN, payload)
     }
 
+    pub fn sign_session_binding<T: Serialize>(
+        &self,
+        payload: &T,
+    ) -> Result<Vec<u8>, IdentityError> {
+        self.sign_payload(SESSION_BINDING_SIGNATURE_DOMAIN, payload)
+    }
+
     pub(crate) fn secret_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
@@ -113,6 +123,14 @@ impl ControllerPublicIdentity {
         signature: &[u8],
     ) -> Result<(), IdentityError> {
         self.verify_payload(SITE_CONFIG_SIGNATURE_DOMAIN, payload, signature)
+    }
+
+    pub fn verify_session_binding<T: Serialize>(
+        &self,
+        payload: &T,
+        signature: &[u8],
+    ) -> Result<(), IdentityError> {
+        self.verify_payload(SESSION_BINDING_SIGNATURE_DOMAIN, payload, signature)
     }
 
     pub(crate) fn verify_payload<T: Serialize>(
@@ -156,6 +174,23 @@ impl DeviceIdentity {
         }
     }
 
+    pub fn sign_session_binding<T: Serialize>(
+        &self,
+        payload: &T,
+    ) -> Result<Vec<u8>, IdentityError> {
+        let message = signed_message(SESSION_BINDING_SIGNATURE_DOMAIN, payload)?;
+        Ok(self.signing_key.sign(&message).to_bytes().to_vec())
+    }
+
+    #[must_use]
+    pub fn noise_static_secret(&self) -> [u8; 32] {
+        let hkdf = Hkdf::<Sha256>::new(None, &self.signing_key.to_bytes());
+        let mut secret = [0_u8; 32];
+        hkdf.expand(DEVICE_NOISE_STATIC_INFO, &mut secret)
+            .expect("32-byte HKDF expansion is valid for SHA-256");
+        secret
+    }
+
     pub(crate) fn secret_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
@@ -169,6 +204,21 @@ impl DevicePublicIdentity {
             return Err(IdentityError::WeakPublicKey);
         }
         Ok(())
+    }
+
+    pub fn verify_session_binding<T: Serialize>(
+        &self,
+        payload: &T,
+        signature: &[u8],
+    ) -> Result<(), IdentityError> {
+        self.validate()?;
+        let key = VerifyingKey::from_bytes(&self.public_key)
+            .map_err(|_| IdentityError::InvalidPublicKey)?;
+        let signature = Signature::from_slice(signature)
+            .map_err(|_| IdentityError::InvalidSignatureLength(signature.len()))?;
+        let message = signed_message(SESSION_BINDING_SIGNATURE_DOMAIN, payload)?;
+        key.verify_strict(&message, &signature)
+            .map_err(|_| IdentityError::InvalidSignature)
     }
 }
 
@@ -239,6 +289,19 @@ mod tests {
         let replacement = ControllerIdentity::generate().unwrap().public_identity();
         assert_ne!(original, replacement);
         assert!(!original.matches_pin(&replacement));
+    }
+
+    #[test]
+    fn device_noise_static_hkdf_is_stable_and_key_separated() {
+        let secret = [41_u8; 32];
+        let first = DeviceIdentity::from_secret(secret);
+        let second = DeviceIdentity::from_secret(secret);
+        assert_eq!(first.noise_static_secret(), second.noise_static_secret());
+        assert_ne!(first.noise_static_secret(), secret);
+        assert_ne!(
+            first.noise_static_secret(),
+            first.public_identity().public_key
+        );
     }
 
     #[test]

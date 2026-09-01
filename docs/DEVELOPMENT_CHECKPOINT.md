@@ -53,7 +53,7 @@
 | V0.3 | Controller GUI shell | DONE | GUI 空列表/ready 状态来自 Local API，不直接持有网络状态 |
 | V1.1 | ControllerKey / DeviceKey / enrollment | DONE | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
 | V1.2 | Site Kit / Host lifecycle / naming | DONE | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
-| V1.3 | Direct iroh + InnerSession E2E | TODO | Controller/Target 双向认证，业务 payload 全部在 inner ciphertext |
+| V1.3 | Direct iroh + InnerSession E2E | DONE | Controller/Target 双向认证，业务 payload 全部在 inner ciphertext |
 | V1.4 | Bounded Read + v1 control plane | TODO | 两台真实机器 Read；Activity/revoke/backup 最小闭环 |
 | V1.25 | Distribution Studio foundation | TODO | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | TODO | 无公网 Target 经 helper 首次 enrollment + Read，helper 看不到业务明文 |
@@ -350,24 +350,46 @@ V1.2 至此允许进入 V1.3。
 
 ### V1.3 — Direct iroh + InnerSession E2E
 
-**Status：TODO**
+**Status：DONE**
 
-计划：
+**Date：2026-09-01**
 
-- 使用当前 iroh stable API 建立 direct/relay outer transport；
-- 明确 transport path 与 Clew business session 分层；
-- 使用成熟 authenticated key exchange/Noise 类 construction 建立 `InnerSession`，不自创密码学；
-- Target pin Controller identity，Controller 验证 DeviceKey；
-- wire major/identity/transcript binding；
-- inner framing、AEAD、replay/order/error handling；
-- Read path/tool kind/payload 全部在 inner ciphertext 中。
+实际落地：
+
+- 新增 `clew-transport` crate；outer transport 使用 **iroh 1.1.0** 当前 API，默认 `presets::N0` 提供 direct/relay，另有 `N0DisableRelay` 作为 direct-only 测试面；ALPN 继续固定为 `clew/1`；
+- `IrohOuter` 只负责 `EndpointAddr`、QUIC connection 与 bi-stream；Clew 的 tool kind/path/payload 不进入 outer 路由元数据，`IrohStream` 显式持有 `Connection`，避免 stream 仍在读写时 connection 被提前 drop；
+- `InnerSession` 使用 **snow 0.10.0** 的 `Noise_XX_25519_ChaChaPoly_BLAKE2s`，不自定义 handshake/AEAD construction；Controller Noise static 使用 V1.1 已持久化且进入 encrypted backup 的独立随机 transport secret；Device Noise static 使用标准 **HKDF-SHA256 (hkdf 0.13)** 从随机 DeviceKey seed 做 domain-separated key separation，不直接复用 Ed25519 signing key；
+- Noise XX 完成后，双方在 **Noise transport ciphertext 内**交换 Ed25519 identity proof；proof 签名绑定最终 Noise transcript hash + `WIRE_MAJOR` + role + `ControllerId/SiteId/DeviceId` + 完整 Controller/Device public identity，因此 Target pin Controller、Controller 验证 DeviceKey，且旧 session proof 不能搬到新 handshake；
+- 新增 `ControllerSessionIdentity::from_stored` / `DeviceSessionIdentity::from_active`，直接消费 V1.1/V1.2 已持久化真实 identity state，不另造第二套凭据；
+- business frame 仅在 InnerSession 内包含 `wire_major + sequence + kind + payload`；inner plaintext hard cap 60 KiB、Noise packet hard cap 65,535 bytes、identity proof cap 8 KiB，length 在 payload allocation 前检查；handshake framing 10 秒 timeout；
+- replay/corruption/wrong-order/wrong-wire 均 fail closed；任何认证/协议失败后 session poison；进一步 hardening 后，post-handshake frame read/write I/O failure 也会 poison session，避免 Noise nonce 已推进后复用不同步 state；
+- direct iroh integration 增加 `TapStream` 旁路捕获 outer stream 写出字节，验证 `\"kind\":\"read\"` 与 `C:/private/data.mrc` 都不会出现在 outer plaintext；代码本身不记录业务 payload。
 
 Acceptance：
 
-- direct 与公共 relay 路径都保持同一个业务安全模型；
-- outer transport dump/log 不出现测试业务明文；
-- wrong Controller / wrong Device / replay / corrupted frame 均 fail closed；
-- path Relay↔Direct 变化不要求 Clew 自己迁移业务 stream。
+- [x] direct 与公共 relay 路径使用完全相同的 `InnerSession` / identity proof / business framing；
+- [x] outer stream capture 不出现测试 Read tool kind/path 明文；
+- [x] wrong Controller / wrong Device / replay / corrupted frame / post-handshake I/O failure 均 fail closed；
+- [x] 公共 relay 地址建立连接后由 iroh 自己管理 Relay↔Direct path，Clew InnerSession 不迁移/重建业务 stream。
+
+Validation evidence：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**68 tests passed**，另 2 个平台/网络 smoke 默认 ignored（Windows interactive Host GUI、public n0 relay）；其中 `clew-transport` 常规 **7 tests passed**，`clew-identity` 增至 16 tests；
+- direct iroh QUIC + Noise + Ed25519 + encrypted `read/read_result` integration：PASS；同一 test 的 outer byte tap 明确断言 tool kind/path marker 不存在；
+- public n0 relay smoke 在 cap00/Windows 当前网络下单独执行：`public_relay_dial_carries_inner_session_without_rekeying` **1/1 PASS（5.27s）**；只把 server relay address 交给 client，InnerSession 正常建立并往返业务帧；
+- security regressions：wrong Controller pin、wrong DeviceKey、replay、ciphertext corruption、post-handshake write failure、EOF/read failure 均拒绝并在需要时 poison session；
+- Android/Unix cross-target 尝试在进入 Clew 代码前被环境挡住：iroh 的 `ring`/`blake3` build script 需要 Android NDK `x86_64-linux-android-clang`，cap00 当前只有 Rust target 没有 NDK C toolchain；这不是编译诊断中的 Clew source error，不能作为 Unix runtime PASS 证据。
+
+Known / deferred：
+
+- V1.3 收口的是 transport/InnerSession 安全原语与真实 direct/public-relay network smoke；Controller/Host 的长期 remote task、enrollment over network 与真实 `Read` request dispatch 属于紧接的 V1.4 vertical slice；
+- 当前实际网络 smoke 平台是 Windows/cap00；macOS/Linux 真机 transport runtime 证据仍缺失，Android cross-check 也受缺失 NDK C toolchain 阻塞；后续有对应 runner 时必须补，不把 Windows 结果冒充跨平台；
+- iroh 的 relay/direct 选择和迁移属于 iroh outer transport；Clew 不把 path type 纳入 identity 权限，也不因 path 变化重建 InnerSession；
+- commit subject：`feat: add v1.3 encrypted iroh transport`。
+
+V1.3 至此允许进入 V1.4。
 
 ### V1.4 — Bounded Read + V1 Control Plane
 
@@ -556,14 +578,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.2 — Site Kit + Host Lifecycle + Naming（DONE）**
+**Current block：V1.3 — Direct iroh + InnerSession E2E（DONE）**
 
-**Next block：V1.3 — Direct iroh + InnerSession E2E**
+**Next block：V1.4 — Bounded Read + V1 Control Plane**
 
-V1.2 已把 V1.1 identity 接到真实 Host/Site Kit lifecycle：signed sidecar、固定恢复顺序、membership reuse、Host 单实例/唤醒、稳定命名、helper-only selector 与 Windows GUI/tray 均已闭环。下一块立即进入 direct iroh outer transport + Target↔Controller InnerSession；Connector 仍不提前介入。
+V1.3 已建立真实 iroh direct/public-relay outer transport 与 Target↔Controller Noise InnerSession：Ed25519 identity proof 绑定 Noise transcript/context，Read kind/path/payload 保持 inner ciphertext，replay/corruption/I/O failure fail closed。下一块立即把这套安全数据面接到 Controller/Host 的真实 enrollment + bounded Read vertical slice，并收口 V1 最小 control plane。
 
 ### Change log
 
+- **2026-09-01** — V1.3 DONE：新增 `clew-transport`、iroh 1.1 direct/public-relay outer、Noise XX InnerSession、HKDF-separated Device transport key、Ed25519 transcript/context binding、bounded encrypted framing、replay/corruption/I/O poison 与 outer plaintext tap；下一块冻结为 V1.4。
 - **2026-09-01** — V1.2 DONE：新增 `clew-host`、signed `site.clew`/ClientFlavor、fixed sidecar recovery、OS-user membership reuse、Host single-instance wake、stable DeviceTag naming、helper-safe selector、Windows Host GUI/tray 与 Linux foreground；下一块冻结为 V1.3。
 - **2026-09-01** — V1.1 DONE：新增 `clew-identity`、Ed25519 Controller/Device identity、signed bootstrap/enrollment、half-commit recovery、Argon2id + XChaCha20-Poly1305 backup skeleton，并把稳定 ControllerId 接入 runtime/Local API；下一块冻结为 V1.2。
 - **2026-09-01** — V0.3 DONE：新增 Controller GUI/tray shell、GUI auto-start + Local API adapter、authenticated `controller.shutdown` 与 Windows desktop runtime smoke；下一块冻结为 V1.1。
