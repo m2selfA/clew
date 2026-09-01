@@ -7,7 +7,7 @@ use std::{
 
 use clew_core::STATE_SCHEMA_VERSION;
 use thiserror::Error;
-use tokio::task::JoinSet;
+use tokio::{sync::watch, task::JoinSet};
 use uuid::Uuid;
 
 use crate::{
@@ -30,6 +30,7 @@ pub struct ControllerRuntime {
     listener: LocalListener,
     secret: LocalApiSecret,
     state: Arc<LocalApiState>,
+    shutdown_rx: watch::Receiver<bool>,
     // Keep ownership last so the IPC endpoint and in-memory state are dropped first.
     _ownership: ControllerOwnership,
 }
@@ -50,6 +51,7 @@ impl ControllerRuntime {
         F: Future<Output = ()>,
     {
         tokio::pin!(shutdown);
+        let mut local_shutdown = self.shutdown_rx.clone();
         let mut handlers = JoinSet::new();
         loop {
             if handlers.len() >= MAX_LOCAL_API_CONNECTIONS {
@@ -58,6 +60,13 @@ impl ControllerRuntime {
                         handlers.abort_all();
                         while handlers.join_next().await.is_some() {}
                         return Ok(());
+                    }
+                    changed = local_shutdown.changed() => {
+                        if changed.is_err() || *local_shutdown.borrow() {
+                            handlers.abort_all();
+                            while handlers.join_next().await.is_some() {}
+                            return Ok(());
+                        }
                     }
                     _ = handlers.join_next() => {}
                 }
@@ -69,6 +78,13 @@ impl ControllerRuntime {
                     handlers.abort_all();
                     while handlers.join_next().await.is_some() {}
                     return Ok(());
+                }
+                changed = local_shutdown.changed() => {
+                    if changed.is_err() || *local_shutdown.borrow() {
+                        handlers.abort_all();
+                        while handlers.join_next().await.is_some() {}
+                        return Ok(());
+                    }
                 }
                 accepted = self.listener.accept() => {
                     let stream = accepted?;
@@ -113,6 +129,7 @@ pub async fn start_controller(
         .as_millis()
         .try_into()
         .map_err(|_| ControllerError::ClockOverflow)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = Arc::new(LocalApiState {
         status: ControllerStatus {
             ready: true,
@@ -123,6 +140,7 @@ pub async fn start_controller(
             local_api_version: crate::LOCAL_API_VERSION,
         },
         devices: Vec::new(),
+        shutdown_tx,
     });
 
     Ok(ControllerStart::Primary(ControllerRuntime {
@@ -131,6 +149,7 @@ pub async fn start_controller(
         listener,
         secret,
         state,
+        shutdown_rx,
     }))
 }
 
@@ -179,6 +198,28 @@ mod tests {
 
         let restarted = start_controller(config).await.unwrap();
         assert!(matches!(restarted, ControllerStart::Primary(_)));
+    }
+
+    #[tokio::test]
+    async fn authenticated_local_api_shutdown_releases_ownership() {
+        let temp = tempdir().unwrap();
+        let config = ControllerConfig::new(temp.path());
+        let primary = match start_controller(config.clone()).await.unwrap() {
+            ControllerStart::Primary(runtime) => runtime,
+            ControllerStart::Existing(_) => panic!("unexpected existing controller"),
+        };
+        let task = tokio::spawn(primary.serve_until(std::future::pending()));
+
+        LocalApiClient::new(config.clone())
+            .controller_shutdown()
+            .await
+            .unwrap();
+        task.await.unwrap().unwrap();
+
+        assert!(matches!(
+            start_controller(config).await.unwrap(),
+            ControllerStart::Primary(_)
+        ));
     }
 
     #[tokio::test]

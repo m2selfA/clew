@@ -1,5 +1,8 @@
 use std::{path::PathBuf, process::ExitCode};
 
+#[cfg(any(windows, target_os = "macos"))]
+mod gui;
+
 use clap::{Parser, Subcommand};
 use clew_runtime::{ControllerConfig, ControllerStart, LocalApiClient, start_controller};
 
@@ -18,6 +21,16 @@ struct Cli {
 enum Command {
     /// Run the persistent local Controller, or attach to the existing owner.
     Controller {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Open the Controller GUI. Starts the Controller automatically if needed.
+    Gui {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Ask the running Controller to exit cleanly.
+    Shutdown {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -68,6 +81,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+        }
+        Command::Gui { state_dir } => {
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let config = controller_config(state_dir)?;
+                gui::run(config).await?;
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                let _ = state_dir;
+                return Err(
+                    "Controller GUI is available on Windows and macOS; use `clew controller` on Linux"
+                        .into(),
+                );
+            }
+        }
+        Command::Shutdown { state_dir } => {
+            let config = controller_config(state_dir)?;
+            LocalApiClient::new(config).controller_shutdown().await?;
         }
         Command::Status { state_dir } => {
             let config = controller_config(state_dir)?;

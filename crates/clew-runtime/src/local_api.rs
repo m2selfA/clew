@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    sync::watch,
     time::{Instant, sleep, timeout},
 };
 
@@ -129,6 +130,7 @@ fn write_secret_file(path: &Path, secret: &[u8]) -> Result<(), std::io::Error> {
 pub(crate) struct LocalApiState {
     pub status: ControllerStatus,
     pub devices: Vec<DeviceSummary>,
+    pub shutdown_tx: watch::Sender<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +145,7 @@ struct LocalRequest {
 enum LocalMethod {
     ControllerStatus,
     DeviceList,
+    ControllerShutdown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +153,7 @@ enum LocalMethod {
 enum LocalResponse {
     ControllerStatus(ControllerStatus),
     DeviceList(DeviceList),
+    Ack,
     Error(LocalApiErrorBody),
 }
 
@@ -164,20 +168,31 @@ pub(crate) async fn serve_connection(
     secret: LocalApiSecret,
     state: LocalApiState,
 ) {
-    let response = match timeout(LOCAL_API_IO_TIMEOUT, read_frame(&mut stream)).await {
-        Ok(Ok(frame)) => match serde_json::from_slice::<LocalRequest>(&frame) {
-            Ok(request) => dispatch(request, &secret, &state),
-            Err(_) => LocalResponse::Error(LocalApiErrorBody {
-                code: LocalApiErrorCode::InvalidRequest,
-                message: "invalid local API request".into(),
-            }),
-        },
-        Ok(Err(_)) | Err(_) => return,
-    };
+    let (response, shutdown_after_reply) =
+        match timeout(LOCAL_API_IO_TIMEOUT, read_frame(&mut stream)).await {
+            Ok(Ok(frame)) => match serde_json::from_slice::<LocalRequest>(&frame) {
+                Ok(request) => dispatch(request, &secret, &state),
+                Err(_) => (
+                    LocalResponse::Error(LocalApiErrorBody {
+                        code: LocalApiErrorCode::InvalidRequest,
+                        message: "invalid local API request".into(),
+                    }),
+                    false,
+                ),
+            },
+            Ok(Err(_)) | Err(_) => return,
+        };
 
     if let Ok(encoded) = serde_json::to_vec(&response) {
-        let _ = timeout(LOCAL_API_IO_TIMEOUT, write_frame(&mut stream, &encoded)).await;
-        let _ = stream.shutdown().await;
+        if timeout(LOCAL_API_IO_TIMEOUT, write_frame(&mut stream, &encoded))
+            .await
+            .is_ok()
+        {
+            let _ = stream.shutdown().await;
+            if shutdown_after_reply {
+                let _ = state.shutdown_tx.send(true);
+            }
+        }
     }
 }
 
@@ -185,28 +200,40 @@ fn dispatch(
     request: LocalRequest,
     secret: &LocalApiSecret,
     state: &LocalApiState,
-) -> LocalResponse {
+) -> (LocalResponse, bool) {
     if !secret.matches(&request.auth) {
-        return LocalResponse::Error(LocalApiErrorBody {
-            code: LocalApiErrorCode::Unauthorized,
-            message: "local API authentication failed".into(),
-        });
+        return (
+            LocalResponse::Error(LocalApiErrorBody {
+                code: LocalApiErrorCode::Unauthorized,
+                message: "local API authentication failed".into(),
+            }),
+            false,
+        );
     }
     if request.api_version != LOCAL_API_VERSION {
-        return LocalResponse::Error(LocalApiErrorBody {
-            code: LocalApiErrorCode::UnsupportedVersion,
-            message: format!(
-                "unsupported local API version {}; this build supports {}",
-                request.api_version, LOCAL_API_VERSION
-            ),
-        });
+        return (
+            LocalResponse::Error(LocalApiErrorBody {
+                code: LocalApiErrorCode::UnsupportedVersion,
+                message: format!(
+                    "unsupported local API version {}; this build supports {}",
+                    request.api_version, LOCAL_API_VERSION
+                ),
+            }),
+            false,
+        );
     }
 
     match request.method {
-        LocalMethod::ControllerStatus => LocalResponse::ControllerStatus(state.status.clone()),
-        LocalMethod::DeviceList => LocalResponse::DeviceList(DeviceList {
-            devices: state.devices.clone(),
-        }),
+        LocalMethod::ControllerStatus => {
+            (LocalResponse::ControllerStatus(state.status.clone()), false)
+        }
+        LocalMethod::DeviceList => (
+            LocalResponse::DeviceList(DeviceList {
+                devices: state.devices.clone(),
+            }),
+            false,
+        ),
+        LocalMethod::ControllerShutdown => (LocalResponse::Ack, true),
     }
 }
 
@@ -235,6 +262,17 @@ impl LocalApiClient {
     pub async fn device_list(&self) -> Result<DeviceList, LocalApiClientError> {
         match self.request(LocalMethod::DeviceList).await? {
             LocalResponse::DeviceList(devices) => Ok(devices),
+            LocalResponse::Error(error) => Err(LocalApiClientError::Remote {
+                code: error.code,
+                message: error.message,
+            }),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn controller_shutdown(&self) -> Result<(), LocalApiClientError> {
+        match self.request(LocalMethod::ControllerShutdown).await? {
+            LocalResponse::Ack => Ok(()),
             LocalResponse::Error(error) => Err(LocalApiClientError::Remote {
                 code: error.code,
                 message: error.message,
@@ -371,12 +409,13 @@ mod tests {
                 local_api_version: LOCAL_API_VERSION,
             },
             devices: Vec::new(),
+            shutdown_tx: watch::channel(false).0,
         }
     }
 
     #[test]
     fn auth_is_required_before_method_dispatch() {
-        let response = dispatch(
+        let (response, shutdown_after_reply) = dispatch(
             LocalRequest {
                 api_version: LOCAL_API_VERSION,
                 auth: "wrong".into(),
@@ -385,6 +424,7 @@ mod tests {
             &LocalApiSecret("a".repeat(SECRET_HEX_LEN)),
             &test_state(),
         );
+        assert!(!shutdown_after_reply);
         assert!(matches!(
             response,
             LocalResponse::Error(LocalApiErrorBody {

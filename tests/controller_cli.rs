@@ -16,6 +16,20 @@ impl ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+
+    fn wait_for_exit(&mut self) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            if self.0.try_wait().unwrap().is_some() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "controller did not exit after shutdown"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 impl Drop for ChildGuard {
@@ -36,6 +50,15 @@ fn run_status(state_dir: &Path) -> Output {
 fn run_devices(state_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clew"))
         .arg("devices")
+        .arg("--state-dir")
+        .arg(state_dir)
+        .output()
+        .unwrap()
+}
+
+fn run_shutdown(state_dir: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_clew"))
+        .arg("shutdown")
         .arg("--state-dir")
         .arg(state_dir)
         .output()
@@ -69,6 +92,34 @@ fn spawn_controller(state_dir: &Path) -> ChildGuard {
             .spawn()
             .unwrap(),
     )
+}
+
+#[test]
+fn authenticated_cli_shutdown_stops_controller_and_allows_restart() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path();
+
+    let mut first = spawn_controller(state_dir);
+    let first_status = wait_until_ready(state_dir);
+    let first_json: serde_json::Value = serde_json::from_slice(&first_status.stdout).unwrap();
+    let first_instance = first_json["instance_id"].as_str().unwrap().to_owned();
+
+    let shutdown = run_shutdown(state_dir);
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    first.wait_for_exit();
+
+    let _restarted = spawn_controller(state_dir);
+    let restarted_status = wait_until_ready(state_dir);
+    let restarted_json: serde_json::Value =
+        serde_json::from_slice(&restarted_status.stdout).unwrap();
+    assert_ne!(
+        restarted_json["instance_id"].as_str().unwrap(),
+        first_instance
+    );
 }
 
 #[test]

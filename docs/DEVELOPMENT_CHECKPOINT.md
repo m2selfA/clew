@@ -50,7 +50,7 @@
 | P0 | 开工前仓库/文档基线 | DONE | checkpoint、repo hygiene、Rust baseline validation、首个基线 commit |
 | V0.1 | Stable IDs / state / proto skeleton | DONE | 类型与 schema 可编译、序列化边界有测试 |
 | V0.2 | Controller single-instance + Local API | DONE | 第二进程能查询状态，不能产生第二份 ownership |
-| V0.3 | Controller GUI shell | TODO | GUI 空列表/ready 状态来自 Local API，不直接持有网络状态 |
+| V0.3 | Controller GUI shell | DONE | GUI 空列表/ready 状态来自 Local API，不直接持有网络状态 |
 | V1.1 | ControllerKey / DeviceKey / enrollment | TODO | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
 | V1.2 | Site Kit / Host lifecycle / naming | TODO | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
 | V1.3 | Direct iroh + InnerSession E2E | TODO | Controller/Target 双向认证，业务 payload 全部在 inner ciphertext |
@@ -214,20 +214,43 @@ V0.2 至此允许进入 V0.3。
 
 ### V0.3 — Controller GUI Shell
 
-**Status：TODO**
+**Status：DONE**
 
-计划：
+**Date：2026-09-01**
 
-- Controller 主窗空列表、ready/error 状态；
-- GUI 只消费 Local API，不直接持有 iroh/session 状态；
-- tray 生命周期骨架；
-- 为后续 Site card / Activity / Distribution Studio 预留 adapter surface，但不提前实现业务页。
+实际落地：
+
+- Windows/macOS desktop 构建使用 `eframe` + `tray-icon` 建立 Controller GUI shell；GUI 本身不持有 iroh/session/network state，只通过 `LocalApiClient` 读取 `controller.status` / `device.list`；
+- `clew gui` 在 Controller 缺失时通过独立 `clew controller` 进程自动拉起唯一 owner，再连接同一 Local API；已有 Controller 时只连接，不创建平行 runtime；
+- 主窗显示 ready/error、设备列表与完整“还没有合作者”空状态；邀请按钮明确保留为 V1，不在 V0.3 偷跑业务；
+- 建立 tray 生命周期骨架：显示主窗/恢复焦点、隐藏到托盘、显式“退出 Clew”；窗口 `X` 通过 `CancelClose + Visible(false)` 只隐藏；
+- Local API 新增 authenticated `controller.shutdown`：服务端先返回 ACK，再触发 runtime shutdown；CLI `clew shutdown` 与 GUI Exit 共用同一边界；
+- shutdown watch 同时进入连接饱和/正常 accept 两条 server loop，避免 GUI Exit 在 16-connection hard cap 下失效；
+- GUI Local API worker 独立线程运行 current-thread Tokio runtime，以 message passing 投影状态到 UI，不让 UI 线程成为 Controller owner。
 
 Acceptance：
 
-- 没有设备时 GUI 是完整空状态而不是 terminal fallback；
-- 关闭主窗不杀 Controller；显式 Exit 才停止；
-- GUI 与 CLI 对同一个 Controller state 观察一致。
+- [x] 没有设备时 GUI 是完整空状态而不是 terminal fallback；
+- [x] 关闭主窗逻辑只隐藏；显式 Exit 通过 authenticated Local API 停止 Controller；
+- [x] GUI 与 CLI 读取同一个 Local API `controller.status` / `device.list`；
+- [x] Windows desktop 实际 smoke 能启动 GUI/tray、自动拉起 Controller 并查询 `ready=true`。
+
+Validation evidence：
+
+- `cargo check --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**30 tests passed**（root integration 2 + core 14 + proto 6 + runtime 8）；
+- 新增回归：authenticated Local API shutdown、CLI shutdown → process exit → same state-dir restart；
+- Windows GUI runtime smoke：`clew gui --state-dir <temp>` 成功启动独立 GUI process 与 Controller process，`clew status` 返回 `ready=true`；
+- GUI 依赖在 cap00 Windows Rust 1.96 toolchain 实际 build/link 通过。
+
+Known / deferred：
+
+- 本块真实桌面 runtime smoke 是 Windows；当前 runner 没有 macOS target/desktop，因此 macOS `eframe + tray-icon` 仍需要后续真机补 smoke；
+- 当前 tray icon 是代码生成的 Clew placeholder；正式 Clew Original/Outfit 资源属于 V1.2/V1.25；
+- V0.3 不实现 invite/Site card/Activity/Studio 业务页，也不把 ControllerKey/remote session 塞进 GUI；这些继续按 checkpoint 推进；
+- commit subject：`feat: add v0.3 controller gui shell`。
+
+V0.3 至此允许进入 V1.1。
 
 ## 6. V1 — 第一条真实远程 Read
 
@@ -483,14 +506,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V0.2 — Controller Single Instance + Local API（DONE）**
+**Current block：V0.3 — Controller GUI Shell（DONE）**
 
-**Next block：V0.3 — Controller GUI Shell**
+**Next block：V1.1 — Identity + Enrollment**
 
-V0.2 已把 Controller 唯一 ownership、本机 IPC、第一批 read-only Local API 和 crash/stale-lock recovery 收口。下一块只建立 Controller GUI shell，并坚持 GUI 只消费 Local API；不提前把 iroh/session state 塞进 GUI。
+V0 本机骨架现已闭环：stable IDs/schema、Controller 唯一 ownership、Local API、Windows Controller GUI/tray 都存在。下一块立即进入真正的 ControllerKey/DeviceKey、signed bootstrap、claim 与 backup/recovery 边界；仍不提前做 iroh data plane。
 
 ### Change log
 
+- **2026-09-01** — V0.3 DONE：新增 Controller GUI/tray shell、GUI auto-start + Local API adapter、authenticated `controller.shutdown` 与 Windows desktop runtime smoke；下一块冻结为 V1.1。
 - **2026-09-01** — V0.2 DONE：新增 `clew-runtime`、跨平台 single-owner file lock、Windows named pipe/Unix UDS Local API、local auth + bounds、CLI client 化与真实 Windows 跨进程 crash-recovery smoke；下一块冻结为 V0.3。
 - **2026-09-01** — V0.1 DONE：建立 `clew-core` / `clew-proto`、稳定 ID/DeviceTag/state layout/proto skeleton 与 20 个边界测试；下一块冻结为 V0.2。
 - **2026-09-01** — 建立 Architecture v1.5 正式开发计划；登记 P0 基线维护；下一块冻结为 V0.1。
