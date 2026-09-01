@@ -393,9 +393,9 @@ V1.3 至此允许进入 V1.4。
 
 ### V1.4 — Bounded Read + V1 Control Plane
 
-**Status：BLOCKED（implementation complete；V1 release gate 尚缺真实 revoke 与 macOS/Linux 平台证据）**
+**Status：BLOCKED（implementation complete；V1 release gate 仅缺 macOS tray 真机证据）**
 
-**Date：2026-09-01**
+**Date：2026-09-01；release-gate evidence update：2026-09-02**
 
 实际落地：
 
@@ -418,8 +418,9 @@ Acceptance evidence：
 - [x] Activity 真实记录成功 Read 与 root-policy denial，能回答设备/路径/result/bytes；`activity-clear` 后真实返回空列表；
 - [x] backup/restore + Recovery Review 真实 smoke：从含 Site/Device/Activity 的 Controller 导出加密 backup，恢复到空 state 后保持原 ControllerId/transport identity；确认前 Gamma 旧 DeviceKey `online=false`，`recovery-confirm` 后无需重启 Host 即恢复 `online=true`，随后再次真实 Read 成功；
 - [x] Windows Controller GUI 最新 V1.4 build 在 cap00 实机启动、自动拉起唯一 Controller，连续多轮 Device/Activity/Recovery Local API refresh 无崩溃；V1.2 Windows Host GUI/tray 实机 smoke 仍有效；
-- [ ] **live device revoke 两机验收缺失**：本轮尝试执行 `clew revoke <DeviceId>` 时被 OpenAI 平台安全检查在命令启动前拦截，测试 state 没有变化；identity/catalog/revoke 单测与实现已覆盖，但不能冒充真实“当前 session 断开 + 重连仍拒绝”的 acceptance；
-- [ ] **macOS tray / Linux foreground 真机证据缺失**：当前可用 runner 没有 macOS/Linux desktop/runtime 环境；Windows 结果不能冒充跨平台 smoke。V1.3 的 Android cross-target 也仍受缺失 NDK C toolchain 阻塞。
+- [x] **live device revoke 真运行闭环**：在 gyz Linux 临时 Controller/Host 分离 state/process 的真实 InnerSession 上执行 `clew revoke 97386e1a-…` 成功；设备立即投影为 `online=false / executable=false`，后续 Read 在 Controller 权限面返回 `Denied: read is not permitted`。原 Host 持续重连 5 秒仍离线；停止后使用完全相同的 host-state/DeviceKey 重启，再等待 5 秒仍只有原 DeviceId 且保持离线/不可执行，没有重新 enrollment 或产生第二台设备；
+- [x] **Linux foreground 真机 smoke**：gyz.sustech（Linux 6.4 / x86_64）从当前 `4a66937` 的精确 `git archive`（217,603 bytes，SHA-256 `38fda1bd0837310f8804fbbb5f3059e54c9878e49e8a79f21985f4dc620e60d7`）native `cargo check --all-targets` / `cargo build --bin clew` 通过；Linux Controller + `host --foreground` 真实完成 mint/enrollment/InnerSession/bounded Read，第二 Host 只返回 `already running`，root 外 Read 固定 `Denied`；
+- [ ] **macOS tray 真机证据缺失**：当前 WebCodex runner inventory 中没有 macOS path/runtime；Windows tray 与 Linux foreground 均已有真实 smoke，但不能替代 macOS。V1.3 的 Android cross-target 仍受缺失 NDK C toolchain 阻塞。
 
 Validation evidence：
 
@@ -427,12 +428,14 @@ Validation evidence：
 - `cargo check --workspace --all-targets`：PASS，0 warnings；
 - `cargo test --workspace --all-targets`：PASS，**92 tests passed / 0 failed / 2 ignored**；ignored 为 interactive Windows Host GUI smoke 与 public n0 relay smoke，两者此前均有单独真实 PASS 证据；
 - V1.4 真实 Windows Controller GUI runtime smoke：PASS；最新 GUI process 保持运行超过多个 refresh 周期，Local API `ready=true`，随后 Controller graceful shutdown、GUI job stop 与临时 state cleanup 完成；
+- V1.4 Linux/gyz native runtime：PASS；Host DeviceId `97386e1a-…` online 后真实读取 `/home/shark/tmp/rabisu/scratch/clew-v14-linux-e2e/share/proof.txt` 返回 33 bytes；同 root 外 `outside.txt` 被 Host policy 拒绝，Activity 分别记录 `succeeded/33 bytes` 与 `denied/0 bytes`；第二 foreground Host 只 wake 现有实例；
+- V1.4 Linux live revoke：PASS；revoke 后当前 session 被移除、catalog 立即不可执行，持续 reconnect 与同 host-state restart 均不能恢复旧 DeviceKey 权限。此前 Windows smoke 的安全拦截因此不再是产品 release blocker；
 - 初次 final workspace test 曾暴露 legacy non-networked Site Kit 会在拿到 Host instance 后立刻 `MissingNetworkConfig` 退出；已改为“endpoint/read policy 同时缺失 → 保持 AwaitingEnrollment；只缺一项 → fail closed”，`host_cli` focused regression 与同一 final workspace test 均转绿；
 - cap00/Gamma smoke 临时目录均确认删除。早期 mzd smoke 在发现并修复半提交/endpoint lifecycle 问题后，mzd WebCodex agent 掉线；后续两次 SSH cleanup 都在环境层 timeout，因此 `D:\\tmp\\clew-v14-smoke` 的最终清理状态**未能验证**，不计为 Clew correctness PASS。
 
 Known / release blockers：
 
-- V1.4 代码实现面至此闭合，但由于 live revoke 与 macOS/Linux 真机 acceptance 仍缺，**V1 暂不标记为对外可用**；不得提前进入 V1.25 并把此 gate 遗留；
+- V1.4 代码实现面、真实 live revoke 与 Linux foreground acceptance 已闭合；当前仅因 **macOS tray 真机 smoke** 仍缺，**V1 暂不标记为对外可用**；不得提前进入 V1.25 并把此 gate 遗留；
 - V2 才引入通用 cancel token/agent tool plane；V1.4 Read 已有 bounded timeout 与任务取消传播，但不提前设计 V2 的跨工具 cancel protocol；
 - commit subject：`feat: implement v1.4 bounded read control plane`。
 
@@ -602,11 +605,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current block：V1.4 — Bounded Read + V1 Control Plane（BLOCKED：implementation complete）**
 
-**Next block：V1.4 release-gate evidence closure（live revoke + macOS/Linux platform smoke）**
+**Next block：V1.4 release-gate evidence closure（macOS tray smoke only）**
 
-V1.4 已完成 Controller-owned control state、真实 network enrollment、长期 InnerSession、bounded Read、Activity、rename/invite-close/revoke 实现、backup/restore/Recovery Review、GUI/CLI Local API surface 与 Windows 双机/GUI smoke。当前不进入 V1.25：先补齐 live revoke 的真实 session/reconnect 证据，以及 macOS tray / Linux foreground 真机 smoke，之后才允许把 V1 标为对外可用。
+V1.4 已完成 Controller-owned control state、真实 network enrollment、长期 InnerSession、bounded Read、Activity、rename/invite-close/revoke、backup/restore/Recovery Review、GUI/CLI Local API surface，以及 Windows 双机/GUI、Linux foreground 与 live revoke 真运行闭环。当前不进入 V1.25：只剩 macOS tray 真机 smoke；拿到对应 runner 后补证据，之后才允许把 V1 标为对外可用。
 
 ### Change log
+
+- **2026-09-02** — V1.4 release-gate closure 前进：gyz Linux x86_64 对 `4a66937` 精确 source archive 完成 native build，并真实跑通 Linux Controller + foreground Host enrollment/InnerSession/bounded Read、root-policy denial、single-instance wake；随后 live revoke 使当前 session offline，持续 reconnect 与同 DeviceKey restart 均无法恢复权限。release blocker 收窄为仅 macOS tray 真机 smoke。
 
 - **2026-09-01** — V1.4 implementation complete / release gate BLOCKED：ControllerControlStore、network enrollment + half-commit recovery、long-lived Host iroh endpoint、bounded Read、Activity、control-plane Local API/CLI、human bootstrap errors、backup v2/Recovery Review 与 Controller GUI V1.4 surface 已落地；cap00↔Gamma 双机 Read/identity-reuse/backup recovery 真实 PASS；仍缺 live revoke 与 macOS/Linux 真机证据，因此不发布 V1、不进入 V1.25。
 - **2026-09-01** — V1.3 DONE：新增 `clew-transport`、iroh 1.1 direct/public-relay outer、Noise XX InnerSession、HKDF-separated Device transport key、Ed25519 transcript/context binding、bounded encrypted framing、replay/corruption/I/O poison 与 outer plaintext tap；下一块冻结为 V1.4。
