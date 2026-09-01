@@ -713,8 +713,10 @@ version = "0.1.0"
 dependencies = [
  "clew-core",
  "clew-identity",
+ "clew-transport",
  "getrandom 0.3.4",
  "hostname",
+ "iroh",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -757,8 +759,11 @@ name = "clew-runtime"
 version = "0.1.0"
 dependencies = [
  "clew-core",
+ "clew-host",
  "clew-identity",
+ "clew-transport",
  "getrandom 0.3.4",
+ "iroh",
  "serde",
  "serde_json",
  "sha2 0.11.0",

@@ -54,7 +54,7 @@
 | V1.1 | ControllerKey / DeviceKey / enrollment | DONE | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
 | V1.2 | Site Kit / Host lifecycle / naming | DONE | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
 | V1.3 | Direct iroh + InnerSession E2E | DONE | Controller/Target 双向认证，业务 payload 全部在 inner ciphertext |
-| V1.4 | Bounded Read + v1 control plane | TODO | 两台真实机器 Read；Activity/revoke/backup 最小闭环 |
+| V1.4 | Bounded Read + v1 control plane | BLOCKED | 实现完成；Windows 双机 Read/Activity/backup 已闭环，仍缺 live revoke + macOS/Linux 真机 release 证据 |
 | V1.25 | Distribution Studio foundation | TODO | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | TODO | 无公网 Target 经 helper 首次 enrollment + Read，helper 看不到业务明文 |
 | V2 | Agent minimum | TODO | Glob/Grep/Read/Edit/Write/Shell + MCP stdio/HTTP + bounds/cancel |
@@ -393,28 +393,50 @@ V1.3 至此允许进入 V1.4。
 
 ### V1.4 — Bounded Read + V1 Control Plane
 
-**Status：TODO**
+**Status：BLOCKED（implementation complete；V1 release gate 尚缺真实 revoke 与 macOS/Linux 平台证据）**
 
-计划：
+**Date：2026-09-01**
 
-- DeviceRegistry / Site projection；
-- bounded `Read`：root policy、offset/limit、最大结果、timeout/cancel；
-- Controller ActivityStore 最小实现；
-- `device.rename` / `device.revoke` / `invite.close` 最小收口；
-- Controller backup GUI/CLI 入口；
-- Controller/Host 状态与错误人话；
-- 两台真实机器 end-to-end acceptance。
+实际落地：
 
-Acceptance：
+- 新增 Controller-owned `ControllerControlStore`：双槽 generation 持久化 `EnrollmentRegistry + ControllerCatalog + bounded Activity + RecoveryReview`；任一已有 control slot 不可读时不会静默重置，较新槽损坏可回退到上一有效 generation；
+- `ControllerCatalog` 建立 Site/Device projection，持久化 Site 名、`ReadPolicy`、Device capabilities、rename/revoke 投影；Local API/CLI 增加 `mint`、`invite-close`、`read`、`rename`、`revoke`、`activity` / `activity-clear`；GUI/CLI 继续只通过 Local API，不形成第二个 Controller state owner；
+- `site.clew` 的 network variant 将**当前 online 后**的 iroh `EndpointAddr` 与 bounded `ReadPolicy` 一并签名；不缓存 Controller 启动瞬间的地址快照，避免 relay/address hint 因启动时序缺失；
+- Host 将 V1.1 enrollment 正式接到 bootstrap ALPN：`Claim → Claimed → Host persist → Persisted → Activated → ActivatedAck`；Controller claim/ACK 事务与 Host DeviceKey/membership 持久化保持分离，半提交窗口使用 0600 `pending-controller-activation` ticket 恢复；matching token 的重复 `Persisted` 幂等完成 Pending→Active/Active；
+- Host active membership 持久化 Controller endpoint + ReadPolicy；同 Controller/Site 重启继续复用 DeviceId/DeviceKey。V1.4 网络 Host 使用一个长期 iroh endpoint 做 InnerSession 重连，不再每次 reconnect 重新 bind endpoint；旧 V1.2 sidecar 若 endpoint/read policy **同时缺失**仍保留 AwaitingEnrollment 兼容状态，只有半配置才 fail closed；
+- bounded `Read` 同时在 Controller 与 Host 两侧执行：Controller 先检查 device/site/revoke/capability/max-result，Host 再执行 canonical root policy、offset/limit、文件类型、结果硬上限与 timeout；root 外目标在 Host 侧拒绝，超过 Site 结果上限在 Controller 侧不下发；业务 request/result 始终走 V1.3 InnerSession；
+- Controller Activity 只保存 bounded metadata 摘要（设备/Site、operation、path summary、result、duration、bytes），不保存文件内容/stdout/env；支持 retention/count hard bound 与显式 clear；
+- bootstrap policy rejection 改为结构化且固定的人话错误；邀请关闭/过期/撤销/额度、Recovery Review 等不再靠 QUIC reset 表达，也不泄漏 bootstrap secret/token/内部 state。发送错误后 graceful shutdown send half，并给对端短窗口读取，真实 Gamma smoke 从 `connection lost` 收敛为 `Denied: This invitation is closed to new devices.`；Controller 日志只记录静态错误类别；
+- Controller backup 从 V1.1 crypto primitive 升级为 v2 payload，纳入 Registry + Catalog；CLI `backup-export` 使用环境变量取口令，`backup-restore` 只允许 stopped + empty state，恢复失败回滚部分 state；恢复后历史 bootstrap 全关闭且 `remote_access_paused=true`，显式 Recovery Review 后才重新接受旧 DeviceKey；
+- Controller GUI V1.4 adapter 增加 Activity、Recovery Review 与加密 backup export；口令使用 password field、两次确认且不进入 Debug/argv/log。restore 仍保持离线 CLI，因为运行中的 Controller GUI 不应绕过“empty stopped state”安全门；
+- Host/Controller human state 与错误面已覆盖 network enrollment、closed invite、Recovery Review、Local API error；root CLI 仍保留 foreground 可观察路径。
 
-- `invite → 双击 → enrollment → InnerSession → bounded Read` 在两台真实机器上成功；
-- 第二次双击不产生第二台设备；
-- Controller 可停止该设备，revoke 后重连也不能恢复权限；
-- Activity 能回答“刚才在哪台机器读了哪个路径”；
-- backup/restore smoke + Recovery Review；
-- Windows/macOS tray 与 Linux foreground 基础行为有对应平台 smoke。
+Acceptance evidence：
 
-完成这里后，才把 **V1** 标记为可对外试用。
+- [x] **真实双机 Windows**：cap00 Controller ↔ Gamma Target 完成 `mint/site.clew → enrollment → InnerSession → bounded Read`；Gamma `D:\\tmp\\clew-v14-gamma\\share\\proof.txt` 返回精确 proof 内容；同一 Site root 外文件返回 `Denied`；50,000-byte 请求超过 49,152-byte Site cap 时 Controller 在下发前拒绝；
+- [x] 第二次启动 Gamma Host 只唤醒现有 instance；进程重启后仍是同一 DeviceId/DeviceKey，显式 rename `Gamma-Renamed` 跨重启/backup restore 保留；`invite.close` 后已有设备继续 Read，新空 state enrollment 被拒绝且收到固定人话；
+- [x] Activity 真实记录成功 Read 与 root-policy denial，能回答设备/路径/result/bytes；`activity-clear` 后真实返回空列表；
+- [x] backup/restore + Recovery Review 真实 smoke：从含 Site/Device/Activity 的 Controller 导出加密 backup，恢复到空 state 后保持原 ControllerId/transport identity；确认前 Gamma 旧 DeviceKey `online=false`，`recovery-confirm` 后无需重启 Host 即恢复 `online=true`，随后再次真实 Read 成功；
+- [x] Windows Controller GUI 最新 V1.4 build 在 cap00 实机启动、自动拉起唯一 Controller，连续多轮 Device/Activity/Recovery Local API refresh 无崩溃；V1.2 Windows Host GUI/tray 实机 smoke 仍有效；
+- [ ] **live device revoke 两机验收缺失**：本轮尝试执行 `clew revoke <DeviceId>` 时被 OpenAI 平台安全检查在命令启动前拦截，测试 state 没有变化；identity/catalog/revoke 单测与实现已覆盖，但不能冒充真实“当前 session 断开 + 重连仍拒绝”的 acceptance；
+- [ ] **macOS tray / Linux foreground 真机证据缺失**：当前可用 runner 没有 macOS/Linux desktop/runtime 环境；Windows 结果不能冒充跨平台 smoke。V1.3 的 Android cross-target 也仍受缺失 NDK C toolchain 阻塞。
+
+Validation evidence：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**92 tests passed / 0 failed / 2 ignored**；ignored 为 interactive Windows Host GUI smoke 与 public n0 relay smoke，两者此前均有单独真实 PASS 证据；
+- V1.4 真实 Windows Controller GUI runtime smoke：PASS；最新 GUI process 保持运行超过多个 refresh 周期，Local API `ready=true`，随后 Controller graceful shutdown、GUI job stop 与临时 state cleanup 完成；
+- 初次 final workspace test 曾暴露 legacy non-networked Site Kit 会在拿到 Host instance 后立刻 `MissingNetworkConfig` 退出；已改为“endpoint/read policy 同时缺失 → 保持 AwaitingEnrollment；只缺一项 → fail closed”，`host_cli` focused regression 与同一 final workspace test 均转绿；
+- cap00/Gamma smoke 临时目录均确认删除。早期 mzd smoke 在发现并修复半提交/endpoint lifecycle 问题后，mzd WebCodex agent 掉线；后续两次 SSH cleanup 都在环境层 timeout，因此 `D:\\tmp\\clew-v14-smoke` 的最终清理状态**未能验证**，不计为 Clew correctness PASS。
+
+Known / release blockers：
+
+- V1.4 代码实现面至此闭合，但由于 live revoke 与 macOS/Linux 真机 acceptance 仍缺，**V1 暂不标记为对外可用**；不得提前进入 V1.25 并把此 gate 遗留；
+- V2 才引入通用 cancel token/agent tool plane；V1.4 Read 已有 bounded timeout 与任务取消传播，但不提前设计 V2 的跨工具 cancel protocol；
+- commit subject：`feat: implement v1.4 bounded read control plane`。
+
+完成上述 release blockers 后，才把 **V1** 标记为可对外试用。
 
 ## 7. V1.25 — Distribution Studio Foundation
 
@@ -578,14 +600,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.3 — Direct iroh + InnerSession E2E（DONE）**
+**Current block：V1.4 — Bounded Read + V1 Control Plane（BLOCKED：implementation complete）**
 
-**Next block：V1.4 — Bounded Read + V1 Control Plane**
+**Next block：V1.4 release-gate evidence closure（live revoke + macOS/Linux platform smoke）**
 
-V1.3 已建立真实 iroh direct/public-relay outer transport 与 Target↔Controller Noise InnerSession：Ed25519 identity proof 绑定 Noise transcript/context，Read kind/path/payload 保持 inner ciphertext，replay/corruption/I/O failure fail closed。下一块立即把这套安全数据面接到 Controller/Host 的真实 enrollment + bounded Read vertical slice，并收口 V1 最小 control plane。
+V1.4 已完成 Controller-owned control state、真实 network enrollment、长期 InnerSession、bounded Read、Activity、rename/invite-close/revoke 实现、backup/restore/Recovery Review、GUI/CLI Local API surface 与 Windows 双机/GUI smoke。当前不进入 V1.25：先补齐 live revoke 的真实 session/reconnect 证据，以及 macOS tray / Linux foreground 真机 smoke，之后才允许把 V1 标为对外可用。
 
 ### Change log
 
+- **2026-09-01** — V1.4 implementation complete / release gate BLOCKED：ControllerControlStore、network enrollment + half-commit recovery、long-lived Host iroh endpoint、bounded Read、Activity、control-plane Local API/CLI、human bootstrap errors、backup v2/Recovery Review 与 Controller GUI V1.4 surface 已落地；cap00↔Gamma 双机 Read/identity-reuse/backup recovery 真实 PASS；仍缺 live revoke 与 macOS/Linux 真机证据，因此不发布 V1、不进入 V1.25。
 - **2026-09-01** — V1.3 DONE：新增 `clew-transport`、iroh 1.1 direct/public-relay outer、Noise XX InnerSession、HKDF-separated Device transport key、Ed25519 transcript/context binding、bounded encrypted framing、replay/corruption/I/O poison 与 outer plaintext tap；下一块冻结为 V1.4。
 - **2026-09-01** — V1.2 DONE：新增 `clew-host`、signed `site.clew`/ClientFlavor、fixed sidecar recovery、OS-user membership reuse、Host single-instance wake、stable DeviceTag naming、helper-safe selector、Windows Host GUI/tray 与 Linux foreground；下一块冻结为 V1.3。
 - **2026-09-01** — V1.1 DONE：新增 `clew-identity`、Ed25519 Controller/Device identity、signed bootstrap/enrollment、half-commit recovery、Argon2id + XChaCha20-Poly1305 backup skeleton，并把稳定 ControllerId 接入 runtime/Local API；下一块冻结为 V1.2。

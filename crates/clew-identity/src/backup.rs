@@ -3,15 +3,15 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use clew_core::{ControllerId, MAX_STATE_DOCUMENT_SIZE};
+use clew_core::{ControllerCatalog, ControllerId, MAX_STATE_DOCUMENT_SIZE};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{ControllerIdentity, EnrollmentRegistry, StoredControllerIdentity};
 
-const BACKUP_VERSION: u32 = 1;
-const BACKUP_AAD: &[u8] = b"clew/controller-backup/v1";
+const BACKUP_VERSION: u32 = 2;
+const BACKUP_AAD: &[u8] = b"clew/controller-backup/v2";
 const BACKUP_SALT_BYTES: usize = 16;
 const BACKUP_NONCE_BYTES: usize = 24;
 const BACKUP_KEY_BYTES: usize = 32;
@@ -26,6 +26,7 @@ pub struct ControllerBackupPayload {
     controller_secret_key: [u8; 32],
     transport_identity_secret: [u8; 32],
     pub registry: EnrollmentRegistry,
+    pub catalog: ControllerCatalog,
     pub created_unix_ms: u64,
 }
 
@@ -38,6 +39,7 @@ impl std::fmt::Debug for ControllerBackupPayload {
             .field("controller_secret_key", &"[REDACTED]")
             .field("transport_identity_secret", &"[REDACTED]")
             .field("registry", &self.registry)
+            .field("catalog", &self.catalog)
             .finish()
     }
 }
@@ -46,6 +48,7 @@ impl ControllerBackupPayload {
     pub fn capture(
         stored: &StoredControllerIdentity,
         registry: EnrollmentRegistry,
+        catalog: ControllerCatalog,
         created_unix_ms: u64,
     ) -> Result<Self, BackupError> {
         if stored.identity().controller_id() != registry.controller_id() {
@@ -53,8 +56,9 @@ impl ControllerBackupPayload {
         }
         Ok(Self {
             controller_secret_key: stored.identity().secret_bytes(),
-            transport_identity_secret: stored.noise_static_secret(),
+            transport_identity_secret: stored.transport_identity_seed(),
             registry,
+            catalog,
             created_unix_ms,
         })
     }
@@ -64,6 +68,7 @@ impl ControllerBackupPayload {
         identity: &ControllerIdentity,
         transport_identity_secret: [u8; 32],
         registry: EnrollmentRegistry,
+        catalog: ControllerCatalog,
         created_unix_ms: u64,
     ) -> Result<Self, BackupError> {
         if identity.controller_id() != registry.controller_id() {
@@ -73,6 +78,7 @@ impl ControllerBackupPayload {
             controller_secret_key: identity.secret_bytes(),
             transport_identity_secret,
             registry,
+            catalog,
             created_unix_ms,
         })
     }
@@ -90,6 +96,7 @@ pub struct RestoredController {
     pub identity: ControllerIdentity,
     pub transport_identity_secret: [u8; 32],
     pub registry: EnrollmentRegistry,
+    pub catalog: ControllerCatalog,
     pub recovery_review: RecoveryReview,
 }
 
@@ -100,6 +107,7 @@ impl std::fmt::Debug for RestoredController {
             .field("controller_id", &self.identity.controller_id())
             .field("transport_identity_secret", &"[REDACTED]")
             .field("registry", &self.registry)
+            .field("catalog", &self.catalog)
             .field("recovery_review", &self.recovery_review)
             .finish()
     }
@@ -201,6 +209,7 @@ pub fn decrypt_controller_backup(
         identity,
         transport_identity_secret,
         registry: payload.registry,
+        catalog: payload.catalog,
         recovery_review: RecoveryReview {
             restored_controller_id,
             remote_access_paused: true,
@@ -247,6 +256,10 @@ fn validate_payload(payload: &ControllerBackupPayload) -> Result<(), BackupError
     if identity.controller_id() != payload.registry.controller_id() {
         return Err(BackupError::ControllerMismatch);
     }
+    payload
+        .catalog
+        .validate()
+        .map_err(|_| BackupError::InvalidCatalog)?;
     Ok(())
 }
 
@@ -293,6 +306,8 @@ pub enum BackupError {
     CipherInit,
     #[error("controller backup authentication failed")]
     AuthenticationFailed,
+    #[error("controller backup catalog is invalid")]
+    InvalidCatalog,
     #[error("controller backup ControllerKey does not match the embedded ControllerId")]
     ControllerMismatch,
     #[error("controller backup restore requires an empty local Controller state")]
@@ -335,7 +350,14 @@ mod tests {
             )
             .unwrap();
         (
-            ControllerBackupPayload::from_parts(&identity, [61_u8; 32], registry, 100).unwrap(),
+            ControllerBackupPayload::from_parts(
+                &identity,
+                [61_u8; 32],
+                registry,
+                ControllerCatalog::default(),
+                100,
+            )
+            .unwrap(),
             pass,
         )
     }
@@ -352,6 +374,7 @@ mod tests {
         let mut restored =
             decrypt_controller_backup(&decoded, "correct horse battery staple", true).unwrap();
         assert_eq!(restored.identity.controller_id(), controller_id);
+        assert_eq!(restored.catalog, ControllerCatalog::default());
         assert!(restored.recovery_review.remote_access_paused);
         assert!(restored.recovery_review.historical_bootstrap_closed);
         let device = crate::DeviceIdentity::generate().unwrap().public_identity();

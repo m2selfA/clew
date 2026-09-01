@@ -102,6 +102,16 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn controller_control_slot_a_path(&self) -> PathBuf {
+        self.version_root().join("controller-control.a.json")
+    }
+
+    #[must_use]
+    pub fn controller_control_slot_b_path(&self) -> PathBuf {
+        self.version_root().join("controller-control.b.json")
+    }
+
+    #[must_use]
     pub fn membership_dir(&self, controller_id: ControllerId, site_id: SiteId) -> PathBuf {
         self.version_root()
             .join("memberships")
@@ -129,6 +139,17 @@ impl StateLayout {
         self.membership_dir(controller_id, site_id)
             .join("host")
             .join("device-key.json")
+    }
+
+    #[must_use]
+    pub fn pending_controller_activation_path(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("controller-activation.pending.json")
     }
 
     #[must_use]
@@ -268,6 +289,18 @@ mod tests {
                 .join("controller.sock")
         );
         assert_eq!(
+            layout.controller_control_slot_a_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("controller-control.a.json")
+        );
+        assert_eq!(
+            layout.controller_control_slot_b_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("controller-control.b.json")
+        );
+        assert_eq!(
             layout.pending_device_identity_path(controller, site),
             PathBuf::from("state-root")
                 .join("v1")
@@ -286,6 +319,16 @@ mod tests {
                 .join(site.to_string())
                 .join("host")
                 .join("device-key.json")
+        );
+        assert_eq!(
+            layout.pending_controller_activation_path(controller, site),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("memberships")
+                .join(controller.to_string())
+                .join(site.to_string())
+                .join("host")
+                .join("controller-activation.pending.json")
         );
         assert_eq!(
             layout.device_record_path(controller, site, device),

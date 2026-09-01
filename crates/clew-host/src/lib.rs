@@ -3,6 +3,8 @@
 mod instance;
 mod membership;
 mod naming;
+mod read;
+mod remote;
 mod runtime;
 mod selection;
 mod site;
@@ -14,6 +16,11 @@ pub use membership::{
 };
 pub use naming::{
     HostNamingError, apply_hostname_collision_policy, normalize_hostname, observed_hostname,
+};
+pub use read::HostReadService;
+pub use remote::{
+    HostRemoteError, complete_networked_activation, serve_networked_membership_once,
+    serve_networked_membership_until,
 };
 pub use runtime::{
     HostLaunchContext, HostLaunchError, HostLaunchState, HostSiteSource, MissingInviteView,

@@ -5,7 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clew_runtime::{ControllerConfig, ControllerStatus, DeviceList, LocalApiClient};
+use clew_core::ActivityResult;
+use clew_runtime::{
+    ActivityList, BackupExportRequest, ControllerConfig, ControllerStatus, DeviceList,
+    LocalApiClient, RecoveryStatus,
+};
 use eframe::egui;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -56,18 +60,24 @@ async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[derive(Debug)]
 enum BackendCommand {
     Refresh,
+    BackupExport { path: String, passphrase: String },
+    RecoveryConfirm,
+    ActivityClear,
     Shutdown,
 }
 
-#[derive(Debug)]
 enum BackendEvent {
     Snapshot {
         status: ControllerStatus,
         devices: DeviceList,
+        activity: ActivityList,
+        recovery: RecoveryStatus,
     },
+    BackupExportComplete(String),
+    RecoveryConfirmed(RecoveryStatus),
+    ActivityCleared,
     Error(String),
     ShutdownComplete,
 }
@@ -90,13 +100,54 @@ impl Backend {
                     .expect("build GUI Local API runtime");
                 let client = LocalApiClient::new(config);
                 while let Ok(command) = command_rx.recv() {
+                    let shutdown = matches!(&command, BackendCommand::Shutdown);
                     let event = match command {
                         BackendCommand::Refresh => runtime.block_on(async {
-                            match client.controller_status().await {
-                                Ok(status) => match client.device_list().await {
-                                    Ok(devices) => BackendEvent::Snapshot { status, devices },
+                            let result = async {
+                                let status = client.controller_status().await?;
+                                let devices = client.device_list().await?;
+                                let activity = client.activity_list(20).await?;
+                                let recovery = client.recovery_status().await?;
+                                Ok::<_, clew_runtime::LocalApiClientError>((
+                                    status, devices, activity, recovery,
+                                ))
+                            }
+                            .await;
+                            match result {
+                                Ok((status, devices, activity, recovery)) => {
+                                    BackendEvent::Snapshot {
+                                        status,
+                                        devices,
+                                        activity,
+                                        recovery,
+                                    }
+                                }
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::BackupExport { path, passphrase } => {
+                            runtime.block_on(async {
+                                match client
+                                    .backup_export(BackupExportRequest {
+                                        path: path.clone(),
+                                        passphrase,
+                                    })
+                                    .await
+                                {
+                                    Ok(()) => BackendEvent::BackupExportComplete(path),
                                     Err(error) => BackendEvent::Error(error.to_string()),
-                                },
+                                }
+                            })
+                        }
+                        BackendCommand::RecoveryConfirm => runtime.block_on(async {
+                            match client.recovery_confirm().await {
+                                Ok(status) => BackendEvent::RecoveryConfirmed(status),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::ActivityClear => runtime.block_on(async {
+                            match client.activity_clear().await {
+                                Ok(()) => BackendEvent::ActivityCleared,
                                 Err(error) => BackendEvent::Error(error.to_string()),
                             }
                         }),
@@ -111,7 +162,7 @@ impl Backend {
                         break;
                     }
                     ctx.request_repaint();
-                    if matches!(command, BackendCommand::Shutdown) {
+                    if shutdown {
                         break;
                     }
                 }
@@ -125,6 +176,20 @@ impl Backend {
 
     fn refresh(&self) {
         let _ = self.tx.send(BackendCommand::Refresh);
+    }
+
+    fn backup_export(&self, path: String, passphrase: String) {
+        let _ = self
+            .tx
+            .send(BackendCommand::BackupExport { path, passphrase });
+    }
+
+    fn recovery_confirm(&self) {
+        let _ = self.tx.send(BackendCommand::RecoveryConfirm);
+    }
+
+    fn activity_clear(&self) {
+        let _ = self.tx.send(BackendCommand::ActivityClear);
     }
 
     fn shutdown(&self) {
@@ -178,6 +243,16 @@ impl Tray {
     }
 }
 
+fn activity_result_label(result: ActivityResult) -> &'static str {
+    match result {
+        ActivityResult::Succeeded => "成功",
+        ActivityResult::Denied => "已拒绝",
+        ActivityResult::Failed => "失败",
+        ActivityResult::TimedOut => "超时",
+        ActivityResult::Cancelled => "已取消",
+    }
+}
+
 fn clew_icon() -> Result<Icon, tray_icon::BadIcon> {
     let side = 32_u32;
     let mut rgba = vec![0_u8; (side * side * 4) as usize];
@@ -199,7 +274,14 @@ struct ControllerApp {
     tray: Tray,
     status: Option<ControllerStatus>,
     devices: DeviceList,
+    activity: ActivityList,
+    recovery: RecoveryStatus,
     error: Option<String>,
+    notice: Option<String>,
+    backup_passphrase: String,
+    backup_passphrase_confirm: String,
+    backup_export_in_flight: bool,
+    recovery_confirm_armed: bool,
     last_refresh: Instant,
     refresh_in_flight: bool,
     exit_requested: bool,
@@ -220,7 +302,14 @@ impl ControllerApp {
             devices: DeviceList {
                 devices: Vec::new(),
             },
+            activity: ActivityList { events: Vec::new() },
+            recovery: RecoveryStatus { review: None },
             error: None,
+            notice: None,
+            backup_passphrase: String::new(),
+            backup_passphrase_confirm: String::new(),
+            backup_export_in_flight: false,
+            recovery_confirm_armed: false,
             last_refresh: Instant::now(),
             refresh_in_flight: true,
             exit_requested: false,
@@ -231,12 +320,41 @@ impl ControllerApp {
         while let Ok(event) = self.backend.rx.try_recv() {
             self.refresh_in_flight = false;
             match event {
-                BackendEvent::Snapshot { status, devices } => {
+                BackendEvent::Snapshot {
+                    status,
+                    devices,
+                    activity,
+                    recovery,
+                } => {
                     self.status = Some(status);
                     self.devices = devices;
+                    self.activity = activity;
+                    self.recovery = recovery;
                     self.error = None;
                 }
-                BackendEvent::Error(error) => self.error = Some(error),
+                BackendEvent::BackupExportComplete(path) => {
+                    self.backup_export_in_flight = false;
+                    self.notice = Some(format!("加密备份已导出：{path}"));
+                    self.error = None;
+                }
+                BackendEvent::RecoveryConfirmed(status) => {
+                    self.recovery = status;
+                    self.recovery_confirm_armed = false;
+                    self.notice = Some("Recovery Review 已确认；允许已恢复设备重新连接。".into());
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::ActivityCleared => {
+                    self.activity.events.clear();
+                    self.notice = Some("本机 Activity 历史已清空。".into());
+                    self.error = None;
+                }
+                BackendEvent::Error(error) => {
+                    self.backup_export_in_flight = false;
+                    self.error = Some(error);
+                }
                 BackendEvent::ShutdownComplete => {
                     self.exit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -300,6 +418,36 @@ impl eframe::App for ControllerApp {
             ui.label("Controller 状态：正在连接…");
         }
 
+        if let Some(notice) = &self.notice {
+            ui.label(notice);
+        }
+
+        if let Some(review) = self.recovery.review
+            && review.remote_access_paused
+        {
+            ui.separator();
+            ui.group(|ui| {
+                ui.heading("Recovery Review");
+                ui.label(
+                    "此 Controller 从加密备份恢复。旧 DeviceKey 当前被暂停，确认后才允许重新连接。",
+                );
+                ui.label(format!("ControllerId：{}", review.restored_controller_id));
+                if self.recovery_confirm_armed {
+                    ui.horizontal(|ui| {
+                        if ui.button("确认并恢复远程访问").clicked() {
+                            self.backend.recovery_confirm();
+                            self.recovery_confirm_armed = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.recovery_confirm_armed = false;
+                        }
+                    });
+                } else if ui.button("检查后继续…").clicked() {
+                    self.recovery_confirm_armed = true;
+                }
+            });
+        }
+
         ui.separator();
         if self.devices.devices.is_empty() {
             ui.vertical_centered(|ui| {
@@ -326,6 +474,80 @@ impl eframe::App for ControllerApp {
                 });
             }
         }
+
+        ui.separator();
+        ui.collapsing("Activity", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("最近 20 条本机活动摘要");
+                if ui.button("清空").clicked() {
+                    self.backend.activity_clear();
+                }
+            });
+            if self.activity.events.is_empty() {
+                ui.label("暂无活动记录。");
+            } else {
+                for event in self.activity.events.iter().rev() {
+                    ui.group(|ui| {
+                        ui.strong(format!(
+                            "{} · {}",
+                            event.operation,
+                            activity_result_label(event.result)
+                        ));
+                        ui.label(format!("DeviceId：{}", event.device_id));
+                        if let Some(path) = &event.path_summary {
+                            ui.label(format!("路径：{path}"));
+                        }
+                        ui.label(format!(
+                            "{} ms · {} bytes",
+                            event.duration_ms, event.transferred_bytes
+                        ));
+                    });
+                }
+            }
+        });
+
+        ui.separator();
+        ui.collapsing("Controller 备份", |ui| {
+            ui.label("导出内容使用 Argon2id + XChaCha20-Poly1305 加密；口令不会写入日志或命令行参数。");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.backup_passphrase)
+                    .password(true)
+                    .hint_text("备份口令（至少 12 bytes）"),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.backup_passphrase_confirm)
+                    .password(true)
+                    .hint_text("再次输入备份口令"),
+            );
+            let passphrase_valid = self.backup_passphrase.len() >= 12
+                && self.backup_passphrase == self.backup_passphrase_confirm;
+            if ui
+                .add_enabled(
+                    passphrase_valid && !self.backup_export_in_flight,
+                    egui::Button::new(if self.backup_export_in_flight {
+                        "正在导出…"
+                    } else {
+                        "导出加密备份…"
+                    }),
+                )
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("clew-controller-backup.json")
+                    .save_file()
+            {
+                if let Some(path) = path.to_str() {
+                    self.backend
+                        .backup_export(path.to_owned(), self.backup_passphrase.clone());
+                    self.backup_export_in_flight = true;
+                    self.backup_passphrase.clear();
+                    self.backup_passphrase_confirm.clear();
+                    self.notice = None;
+                } else {
+                    self.error = Some("备份路径必须是有效 UTF-8。".into());
+                }
+            }
+            ui.label("恢复备份必须在 Controller 停止且目标 state 为空时执行；当前使用 `clew backup-restore` 完成该离线安全步骤。之后可在此窗口完成 Recovery Review。 ");
+        });
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
             ui.horizontal(|ui| {

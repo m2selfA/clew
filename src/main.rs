@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{io::Write, path::PathBuf, process::ExitCode};
 
 #[cfg(any(windows, target_os = "macos"))]
 mod gui;
@@ -6,13 +6,17 @@ mod gui;
 mod host_gui;
 
 use clap::{Parser, Subcommand};
+use clew_core::{DeviceId, InviteId};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchState, acquire_host_instance,
-    resolve_host_launch,
+    complete_networked_activation, resolve_host_launch, serve_networked_membership_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
-use clew_runtime::{ControllerConfig, ControllerStart, LocalApiClient, start_controller};
+use clew_runtime::{
+    BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
+    RemoteReadRequest, restore_controller_backup, start_controller,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,6 +49,94 @@ enum Command {
     },
     /// Open the Controller GUI. Starts the Controller automatically if needed.
     Gui {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Create a signed networked site.clew invitation for this Controller platform.
+    Mint {
+        site_name: String,
+        #[arg(long = "root", value_name = "DIR", required = true)]
+        roots: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE", default_value = "site.clew")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        max_claims: u32,
+        #[arg(long, default_value_t = 168)]
+        valid_hours: u64,
+        #[arg(long, default_value_t = 24)]
+        deployment_hours: u64,
+        #[arg(long, default_value_t = 49_152)]
+        max_result_bytes: u32,
+        #[arg(long, default_value_t = 5_000)]
+        read_timeout_ms: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Close one bootstrap invite to future claims while keeping enrolled devices.
+    InviteClose {
+        invite_id: InviteId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Read one bounded byte range from an enrolled executable device.
+    Read {
+        device_id: DeviceId,
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 16_384)]
+        limit: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Rename an enrolled device in the Controller catalog.
+    Rename {
+        device_id: DeviceId,
+        display_name: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Revoke a device and disconnect its current session.
+    Revoke {
+        device_id: DeviceId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show recent bounded Controller activity.
+    Activity {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Clear local Controller activity history.
+    ActivityClear {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Export an encrypted Controller identity/state backup. Passphrase comes from an environment variable.
+    BackupExport {
+        output: PathBuf,
+        #[arg(long, default_value = "CLEW_BACKUP_PASSPHRASE")]
+        passphrase_env: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Restore an encrypted Controller backup into an empty, stopped Controller state.
+    BackupRestore {
+        input: PathBuf,
+        #[arg(long, default_value = "CLEW_BACKUP_PASSPHRASE")]
+        passphrase_env: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show whether a restored Controller is still paused for Recovery Review.
+    RecoveryStatus {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Confirm Recovery Review and allow restored DeviceKeys to reconnect.
+    RecoveryConfirm {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -121,6 +213,134 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        Command::Mint {
+            site_name,
+            roots,
+            output,
+            max_claims,
+            valid_hours,
+            deployment_hours,
+            max_result_bytes,
+            read_timeout_ms,
+            state_dir,
+        } => {
+            let valid_for_ms = valid_hours
+                .checked_mul(60 * 60 * 1_000)
+                .ok_or("invite validity is too large")?;
+            let deployment_window_ms = deployment_hours
+                .checked_mul(60 * 60 * 1_000)
+                .ok_or("deployment window is too large")?;
+            let config = controller_config(state_dir)?;
+            let result = LocalApiClient::new(config)
+                .invite_issue(InviteIssueRequest {
+                    site_name,
+                    roots: roots
+                        .into_iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect(),
+                    max_claims,
+                    valid_for_ms,
+                    deployment_window_ms,
+                    max_result_bytes,
+                    read_timeout_ms,
+                })
+                .await?;
+            if let Some(parent) = output.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            result.site_file.write(&output)?;
+            println!("{}", output.display());
+        }
+        Command::InviteClose {
+            invite_id,
+            state_dir,
+        } => {
+            let config = controller_config(state_dir)?;
+            LocalApiClient::new(config).invite_close(invite_id).await?;
+        }
+        Command::Read {
+            device_id,
+            path,
+            offset,
+            limit,
+            state_dir,
+        } => {
+            let config = controller_config(state_dir)?;
+            let result = LocalApiClient::new(config)
+                .read(RemoteReadRequest {
+                    device_id,
+                    path,
+                    offset,
+                    limit,
+                })
+                .await?;
+            std::io::stdout().write_all(&result.data)?;
+        }
+        Command::Rename {
+            device_id,
+            display_name,
+            state_dir,
+        } => {
+            let config = controller_config(state_dir)?;
+            let device = LocalApiClient::new(config)
+                .device_rename(device_id, display_name)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&device)?);
+        }
+        Command::Revoke {
+            device_id,
+            state_dir,
+        } => {
+            let config = controller_config(state_dir)?;
+            LocalApiClient::new(config).device_revoke(device_id).await?;
+        }
+        Command::Activity { limit, state_dir } => {
+            let config = controller_config(state_dir)?;
+            let activity = LocalApiClient::new(config).activity_list(limit).await?;
+            println!("{}", serde_json::to_string_pretty(&activity)?);
+        }
+        Command::ActivityClear { state_dir } => {
+            let config = controller_config(state_dir)?;
+            LocalApiClient::new(config).activity_clear().await?;
+        }
+        Command::BackupExport {
+            output,
+            passphrase_env,
+            state_dir,
+        } => {
+            let passphrase = backup_passphrase(&passphrase_env)?;
+            let path = output
+                .to_str()
+                .ok_or("backup output path must be valid UTF-8")?
+                .to_owned();
+            let config = controller_config(state_dir)?;
+            LocalApiClient::new(config)
+                .backup_export(BackupExportRequest { path, passphrase })
+                .await?;
+            println!("{}", output.display());
+        }
+        Command::BackupRestore {
+            input,
+            passphrase_env,
+            state_dir,
+        } => {
+            let passphrase = backup_passphrase(&passphrase_env)?;
+            let config = controller_config(state_dir)?;
+            let review = restore_controller_backup(&config, &input, &passphrase)?;
+            println!("{}", serde_json::to_string_pretty(&review)?);
+        }
+        Command::RecoveryStatus { state_dir } => {
+            let config = controller_config(state_dir)?;
+            let status = LocalApiClient::new(config).recovery_status().await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Command::RecoveryConfirm { state_dir } => {
+            let config = controller_config(state_dir)?;
+            let status = LocalApiClient::new(config).recovery_confirm().await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         Command::Shutdown { state_dir } => {
             let config = controller_config(state_dir)?;
             LocalApiClient::new(config).controller_shutdown().await?;
@@ -171,6 +391,7 @@ async fn run_host_foreground(
         }
         HostInstanceStart::Primary(instance) => instance,
     };
+    let state = complete_networked_activation(layout, state).await?;
     print_host_state(&state);
     if matches!(
         state,
@@ -178,14 +399,37 @@ async fn run_host_foreground(
     ) {
         return Ok(());
     }
-    instance
+
+    let remote = if let HostLaunchState::Active { membership, .. } = &state
+        && membership.marker.controller_endpoint.is_some()
+        && membership.marker.read_policy.is_some()
+    {
+        let membership = membership.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            serve_networked_membership_until(&membership, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        Some((shutdown_tx, task))
+    } else {
+        None
+    };
+
+    let serve_result = instance
         .serve_until(
             async {
                 let _ = tokio::signal::ctrl_c().await;
             },
             None,
         )
-        .await?;
+        .await;
+    if let Some((shutdown_tx, task)) = remote {
+        let _ = shutdown_tx.send(());
+        task.await??;
+    }
+    serve_result?;
     Ok(())
 }
 
@@ -204,6 +448,7 @@ async fn run_host_desktop(
             }
             HostInstanceStart::Primary(instance) => instance,
         };
+        state = complete_networked_activation(&layout, state).await?;
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(instance.serve_until(
@@ -212,9 +457,29 @@ async fn run_host_desktop(
             },
             Some(wake_tx),
         ));
+        let remote = if let HostLaunchState::Active { membership, .. } = &state
+            && membership.marker.controller_endpoint.is_some()
+            && membership.marker.read_policy.is_some()
+        {
+            let membership = membership.clone();
+            let (remote_shutdown_tx, remote_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                serve_networked_membership_until(&membership, async move {
+                    let _ = remote_shutdown_rx.await;
+                })
+                .await
+            });
+            Some((remote_shutdown_tx, task))
+        } else {
+            None
+        };
         let action = host_gui::run(state, wake_rx)?;
         let _ = shutdown_tx.send(());
         server.await??;
+        if let Some((remote_shutdown_tx, task)) = remote {
+            let _ = remote_shutdown_tx.send(());
+            task.await??;
+        }
         match action {
             host_gui::HostGuiAction::Exit => return Ok(()),
             host_gui::HostGuiAction::OpenSite(path) => {
@@ -268,6 +533,14 @@ fn print_host_state(state: &HostLaunchState) {
             }
         }
     }
+}
+
+fn backup_passphrase(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if name.is_empty() {
+        return Err("backup passphrase environment variable name cannot be empty".into());
+    }
+    std::env::var(name)
+        .map_err(|_| format!("backup passphrase environment variable {name} is not set").into())
 }
 
 fn controller_config(

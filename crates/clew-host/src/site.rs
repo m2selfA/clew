@@ -1,8 +1,10 @@
 use std::{fmt, path::Path};
 
+use clew_core::ReadPolicy;
 use clew_identity::{
     ControllerIdentity, ControllerPublicIdentity, IdentityError, SignedSiteBootstrapPass,
 };
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -120,6 +122,10 @@ pub struct SiteClewPayload {
     pub client_flavor_id: ClientFlavorId,
     pub bootstrap: SignedSiteBootstrapPass,
     pub role_hint: HostRoleHint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_endpoint: Option<EndpointAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_policy: Option<ReadPolicy>,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,9 +151,42 @@ impl SignedSiteClew {
         bootstrap: SignedSiteBootstrapPass,
         role_hint: HostRoleHint,
     ) -> Result<Self, SiteClewError> {
+        Self::issue_with_network(controller, client_flavor, bootstrap, role_hint, None, None)
+    }
+
+    pub fn issue_networked(
+        controller: &ControllerIdentity,
+        client_flavor: ClientFlavor,
+        bootstrap: SignedSiteBootstrapPass,
+        role_hint: HostRoleHint,
+        controller_endpoint: EndpointAddr,
+        read_policy: ReadPolicy,
+    ) -> Result<Self, SiteClewError> {
+        read_policy.validate()?;
+        Self::issue_with_network(
+            controller,
+            client_flavor,
+            bootstrap,
+            role_hint,
+            Some(controller_endpoint),
+            Some(read_policy),
+        )
+    }
+
+    fn issue_with_network(
+        controller: &ControllerIdentity,
+        client_flavor: ClientFlavor,
+        bootstrap: SignedSiteBootstrapPass,
+        role_hint: HostRoleHint,
+        controller_endpoint: Option<EndpointAddr>,
+        read_policy: Option<ReadPolicy>,
+    ) -> Result<Self, SiteClewError> {
         let bootstrap_controller = bootstrap.verify()?;
         if bootstrap_controller != controller.public_identity() {
             return Err(SiteClewError::ControllerMismatch);
+        }
+        if let Some(policy) = &read_policy {
+            policy.validate()?;
         }
         let client_flavor_id = client_flavor.id()?;
         let payload = SiteClewPayload {
@@ -156,6 +195,8 @@ impl SignedSiteClew {
             client_flavor_id,
             bootstrap,
             role_hint,
+            controller_endpoint,
+            read_policy,
         };
         let signature = controller.sign_site_config(&payload)?;
         Ok(Self { payload, signature })
@@ -167,6 +208,12 @@ impl SignedSiteClew {
         }
         if self.payload.client_flavor.id()? != self.payload.client_flavor_id {
             return Err(SiteClewError::FlavorFingerprintMismatch);
+        }
+        if let Some(policy) = &self.payload.read_policy {
+            policy.validate()?;
+        }
+        if self.payload.controller_endpoint.is_some() != self.payload.read_policy.is_some() {
+            return Err(SiteClewError::IncompleteNetworkConfig);
         }
         let controller = self.payload.bootstrap.verify()?;
         controller.verify_site_config(&self.payload, &self.signature)?;
@@ -299,6 +346,10 @@ pub enum SiteClewError {
     Io(#[from] std::io::Error),
     #[error("unsupported site.clew version {0}")]
     UnsupportedVersion(u32),
+    #[error(transparent)]
+    Policy(#[from] clew_core::ControlModelError),
+    #[error("site.clew network config must contain both endpoint and read policy")]
+    IncompleteNetworkConfig,
     #[error("site.clew belongs to a different Controller")]
     ControllerMismatch,
     #[error("site.clew ClientFlavor fingerprint does not match its descriptor")]
@@ -353,6 +404,58 @@ mod tests {
 
         let mut tampered = decoded;
         tampered.payload.role_hint = HostRoleHint::ConnectorOnly;
+        assert!(matches!(
+            tampered.verify(),
+            Err(SiteClewError::Identity(IdentityError::InvalidSignature))
+        ));
+    }
+
+    #[test]
+    fn networked_site_file_signs_endpoint_and_read_policy() {
+        let controller = ControllerIdentity::from_secret([72_u8; 32]);
+        let mut registry =
+            EnrollmentRegistry::new(controller.controller_id(), PermissionGrant::EXECUTE_READ);
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id: SiteId::new(),
+                    invite_id: InviteId::new(),
+                    site_name: "Network Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ,
+                    not_before_unix_ms: 1,
+                    expires_unix_ms: 10_000,
+                    deployment_window_ms: 1_000,
+                    max_claims: 2,
+                },
+            )
+            .unwrap();
+        let endpoint_secret = iroh::SecretKey::from_bytes(&[9_u8; 32]);
+        let endpoint = EndpointAddr {
+            id: endpoint_secret.public(),
+            addrs: Default::default(),
+        };
+        let policy = ReadPolicy::new(vec!["D:/shared".into()], 4096, 2_000).unwrap();
+        let file = SignedSiteClew::issue_networked(
+            &controller,
+            ClientFlavor::clew_original_current(),
+            bootstrap,
+            HostRoleHint::ExecutePreferred,
+            endpoint.clone(),
+            policy.clone(),
+        )
+        .unwrap();
+        let decoded = SignedSiteClew::from_bytes(&file.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.payload.controller_endpoint, Some(endpoint));
+        assert_eq!(decoded.payload.read_policy, Some(policy));
+
+        let mut tampered = decoded;
+        tampered
+            .payload
+            .read_policy
+            .as_mut()
+            .unwrap()
+            .max_result_bytes = 1;
         assert!(matches!(
             tampered.verify(),
             Err(SiteClewError::Identity(IdentityError::InvalidSignature))

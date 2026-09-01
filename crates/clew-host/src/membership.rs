@@ -5,13 +5,14 @@ use std::{
 };
 
 use clew_core::{
-    ControllerId, DeviceNameOrigin, DeviceRecord, InviteId, MAX_STATE_DOCUMENT_SIZE, SiteId,
-    StateCodecError, StateLayout, decode_state_json, encode_state_json,
+    ControllerId, DeviceNameOrigin, DeviceRecord, InviteId, MAX_STATE_DOCUMENT_SIZE, ReadPolicy,
+    SiteId, StateCodecError, StateLayout, decode_state_json, encode_state_json,
 };
 use clew_identity::{
     ActiveDeviceIdentity, ControllerPublicIdentity, DeviceIdentityStore, DeviceIdentityStoreError,
     EnrollmentReceipt, PendingDeviceIdentity,
 };
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -27,6 +28,10 @@ pub struct HostMembershipMarker {
     pub site_name: String,
     pub device_id: clew_core::DeviceId,
     pub invite_id: InviteId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_endpoint: Option<EndpointAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_policy: Option<ReadPolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +59,49 @@ impl HostMembershipStore {
         pending: &PendingDeviceIdentity,
         receipt: &EnrollmentReceipt,
         hostname: &str,
+    ) -> Result<HostMembership, HostMembershipError> {
+        self.activate_with_network(
+            client_flavor_id,
+            site_name,
+            pending,
+            receipt,
+            hostname,
+            None,
+            None,
+        )
+    }
+
+    pub fn activate_networked(
+        &self,
+        client_flavor_id: ClientFlavorId,
+        site_name: &str,
+        pending: &PendingDeviceIdentity,
+        receipt: &EnrollmentReceipt,
+        hostname: &str,
+        controller_endpoint: EndpointAddr,
+        read_policy: ReadPolicy,
+    ) -> Result<HostMembership, HostMembershipError> {
+        read_policy.validate()?;
+        self.activate_with_network(
+            client_flavor_id,
+            site_name,
+            pending,
+            receipt,
+            hostname,
+            Some(controller_endpoint),
+            Some(read_policy),
+        )
+    }
+
+    fn activate_with_network(
+        &self,
+        client_flavor_id: ClientFlavorId,
+        site_name: &str,
+        pending: &PendingDeviceIdentity,
+        receipt: &EnrollmentReceipt,
+        hostname: &str,
+        controller_endpoint: Option<EndpointAddr>,
+        read_policy: Option<ReadPolicy>,
     ) -> Result<HostMembership, HostMembershipError> {
         if receipt.controller_id != pending.controller().controller_id
             || receipt.site_id != pending.site_id()
@@ -86,7 +134,11 @@ impl HostMembershipStore {
             &record,
         )?;
         let identity_store = DeviceIdentityStore::new(self.layout.clone());
-        let identity = identity_store.promote_active(pending, receipt)?;
+        let identity = if controller_endpoint.is_some() {
+            identity_store.promote_active_pending_controller_ack(pending, receipt)?
+        } else {
+            identity_store.promote_active(pending, receipt)?
+        };
         let marker = HostMembershipMarker {
             client_flavor_id,
             controller: pending.controller(),
@@ -94,6 +146,8 @@ impl HostMembershipStore {
             site_name,
             device_id: receipt.device_id,
             invite_id: receipt.invite_id,
+            controller_endpoint,
+            read_policy,
         };
         write_or_verify_state(
             &self
@@ -153,6 +207,8 @@ impl HostMembershipStore {
         controller: ControllerPublicIdentity,
         site_id: SiteId,
         site_name: &str,
+        controller_endpoint: Option<EndpointAddr>,
+        read_policy: Option<ReadPolicy>,
     ) -> Result<Option<HostMembership>, HostMembershipError> {
         controller.validate()?;
         let identity_store = DeviceIdentityStore::new(self.layout.clone());
@@ -180,6 +236,8 @@ impl HostMembershipStore {
             site_name: validate_site_name(site_name)?,
             device_id: identity.device_id(),
             invite_id: identity.invite_id(),
+            controller_endpoint,
+            read_policy,
         };
         write_or_verify_state(
             &self
@@ -356,6 +414,8 @@ pub enum HostMembershipError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     State(#[from] StateCodecError),
+    #[error(transparent)]
+    Model(#[from] clew_core::ControlModelError),
     #[error(transparent)]
     Identity(#[from] clew_identity::IdentityError),
     #[error(transparent)]

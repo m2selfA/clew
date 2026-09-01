@@ -433,15 +433,16 @@ impl EnrollmentRegistry {
                 .iter_mut()
                 .find(|claim| claim.receipt.device_id == device_id)
                 .ok_or(EnrollmentError::MissingClaim)?;
-            match claim.status {
-                EnrollmentStatus::PendingHostPersist => {}
-                EnrollmentStatus::Active => return Err(EnrollmentError::FinalizedReplay),
-                EnrollmentStatus::Revoked => return Err(EnrollmentError::InviteRevoked),
-            }
             if !constant_time_eq(&claim.receipt.persist_ack_token, persist_ack_token) {
                 return Err(EnrollmentError::PersistTokenMismatch);
             }
-            claim.status = EnrollmentStatus::Active;
+            match claim.status {
+                EnrollmentStatus::PendingHostPersist => {
+                    claim.status = EnrollmentStatus::Active;
+                }
+                EnrollmentStatus::Active => {}
+                EnrollmentStatus::Revoked => return Err(EnrollmentError::InviteRevoked),
+            }
             claim.receipt.clone()
         };
 
@@ -476,6 +477,39 @@ impl EnrollmentRegistry {
         }
     }
 
+    pub fn revoke_device(&mut self, device_id: DeviceId) -> Result<(), EnrollmentError> {
+        let device = self
+            .devices
+            .get_mut(&device_id)
+            .ok_or(EnrollmentError::UnknownDevice(device_id))?;
+        device.status = EnrollmentStatus::Revoked;
+        if let Some(invite) = self.invites.get_mut(&device.invite_id)
+            && let Some(claim) = invite
+                .claims
+                .iter_mut()
+                .find(|claim| claim.receipt.device_id == device_id)
+        {
+            claim.status = EnrollmentStatus::Revoked;
+        }
+        Ok(())
+    }
+
+    pub fn revoke_site(&mut self, site_id: SiteId) -> Vec<DeviceId> {
+        let mut revoked = Vec::new();
+        let device_ids: Vec<_> = self
+            .devices
+            .values()
+            .filter(|device| device.site_id == site_id)
+            .map(|device| device.device_id)
+            .collect();
+        for device_id in device_ids {
+            if self.revoke_device(device_id).is_ok() {
+                revoked.push(device_id);
+            }
+        }
+        revoked
+    }
+
     pub fn close_all_invites(&mut self) {
         for state in self.invites.values_mut() {
             state.closed = true;
@@ -490,6 +524,17 @@ impl EnrollmentRegistry {
     #[must_use]
     pub fn device(&self, device_id: DeviceId) -> Option<&EnrollmentDeviceRecord> {
         self.devices.get(&device_id)
+    }
+
+    #[must_use]
+    pub fn devices(&self) -> impl Iterator<Item = &EnrollmentDeviceRecord> {
+        self.devices.values()
+    }
+
+    #[must_use]
+    pub fn is_device_active(&self, device_id: DeviceId) -> bool {
+        self.device(device_id)
+            .is_some_and(|device| device.status == EnrollmentStatus::Active)
     }
 }
 
@@ -533,6 +578,8 @@ pub enum EnrollmentError {
     FinalizedReplay,
     #[error("enrollment claim was not found")]
     MissingClaim,
+    #[error("unknown enrolled DeviceId {0}")]
+    UnknownDevice(DeviceId),
     #[error("host persist acknowledgement token does not match")]
     PersistTokenMismatch,
 }
@@ -598,10 +645,46 @@ mod tests {
         registry
             .finalize_host_persist(first.invite_id, first.device_id, first.persist_ack_token())
             .unwrap();
+        let repeated_finalize = registry
+            .finalize_host_persist(first.invite_id, first.device_id, first.persist_ack_token())
+            .unwrap();
+        assert_eq!(repeated_finalize.device_id, first.device_id);
+        assert_eq!(repeated_finalize.status, EnrollmentStatus::Active);
         assert!(matches!(
             registry.claim(&pass, device, 1_200),
             Err(EnrollmentError::FinalizedReplay)
         ));
+    }
+
+    #[test]
+    fn device_and_site_revoke_mark_future_authorization_inactive() {
+        let (controller, mut registry) = controller_and_registry();
+        let first_pass = registry.issue_bootstrap(&controller, spec(1)).unwrap();
+        let first_device = DeviceIdentity::generate().unwrap().public_identity();
+        let first = registry.claim(&first_pass, first_device, 1_100).unwrap();
+        registry
+            .finalize_host_persist(first.invite_id, first.device_id, first.persist_ack_token())
+            .unwrap();
+        assert!(registry.is_device_active(first.device_id));
+        registry.revoke_device(first.device_id).unwrap();
+        assert!(!registry.is_device_active(first.device_id));
+
+        let mut second_spec = spec(2);
+        second_spec.site_id = first.site_id;
+        let second_pass = registry.issue_bootstrap(&controller, second_spec).unwrap();
+        let second_device = DeviceIdentity::generate().unwrap().public_identity();
+        let second = registry.claim(&second_pass, second_device, 1_100).unwrap();
+        registry
+            .finalize_host_persist(
+                second.invite_id,
+                second.device_id,
+                second.persist_ack_token(),
+            )
+            .unwrap();
+        let revoked = registry.revoke_site(first.site_id);
+        assert!(revoked.contains(&first.device_id));
+        assert!(revoked.contains(&second.device_id));
+        assert!(!registry.is_device_active(second.device_id));
     }
 
     #[test]

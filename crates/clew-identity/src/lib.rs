@@ -7,8 +7,9 @@ mod keys;
 mod store;
 
 pub use backup::{
-    ControllerBackupPayload, EncryptedControllerBackup, RecoveryReview, RestoredController,
-    backup_from_json, backup_to_json, decrypt_controller_backup, encrypt_controller_backup,
+    BackupError, ControllerBackupPayload, EncryptedControllerBackup, RecoveryReview,
+    RestoredController, backup_from_json, backup_to_json, decrypt_controller_backup,
+    encrypt_controller_backup,
 };
 pub use enrollment::{
     EnrollmentDeviceRecord, EnrollmentError, EnrollmentReceipt, EnrollmentRegistry,
@@ -21,5 +22,5 @@ pub use keys::{
 };
 pub use store::{
     ActiveDeviceIdentity, ControllerIdentityStore, DeviceIdentityStore, DeviceIdentityStoreError,
-    PendingDeviceIdentity, StoredControllerIdentity,
+    PendingControllerActivation, PendingDeviceIdentity, StoredControllerIdentity,
 };

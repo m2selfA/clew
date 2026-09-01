@@ -6,8 +6,10 @@ edition.workspace = true
 [dependencies]
 clew-core = { path = "../clew-core" }
 clew-identity = { path = "../clew-identity" }
+clew-transport = { path = "../clew-transport" }
 getrandom.workspace = true
 hostname.workspace = true
+iroh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

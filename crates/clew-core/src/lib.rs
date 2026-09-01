@@ -1,10 +1,17 @@
 #![forbid(unsafe_code)]
 
+mod control;
 mod device;
 mod id;
 mod naming;
 mod state;
 
+pub use control::{
+    ActivityEvent, ActivityResult, ControlModelError, ControllerCatalog, ControllerDeviceRecord,
+    ControllerSiteRecord, HARD_ACTIVITY_RETENTION_MS, HARD_MAX_ACTIVITY_EVENTS,
+    HARD_MAX_READ_RESULT_BYTES, HARD_MAX_READ_ROOT_BYTES, HARD_MAX_READ_ROOTS,
+    HARD_MAX_READ_TIMEOUT_MS, ReadPolicy,
+};
 pub use device::{DeviceNameOrigin, DeviceRecord, DeviceSummary, MemberCapabilities, SiteMember};
 pub use id::{ControllerId, DeviceId, InviteId, SiteId, StableIdError};
 pub use naming::{

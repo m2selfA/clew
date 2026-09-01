@@ -185,9 +185,14 @@ fn resolve_site_file(
     let site_name = site_file.payload.bootstrap.payload.site_name.clone();
     let flavor_id = context.client_flavor.id()?;
     let memberships = HostMembershipStore::new(context.state_layout.clone());
-    if let Some(membership) =
-        memberships.recover_active_from_site(flavor_id, controller, site_id, &site_name)?
-    {
+    if let Some(membership) = memberships.recover_active_from_site(
+        flavor_id,
+        controller,
+        site_id,
+        &site_name,
+        site_file.payload.controller_endpoint.clone(),
+        site_file.payload.read_policy.clone(),
+    )? {
         return Ok(HostLaunchState::Active { membership, source });
     }
 

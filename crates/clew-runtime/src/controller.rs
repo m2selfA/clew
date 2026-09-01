@@ -1,18 +1,23 @@
 use std::{
     fs,
     future::Future,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use clew_core::STATE_SCHEMA_VERSION;
 use clew_identity::{ControllerIdentityStore, DeviceIdentityStoreError};
+use clew_transport::IrohOuter;
 use thiserror::Error;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 use uuid::Uuid;
 
 use crate::{
-    ControllerConfig, LocalApiClient, LocalApiClientError,
+    ControllerConfig, ControllerControlStore, LocalApiClient, LocalApiClientError,
+    MAX_REMOTE_CONNECTIONS, RemoteHub, handle_remote_connection,
     local_api::{
         ControllerStatus, LocalApiSecret, LocalApiState, MAX_LOCAL_API_CONNECTIONS,
         serve_connection,
@@ -32,6 +37,7 @@ pub struct ControllerRuntime {
     secret: LocalApiSecret,
     state: Arc<LocalApiState>,
     shutdown_rx: watch::Receiver<bool>,
+    remote: IrohOuter,
     // Keep ownership last so the IPC endpoint and in-memory state are dropped first.
     _ownership: ControllerOwnership,
 }
@@ -53,49 +59,77 @@ impl ControllerRuntime {
     {
         tokio::pin!(shutdown);
         let mut local_shutdown = self.shutdown_rx.clone();
-        let mut handlers = JoinSet::new();
-        loop {
-            if handlers.len() >= MAX_LOCAL_API_CONNECTIONS {
-                tokio::select! {
-                    _ = &mut shutdown => {
-                        handlers.abort_all();
-                        while handlers.join_next().await.is_some() {}
-                        return Ok(());
-                    }
-                    changed = local_shutdown.changed() => {
-                        if changed.is_err() || *local_shutdown.borrow() {
-                            handlers.abort_all();
-                            while handlers.join_next().await.is_some() {}
-                            return Ok(());
+        let mut local_handlers = JoinSet::new();
+        let mut remote_handlers = JoinSet::new();
+        let (remote_accept_tx, mut remote_accept_rx) = mpsc::channel(MAX_REMOTE_CONNECTIONS);
+        let remote_acceptor = self.remote.clone();
+        let mut remote_accept_task = tokio::spawn(async move {
+            loop {
+                match remote_acceptor.accept_classified().await {
+                    Ok(accepted) => {
+                        if remote_accept_tx.send(accepted).await.is_err() {
+                            return;
                         }
                     }
-                    _ = handlers.join_next() => {}
+                    Err(error) => {
+                        eprintln!("Clew remote accept failed: {error}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
-                continue;
             }
-
+        });
+        loop {
             tokio::select! {
                 _ = &mut shutdown => {
-                    handlers.abort_all();
-                    while handlers.join_next().await.is_some() {}
+                    remote_accept_task.abort();
+                    let _ = (&mut remote_accept_task).await;
+                    local_handlers.abort_all();
+                    remote_handlers.abort_all();
+                    while local_handlers.join_next().await.is_some() {}
+                    while remote_handlers.join_next().await.is_some() {}
+                    self.remote.close().await;
                     return Ok(());
                 }
                 changed = local_shutdown.changed() => {
                     if changed.is_err() || *local_shutdown.borrow() {
-                        handlers.abort_all();
-                        while handlers.join_next().await.is_some() {}
+                        remote_accept_task.abort();
+                        let _ = (&mut remote_accept_task).await;
+                        local_handlers.abort_all();
+                        remote_handlers.abort_all();
+                        while local_handlers.join_next().await.is_some() {}
+                        while remote_handlers.join_next().await.is_some() {}
+                        self.remote.close().await;
                         return Ok(());
                     }
                 }
-                accepted = self.listener.accept() => {
+                accepted = self.listener.accept(), if local_handlers.len() < MAX_LOCAL_API_CONNECTIONS => {
                     let stream = accepted?;
                     let secret = self.secret.clone();
                     let state = (*self.state).clone();
-                    handlers.spawn(async move {
+                    local_handlers.spawn(async move {
                         serve_connection(stream, secret, state).await;
                     });
                 }
-                _ = handlers.join_next(), if !handlers.is_empty() => {}
+                accepted = remote_accept_rx.recv(), if remote_handlers.len() < MAX_REMOTE_CONNECTIONS => {
+                    let Some((protocol, stream)) = accepted else {
+                        return Err(ControllerError::RemoteAcceptLoopStopped);
+                    };
+                    let identity = self.state.controller_identity.clone();
+                    let control = Arc::clone(&self.state.control);
+                    let hub = self.state.remote.clone();
+                    remote_handlers.spawn(async move {
+                        if let Err(error) =
+                            handle_remote_connection(protocol, stream, identity, control, hub).await
+                        {
+                            eprintln!(
+                                "Clew remote connection ended ({})",
+                                error.category()
+                            );
+                        }
+                    });
+                }
+                _ = local_handlers.join_next(), if !local_handlers.is_empty() => {}
+                _ = remote_handlers.join_next(), if !remote_handlers.is_empty() => {}
             }
         }
     }
@@ -124,6 +158,13 @@ pub async fn start_controller(
 
     let controller_identity = ControllerIdentityStore::new(layout.clone()).load_or_create()?;
     let controller_id = controller_identity.identity().controller_id();
+    let control = Arc::new(Mutex::new(ControllerControlStore::load_or_create(
+        layout.clone(),
+        controller_id,
+    )?));
+    let remote = IrohOuter::bind_with_secret(controller_identity.iroh_endpoint_secret()).await?;
+    let remote_endpoint_id = remote.addr().id.to_string();
+    let remote_hub = RemoteHub::default();
 
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
@@ -143,8 +184,12 @@ pub async fn start_controller(
             started_unix_ms,
             state_schema_version: STATE_SCHEMA_VERSION,
             local_api_version: crate::LOCAL_API_VERSION,
+            remote_endpoint_id: Some(remote_endpoint_id),
         },
-        devices: Vec::new(),
+        controller_identity: controller_identity.clone(),
+        controller_outer: Some(remote.clone()),
+        control,
+        remote: remote_hub,
         shutdown_tx,
     });
 
@@ -155,6 +200,7 @@ pub async fn start_controller(
         secret,
         state,
         shutdown_rx,
+        remote,
     }))
 }
 
@@ -166,6 +212,12 @@ pub enum ControllerError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     LocalApi(#[from] LocalApiClientError),
+    #[error(transparent)]
+    ControlStore(#[from] crate::ControlStoreError),
+    #[error(transparent)]
+    RemoteTransport(#[from] clew_transport::IrohOuterError),
+    #[error("remote accept loop stopped unexpectedly")]
+    RemoteAcceptLoopStopped,
     #[error("system clock is before the Unix epoch")]
     ClockBeforeUnixEpoch,
     #[error("system clock value does not fit in milliseconds")]

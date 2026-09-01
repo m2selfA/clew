@@ -1,4 +1,7 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::{self, FromStr},
+    time::Duration,
+};
 
 use clew_core::{ControllerId, DeviceId, SiteId};
 use clew_identity::{
@@ -19,6 +22,7 @@ const MAX_NOISE_PACKET: usize = 65_535;
 const MAX_IDENTITY_PROOF: usize = 8 * 1024;
 pub const MAX_INNER_PLAINTEXT: usize = 60 * 1024;
 const MAX_MESSAGE_KIND_BYTES: usize = 64;
+const BUSINESS_FRAME_HEADER_BYTES: usize = 4 + 8 + 1 + 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +56,39 @@ impl ControllerSessionIdentity {
             site_id,
         }
     }
+}
+
+#[derive(Clone)]
+pub struct ControllerSessionAuthority {
+    pub identity: ControllerIdentity,
+    pub noise_static_secret: [u8; 32],
+}
+
+impl ControllerSessionAuthority {
+    #[must_use]
+    pub fn from_stored(stored: &StoredControllerIdentity) -> Self {
+        Self {
+            identity: stored.identity().clone(),
+            noise_static_secret: stored.noise_static_secret(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ControllerSessionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControllerSessionAuthority")
+            .field("controller_id", &self.identity.controller_id())
+            .field("noise_static_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceSessionClaim {
+    pub device_identity: DevicePublicIdentity,
+    pub device_id: DeviceId,
+    pub site_id: SiteId,
 }
 
 impl std::fmt::Debug for ControllerSessionIdentity {
@@ -120,7 +157,10 @@ impl InnerMessage {
         if self.kind.is_empty() || self.kind.len() > MAX_MESSAGE_KIND_BYTES {
             return Err(InnerSessionError::InvalidMessageKind);
         }
-        let encoded_len = serde_json::to_vec(self)?.len();
+        let encoded_len = BUSINESS_FRAME_HEADER_BYTES
+            .checked_add(self.kind.len())
+            .and_then(|value| value.checked_add(self.payload.len()))
+            .ok_or(InnerSessionError::PlaintextTooLarge(usize::MAX))?;
         if encoded_len > MAX_INNER_PLAINTEXT {
             return Err(InnerSessionError::PlaintextTooLarge(encoded_len));
         }
@@ -198,35 +238,62 @@ impl InnerSession {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        identity.identity.public_identity().validate()?;
         identity.expected_device.validate()?;
-        let mut handshake = build_handshake(false, &identity.noise_static_secret)?;
+        let expected_device = identity.expected_device;
+        let expected_device_id = identity.device_id;
+        let expected_site_id = identity.site_id;
+        Self::accept_authorized(
+            stream,
+            ControllerSessionAuthority {
+                identity: identity.identity,
+                noise_static_secret: identity.noise_static_secret,
+            },
+            move |claim| {
+                claim.device_identity == expected_device
+                    && claim.device_id == expected_device_id
+                    && claim.site_id == expected_site_id
+            },
+        )
+        .await
+    }
+
+    pub async fn accept_authorized<S, F>(
+        stream: &mut S,
+        authority: ControllerSessionAuthority,
+        authorize: F,
+    ) -> Result<Self, InnerSessionError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+        F: FnOnce(&DeviceSessionClaim) -> bool,
+    {
+        authority.identity.public_identity().validate()?;
+        let mut handshake = build_handshake(false, &authority.noise_static_secret)?;
         responder_handshake(stream, &mut handshake).await?;
         let transcript = handshake.get_handshake_hash().to_vec();
         let mut transport = handshake.into_transport_mode()?;
 
         let device_proof: DeviceProof =
             read_encrypted_json(stream, &mut transport, MAX_IDENTITY_PROOF).await?;
-        validate_device_proof(
+        let claim = validate_untrusted_device_proof(
             &device_proof,
-            &identity.expected_device,
-            identity.identity.controller_id(),
+            authority.identity.controller_id(),
             &transcript,
-            identity.site_id,
-            identity.device_id,
         )?;
+        if !authorize(&claim) {
+            return Err(InnerSessionError::IdentityBindingMismatch);
+        }
 
         let body = ControllerProofBody {
             wire_major: clew_proto::WIRE_MAJOR,
             role: InnerRole::Controller,
             transcript_hash: transcript,
-            controller_id: identity.identity.controller_id(),
-            site_id: identity.site_id,
-            device_id: identity.device_id,
-            controller_identity: identity.identity.public_identity(),
+            controller_id: authority.identity.controller_id(),
+            site_id: claim.site_id,
+            device_id: claim.device_id,
+            controller_identity: authority.identity.public_identity(),
         };
         let proof = ControllerProof {
-            signature: identity.identity.sign_session_binding(&body)?,
+            signature: authority.identity.sign_session_binding(&body)?,
             body,
         };
         write_encrypted_json(stream, &mut transport, &proof, MAX_IDENTITY_PROOF).await?;
@@ -237,9 +304,9 @@ impl InnerSession {
             recv_sequence: 0,
             poisoned: false,
             peer_role: InnerRole::Device,
-            controller_id: identity.identity.controller_id(),
-            device_id: identity.device_id,
-            site_id: identity.site_id,
+            controller_id: authority.identity.controller_id(),
+            device_id: claim.device_id,
+            site_id: claim.site_id,
         })
     }
 
@@ -301,15 +368,7 @@ impl InnerSession {
             return Err(InnerSessionError::SessionPoisoned);
         }
         message.validate()?;
-        let frame = BusinessFrame {
-            wire_major: clew_proto::WIRE_MAJOR,
-            sequence: self.send_sequence,
-            message: message.clone(),
-        };
-        let plaintext = serde_json::to_vec(&frame)?;
-        if plaintext.len() > MAX_INNER_PLAINTEXT {
-            return Err(InnerSessionError::PlaintextTooLarge(plaintext.len()));
-        }
+        let plaintext = encode_business_frame(self.send_sequence, message)?;
         let mut ciphertext = vec![0_u8; plaintext.len() + 16];
         let written = self.transport.write_message(&plaintext, &mut ciphertext)?;
         ciphertext.truncate(written);
@@ -334,22 +393,22 @@ impl InnerSession {
             if plaintext.len() > MAX_INNER_PLAINTEXT {
                 return Err(InnerSessionError::PlaintextTooLarge(plaintext.len()));
             }
-            let frame: BusinessFrame = serde_json::from_slice(&plaintext)?;
-            if frame.wire_major != clew_proto::WIRE_MAJOR {
-                return Err(InnerSessionError::WrongWireMajor(frame.wire_major));
+            let (wire_major, sequence, message) = decode_business_frame(&plaintext)?;
+            if wire_major != clew_proto::WIRE_MAJOR {
+                return Err(InnerSessionError::WrongWireMajor(wire_major));
             }
-            if frame.sequence != self.recv_sequence {
+            if sequence != self.recv_sequence {
                 return Err(InnerSessionError::UnexpectedSequence {
                     expected: self.recv_sequence,
-                    actual: frame.sequence,
+                    actual: sequence,
                 });
             }
-            frame.message.validate()?;
+            message.validate()?;
             self.recv_sequence = self
                 .recv_sequence
                 .checked_add(1)
                 .ok_or(InnerSessionError::SequenceExhausted)?;
-            Ok(frame.message)
+            Ok(message)
         })();
         if result.is_err() {
             self.poisoned = true;
@@ -358,11 +417,69 @@ impl InnerSession {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BusinessFrame {
-    wire_major: u32,
+fn encode_business_frame(
     sequence: u64,
-    message: InnerMessage,
+    message: &InnerMessage,
+) -> Result<Vec<u8>, InnerSessionError> {
+    message.validate()?;
+    let kind_len: u8 = message
+        .kind
+        .len()
+        .try_into()
+        .map_err(|_| InnerSessionError::InvalidMessageKind)?;
+    let payload_len: u32 = message
+        .payload
+        .len()
+        .try_into()
+        .map_err(|_| InnerSessionError::PlaintextTooLarge(message.payload.len()))?;
+    let total = BUSINESS_FRAME_HEADER_BYTES
+        .checked_add(kind_len as usize)
+        .and_then(|value| value.checked_add(payload_len as usize))
+        .ok_or(InnerSessionError::MalformedBusinessFrame)?;
+    if total > MAX_INNER_PLAINTEXT {
+        return Err(InnerSessionError::PlaintextTooLarge(total));
+    }
+    let mut frame = Vec::with_capacity(total);
+    frame.extend_from_slice(&clew_proto::WIRE_MAJOR.to_be_bytes());
+    frame.extend_from_slice(&sequence.to_be_bytes());
+    frame.push(kind_len);
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.extend_from_slice(message.kind.as_bytes());
+    frame.extend_from_slice(&message.payload);
+    Ok(frame)
+}
+
+fn decode_business_frame(frame: &[u8]) -> Result<(u32, u64, InnerMessage), InnerSessionError> {
+    if frame.len() < BUSINESS_FRAME_HEADER_BYTES || frame.len() > MAX_INNER_PLAINTEXT {
+        return Err(InnerSessionError::MalformedBusinessFrame);
+    }
+    let wire_major = u32::from_be_bytes(frame[0..4].try_into().expect("fixed header slice"));
+    let sequence = u64::from_be_bytes(frame[4..12].try_into().expect("fixed header slice"));
+    let kind_len = frame[12] as usize;
+    let payload_len =
+        u32::from_be_bytes(frame[13..17].try_into().expect("fixed header slice")) as usize;
+    if kind_len == 0 || kind_len > MAX_MESSAGE_KIND_BYTES {
+        return Err(InnerSessionError::InvalidMessageKind);
+    }
+    let kind_start = BUSINESS_FRAME_HEADER_BYTES;
+    let payload_start = kind_start
+        .checked_add(kind_len)
+        .ok_or(InnerSessionError::MalformedBusinessFrame)?;
+    let end = payload_start
+        .checked_add(payload_len)
+        .ok_or(InnerSessionError::MalformedBusinessFrame)?;
+    if end != frame.len() {
+        return Err(InnerSessionError::MalformedBusinessFrame);
+    }
+    let kind = str::from_utf8(&frame[kind_start..payload_start])
+        .map_err(|_| InnerSessionError::InvalidMessageKindEncoding)?
+        .to_owned();
+    let message = InnerMessage {
+        kind,
+        payload: frame[payload_start..end].to_vec(),
+    };
+    message.validate()?;
+    Ok((wire_major, sequence, message))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -399,26 +516,28 @@ struct ControllerProof {
     signature: Vec<u8>,
 }
 
-fn validate_device_proof(
+fn validate_untrusted_device_proof(
     proof: &DeviceProof,
-    expected: &DevicePublicIdentity,
     controller_id: ControllerId,
     transcript: &[u8],
-    site_id: SiteId,
-    device_id: DeviceId,
-) -> Result<(), InnerSessionError> {
+) -> Result<DeviceSessionClaim, InnerSessionError> {
     if proof.body.wire_major != clew_proto::WIRE_MAJOR
         || proof.body.role != InnerRole::Device
         || proof.body.transcript_hash != transcript
         || proof.body.controller_id != controller_id
-        || proof.body.site_id != site_id
-        || proof.body.device_id != device_id
-        || &proof.body.device_identity != expected
     {
         return Err(InnerSessionError::IdentityBindingMismatch);
     }
-    expected.verify_session_binding(&proof.body, &proof.signature)?;
-    Ok(())
+    proof.body.device_identity.validate()?;
+    proof
+        .body
+        .device_identity
+        .verify_session_binding(&proof.body, &proof.signature)?;
+    Ok(DeviceSessionClaim {
+        device_identity: proof.body.device_identity,
+        device_id: proof.body.device_id,
+        site_id: proof.body.site_id,
+    })
 }
 
 fn validate_controller_proof(
@@ -602,6 +721,10 @@ pub enum InnerSessionError {
     PlaintextTooLarge(usize),
     #[error("inner message kind must be 1..={MAX_MESSAGE_KIND_BYTES} bytes")]
     InvalidMessageKind,
+    #[error("inner business frame is malformed")]
+    MalformedBusinessFrame,
+    #[error("inner message kind is not valid UTF-8")]
+    InvalidMessageKindEncoding,
     #[error("inner frame uses wire major {0}")]
     WrongWireMajor(u32),
     #[error("inner frame sequence mismatch: expected {expected}, got {actual}")]
@@ -655,6 +778,56 @@ mod tests {
         assert_eq!(controller.controller_id(), device.controller_id());
         assert_eq!(controller.device_id(), device.device_id());
         assert_eq!(controller.site_id(), device.site_id());
+    }
+
+    #[tokio::test]
+    async fn dynamic_authorizer_resolves_device_only_after_encrypted_proof() {
+        let (controller, device) = identities();
+        let expected_public = device.identity.public_identity();
+        let expected_device_id = device.device_id;
+        let expected_site_id = device.site_id;
+        let (mut left, mut right) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            InnerSession::accept_authorized(
+                &mut left,
+                ControllerSessionAuthority {
+                    identity: controller.identity,
+                    noise_static_secret: controller.noise_static_secret,
+                },
+                move |claim| {
+                    claim.device_identity == expected_public
+                        && claim.device_id == expected_device_id
+                        && claim.site_id == expected_site_id
+                },
+            )
+            .await
+        });
+        let client = InnerSession::connect(&mut right, device).await.unwrap();
+        let accepted = server.await.unwrap().unwrap();
+        assert_eq!(accepted.device_id(), client.device_id());
+        assert_eq!(accepted.site_id(), client.site_id());
+    }
+
+    #[tokio::test]
+    async fn dynamic_authorizer_rejects_self_signed_but_unknown_device() {
+        let (controller, device) = identities();
+        let (mut left, mut right) = tokio::io::duplex(128 * 1024);
+        let server = tokio::spawn(async move {
+            InnerSession::accept_authorized(
+                &mut left,
+                ControllerSessionAuthority {
+                    identity: controller.identity,
+                    noise_static_secret: controller.noise_static_secret,
+                },
+                |_| false,
+            )
+            .await
+        });
+        let _client = tokio::spawn(async move { InnerSession::connect(&mut right, device).await });
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(InnerSessionError::IdentityBindingMismatch)
+        ));
     }
 
     #[tokio::test]
@@ -734,6 +907,18 @@ mod tests {
             controller.recv(&mut eof).await,
             Err(InnerSessionError::SessionPoisoned)
         ));
+    }
+
+    #[tokio::test]
+    async fn binary_business_frame_carries_max_v1_read_payload_without_json_expansion() {
+        let (mut controller, mut device) = session_pair().await;
+        let payload = vec![0xA5; clew_core::HARD_MAX_READ_RESULT_BYTES as usize];
+        let message = InnerMessage::new("read_result", payload.clone()).unwrap();
+        let ciphertext = device.seal(&message).unwrap();
+        assert!(ciphertext.len() < MAX_INNER_PLAINTEXT + 16);
+        let decoded = controller.open(&ciphertext).unwrap();
+        assert_eq!(decoded.kind, "read_result");
+        assert_eq!(decoded.payload, payload);
     }
 
     #[tokio::test]

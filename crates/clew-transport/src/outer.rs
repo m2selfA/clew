@@ -6,11 +6,17 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, EndpointAddr,
+    Endpoint, EndpointAddr, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrohProtocol {
+    InnerSession,
+    Bootstrap,
+}
 
 #[derive(Clone, Debug)]
 pub struct IrohOuter {
@@ -20,7 +26,17 @@ pub struct IrohOuter {
 impl IrohOuter {
     pub async fn bind() -> Result<Self, IrohOuterError> {
         let endpoint = Endpoint::builder(presets::N0)
-            .alpns(vec![clew_proto::ALPN.to_vec()])
+            .alpns(supported_alpns())
+            .bind()
+            .await
+            .map_err(IrohOuterError::from_display)?;
+        Ok(Self { endpoint })
+    }
+
+    pub async fn bind_with_secret(secret: [u8; 32]) -> Result<Self, IrohOuterError> {
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(SecretKey::from_bytes(&secret))
+            .alpns(supported_alpns())
             .bind()
             .await
             .map_err(IrohOuterError::from_display)?;
@@ -29,7 +45,17 @@ impl IrohOuter {
 
     pub async fn bind_direct_only() -> Result<Self, IrohOuterError> {
         let endpoint = Endpoint::builder(presets::N0DisableRelay)
-            .alpns(vec![clew_proto::ALPN.to_vec()])
+            .alpns(supported_alpns())
+            .bind()
+            .await
+            .map_err(IrohOuterError::from_display)?;
+        Ok(Self { endpoint })
+    }
+
+    pub async fn bind_direct_only_with_secret(secret: [u8; 32]) -> Result<Self, IrohOuterError> {
+        let endpoint = Endpoint::builder(presets::N0DisableRelay)
+            .secret_key(SecretKey::from_bytes(&secret))
+            .alpns(supported_alpns())
             .bind()
             .await
             .map_err(IrohOuterError::from_display)?;
@@ -41,11 +67,15 @@ impl IrohOuter {
         self.endpoint.addr()
     }
 
-    pub async fn relay_only_addr(&self) -> Result<EndpointAddr, IrohOuterError> {
+    pub async fn online_addr(&self) -> Result<EndpointAddr, IrohOuterError> {
         tokio::time::timeout(Duration::from_secs(20), self.endpoint.online())
             .await
             .map_err(|_| IrohOuterError::RelayOnlineTimeout)?;
-        let EndpointAddr { id, addrs } = self.endpoint.addr();
+        Ok(self.endpoint.addr())
+    }
+
+    pub async fn relay_only_addr(&self) -> Result<EndpointAddr, IrohOuterError> {
+        let EndpointAddr { id, addrs } = self.online_addr().await?;
         let mut relay_only = EndpointAddr {
             id,
             addrs: Default::default(),
@@ -62,9 +92,26 @@ impl IrohOuter {
     }
 
     pub async fn connect(&self, addr: EndpointAddr) -> Result<IrohStream, IrohOuterError> {
+        self.connect_with_protocol(addr, IrohProtocol::InnerSession)
+            .await
+    }
+
+    pub async fn connect_bootstrap(
+        &self,
+        addr: EndpointAddr,
+    ) -> Result<IrohStream, IrohOuterError> {
+        self.connect_with_protocol(addr, IrohProtocol::Bootstrap)
+            .await
+    }
+
+    async fn connect_with_protocol(
+        &self,
+        addr: EndpointAddr,
+        protocol: IrohProtocol,
+    ) -> Result<IrohStream, IrohOuterError> {
         let connection = self
             .endpoint
-            .connect(addr, clew_proto::ALPN)
+            .connect(addr, protocol.alpn())
             .await
             .map_err(IrohOuterError::from_display)?;
         let (send, recv) = connection
@@ -79,26 +126,64 @@ impl IrohOuter {
     }
 
     pub async fn accept(&self) -> Result<IrohStream, IrohOuterError> {
+        let (protocol, stream) = self.accept_classified().await?;
+        if protocol != IrohProtocol::InnerSession {
+            return Err(IrohOuterError::UnexpectedProtocol(protocol));
+        }
+        Ok(stream)
+    }
+
+    pub async fn accept_classified(&self) -> Result<(IrohProtocol, IrohStream), IrohOuterError> {
         let incoming = self
             .endpoint
             .accept()
             .await
             .ok_or(IrohOuterError::EndpointClosed)?;
         let connection = incoming.await.map_err(IrohOuterError::from_display)?;
+        let protocol = IrohProtocol::from_alpn(connection.alpn())?;
         let (send, recv) = connection
             .accept_bi()
             .await
             .map_err(IrohOuterError::from_display)?;
-        Ok(IrohStream {
-            connection,
-            send,
-            recv,
-        })
+        Ok((
+            protocol,
+            IrohStream {
+                connection,
+                send,
+                recv,
+            },
+        ))
     }
 
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
+}
+
+impl IrohProtocol {
+    const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::InnerSession => clew_proto::ALPN,
+            Self::Bootstrap => clew_proto::BOOTSTRAP_ALPN,
+        }
+    }
+
+    fn from_alpn(alpn: &[u8]) -> Result<Self, IrohOuterError> {
+        if alpn == clew_proto::ALPN {
+            Ok(Self::InnerSession)
+        } else if alpn == clew_proto::BOOTSTRAP_ALPN {
+            Ok(Self::Bootstrap)
+        } else {
+            Err(IrohOuterError::UnsupportedAlpn)
+        }
+    }
+}
+
+fn supported_alpns() -> Vec<Vec<u8>> {
+    vec![
+        clew_proto::ALPN.to_vec(),
+        clew_proto::BOOTSTRAP_ALPN.to_vec(),
+    ]
 }
 
 #[derive(Debug)]
@@ -151,6 +236,10 @@ pub enum IrohOuterError {
     RelayOnlineTimeout,
     #[error("iroh endpoint has no advertised relay address")]
     NoRelayAddress,
+    #[error("iroh negotiated an unsupported ALPN")]
+    UnsupportedAlpn,
+    #[error("iroh connection used unexpected protocol {0:?}")]
+    UnexpectedProtocol(IrohProtocol),
     #[error("iroh outer transport failed: {0}")]
     Iroh(String),
 }
@@ -213,6 +302,38 @@ mod tests {
         fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_shutdown(cx)
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_alpn_is_classified_separately_from_inner_session() {
+        let server = IrohOuter::bind_direct_only().await.unwrap();
+        let client = IrohOuter::bind_direct_only().await.unwrap();
+        let server_addr = server.addr();
+        let accepted = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept_classified().await.unwrap().0 }
+        });
+        let mut stream = client.connect_bootstrap(server_addr).await.unwrap();
+        stream.write_all(b"bootstrap").await.unwrap();
+        stream.flush().await.unwrap();
+        assert_eq!(accepted.await.unwrap(), IrohProtocol::Bootstrap);
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_secret_keeps_endpoint_id_stable_across_rebind() {
+        let secret = [73_u8; 32];
+        let first = IrohOuter::bind_direct_only_with_secret(secret)
+            .await
+            .unwrap();
+        let first_id = first.addr().id;
+        first.close().await;
+        let second = IrohOuter::bind_direct_only_with_secret(secret)
+            .await
+            .unwrap();
+        assert_eq!(second.addr().id, first_id);
+        second.close().await;
     }
 
     #[tokio::test]
