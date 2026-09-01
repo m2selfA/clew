@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Clew">
+  <rect width="512" height="512" rx="112" fill="#F7F4EC"/>
+  <g fill="none" stroke="#E2B657" stroke-width="14" stroke-linecap="round">
+    <ellipse cx="248" cy="250" rx="108" ry="108"/>
+    <ellipse cx="248" cy="250" rx="108" ry="48" transform="rotate(-18 248 250)"/>
+    <ellipse cx="248" cy="250" rx="108" ry="48" transform="rotate(28 248 250)"/>
+    <ellipse cx="248" cy="250" rx="108" ry="48" transform="rotate(72 248 250)"/>
+    <ellipse cx="248" cy="250" rx="48" ry="108" transform="rotate(12 248 250)"/>
+  </g>
+  <path d="M330 300 C368 328 392 318 410 348" fill="none" stroke="#7EB8D4" stroke-width="14" stroke-linecap="round"/>
+</svg>

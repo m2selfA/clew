@@ -1,0 +1,21 @@
+/target/
+/dist/
+/artifacts/
+/.clew/
+/.clew-cache/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

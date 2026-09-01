@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Clew mark">
+  <g fill="none" stroke="#C9963A" stroke-width="10" stroke-linecap="round">
+    <ellipse cx="120" cy="124" rx="72" ry="72"/>
+    <ellipse cx="120" cy="124" rx="72" ry="30" transform="rotate(-18 120 124)"/>
+    <ellipse cx="120" cy="124" rx="72" ry="30" transform="rotate(28 120 124)"/>
+    <ellipse cx="120" cy="124" rx="72" ry="30" transform="rotate(72 120 124)"/>
+    <ellipse cx="120" cy="124" rx="30" ry="72" transform="rotate(12 120 124)"/>
+  </g>
+  <path d="M176 156 C204 176 220 168 232 190" fill="none" stroke="#7EB8D4" stroke-width="10" stroke-linecap="round"/>
+</svg>

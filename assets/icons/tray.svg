@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="Clew tray">
+  <circle cx="15" cy="15" r="9" fill="none" stroke="#C9963A" stroke-width="2"/>
+  <ellipse cx="15" cy="15" rx="9" ry="3.5" fill="none" stroke="#C9963A" stroke-width="1.6" transform="rotate(30 15 15)"/>
+  <path d="M22 18 q5 3 7 7" fill="none" stroke="#7EB8D4" stroke-width="2" stroke-linecap="round"/>
+</svg>

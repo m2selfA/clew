@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Clew app">
+  <rect width="256" height="256" rx="56" fill="#F7F4EC"/>
+  <g fill="none" stroke="#E2B657" stroke-width="8" stroke-linecap="round">
+    <ellipse cx="124" cy="124" rx="54" ry="54"/>
+    <ellipse cx="124" cy="124" rx="54" ry="24" transform="rotate(-18 124 124)"/>
+    <ellipse cx="124" cy="124" rx="54" ry="24" transform="rotate(28 124 124)"/>
+    <ellipse cx="124" cy="124" rx="54" ry="24" transform="rotate(72 124 124)"/>
+    <ellipse cx="124" cy="124" rx="24" ry="54" transform="rotate(12 124 124)"/>
+  </g>
+  <path d="M166 150 C186 166 198 160 208 176" fill="none" stroke="#7EB8D4" stroke-width="8" stroke-linecap="round"/>
+</svg>

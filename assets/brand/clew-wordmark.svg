@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="200" viewBox="0 0 640 200" role="img" aria-label="clew">
+  <rect width="640" height="200" fill="#F7F4EC"/>
+  <g fill="none" stroke="#C9963A" stroke-width="7" stroke-linecap="round">
+    <ellipse cx="92" cy="100" rx="44" ry="44"/>
+    <ellipse cx="92" cy="100" rx="44" ry="18" transform="rotate(-18 92 100)"/>
+    <ellipse cx="92" cy="100" rx="44" ry="18" transform="rotate(28 92 100)"/>
+    <ellipse cx="92" cy="100" rx="44" ry="18" transform="rotate(72 92 100)"/>
+  </g>
+  <path d="M126 120 C148 132 158 126 168 142" fill="none" stroke="#7EB8D4" stroke-width="7" stroke-linecap="round"/>
+  <text x="214" y="118" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="72" font-weight="600" fill="#3D3A35">clew</text>
+</svg>
