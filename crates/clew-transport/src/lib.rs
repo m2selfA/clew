@@ -4,6 +4,7 @@ mod connector;
 mod discovery;
 mod inner;
 mod lease;
+mod nearby;
 mod outer;
 mod protocol;
 mod sealed_bootstrap;
@@ -27,6 +28,10 @@ pub use lease::{
     CONNECTOR_LEASE_MESSAGE_KIND, CONNECTOR_LEASE_VERSION, ConnectorLease, ConnectorLeaseError,
     ConnectorLeaseRole, MAX_CONNECTOR_LEASE_ENCODED_BYTES, MAX_CONNECTOR_LEASE_LIFETIME_MS,
     SignedConnectorLease,
+};
+pub use nearby::{
+    MAX_NEARBY_CONNECTOR_ADDRS, MAX_NEARBY_CONNECTOR_FILE_BYTES, NEARBY_CONNECTOR_FILE_KIND,
+    NEARBY_CONNECTOR_FILE_VERSION, NearbyConnectorError, NearbyConnectorFile,
 };
 pub use outer::{IrohOuter, IrohOuterError, IrohProtocol, IrohStream};
 pub use protocol::{

@@ -61,12 +61,11 @@ impl SignedConnectorLease {
         Ok(signed)
     }
 
-    pub fn verify_for_candidate(
+    pub fn verify_binding_for_candidate(
         &self,
         pinned_controller: &ControllerPublicIdentity,
         expected_site_id: SiteId,
         expected_endpoint_id: EndpointId,
-        now_unix_ms: u64,
     ) -> Result<DeviceId, ConnectorLeaseError> {
         self.check_size()?;
         validate_payload(&self.payload)?;
@@ -80,13 +79,28 @@ impl SignedConnectorLease {
         if self.payload.connector_endpoint_id != *expected_endpoint_id.as_bytes() {
             return Err(ConnectorLeaseError::EndpointMismatch);
         }
+        Ok(self.payload.connector_device_id)
+    }
+
+    pub fn verify_for_candidate(
+        &self,
+        pinned_controller: &ControllerPublicIdentity,
+        expected_site_id: SiteId,
+        expected_endpoint_id: EndpointId,
+        now_unix_ms: u64,
+    ) -> Result<DeviceId, ConnectorLeaseError> {
+        let device_id = self.verify_binding_for_candidate(
+            pinned_controller,
+            expected_site_id,
+            expected_endpoint_id,
+        )?;
         if now_unix_ms < self.payload.issued_unix_ms {
             return Err(ConnectorLeaseError::NotYetValid);
         }
         if now_unix_ms >= self.payload.expires_unix_ms {
             return Err(ConnectorLeaseError::Expired);
         }
-        Ok(self.payload.connector_device_id)
+        Ok(device_id)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConnectorLeaseError> {
@@ -224,6 +238,12 @@ mod tests {
             signed.verify_for_candidate(&controller.public_identity(), site, ep, 61_000),
             Err(ConnectorLeaseError::Expired)
         ));
+        assert_eq!(
+            signed
+                .verify_binding_for_candidate(&controller.public_identity(), site, ep)
+                .unwrap(),
+            device
+        );
         assert!(matches!(
             signed.verify_for_candidate(&controller.public_identity(), site, ep, 999),
             Err(ConnectorLeaseError::NotYetValid)

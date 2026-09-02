@@ -3,6 +3,7 @@
 mod instance;
 mod membership;
 mod naming;
+mod nearby;
 mod outfit;
 mod read;
 mod remote;
@@ -18,6 +19,10 @@ pub use membership::{
 pub use naming::{
     HostNamingError, apply_hostname_collision_policy, normalize_hostname, observed_hostname,
 };
+pub use nearby::{
+    LEGACY_NEARBY_CONNECTOR_FILE_NAME, NEARBY_CONNECTOR_FILE_NAME, NearbyConnectorStore,
+    NearbyConnectorStoreError,
+};
 pub use outfit::{
     KEY_AWAITING_ENROLLMENT, KEY_CHOOSE_INVITE, KEY_EXIT_AND_DISCONNECT, KEY_EXTRACT_FIRST,
     KEY_HELPER_READY, KEY_HIDE_TO_TRAY, KEY_MISSING_INVITE_BODY, KEY_MISSING_INVITE_TITLE,
@@ -30,7 +35,8 @@ pub use outfit::{
 pub use read::HostReadService;
 pub use remote::{
     HostRemoteError, complete_networked_activation, serve_networked_membership_once,
-    serve_networked_membership_until, wait_for_networked_activation_until,
+    serve_networked_membership_once_with_layout, serve_networked_membership_until,
+    serve_networked_membership_until_with_layout, wait_for_networked_activation_until,
 };
 pub use runtime::{
     HostLaunchContext, HostLaunchError, HostLaunchState, HostSiteSource, MissingInviteView,

@@ -276,8 +276,10 @@ mod tests {
         }
     }
 
+    #[ignore = "requires working multicast mDNS on the test network"]
     #[tokio::test]
     async fn real_mdns_discovers_only_same_site_and_connects() {
+        // Explicit integration: multicast mDNS can be disabled by VM/enterprise network policy.
         let controller_id = ControllerId::from_bytes([51_u8; 16]).unwrap();
         let wanted_site = SiteId::from_bytes([52_u8; 16]).unwrap();
         let wrong_site = SiteId::from_bytes([53_u8; 16]).unwrap();

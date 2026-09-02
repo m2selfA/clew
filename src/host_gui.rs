@@ -4,7 +4,10 @@ use std::{
 };
 
 use clew_core::{ControllerId, SiteId, StateLayout};
-use clew_host::{HostLaunchState, OutfitAssetRef, OutfitProfile, OutfitRuntimeView};
+use clew_host::{
+    HostLaunchState, LEGACY_NEARBY_CONNECTOR_FILE_NAME, NEARBY_CONNECTOR_FILE_NAME,
+    NearbyConnectorStore, OutfitAssetRef, OutfitProfile, OutfitRuntimeView,
+};
 use clew_runtime::{OutfitAssetError, OutfitAssetPreview, OutfitAssetStore};
 use eframe::egui;
 use tokio::sync::mpsc;
@@ -54,6 +57,7 @@ pub fn run(
         Box::new(move |cc| {
             Ok(Box::new(HostApp::new(
                 cc,
+                layout.clone(),
                 state,
                 outfit,
                 visuals,
@@ -188,6 +192,7 @@ fn render_asset_ref(
 }
 
 struct HostApp {
+    layout: StateLayout,
     state: HostLaunchState,
     outfit: OutfitRuntimeView,
     wake_rx: mpsc::UnboundedReceiver<()>,
@@ -197,12 +202,14 @@ struct HostApp {
     logo: Option<egui::TextureHandle>,
     key_visual: Option<egui::TextureHandle>,
     action: Arc<Mutex<Option<HostGuiAction>>>,
+    nearby_message: Option<String>,
     exit_requested: bool,
 }
 
 impl HostApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
+        layout: StateLayout,
         state: HostLaunchState,
         outfit: OutfitRuntimeView,
         visuals: HostVisualAssets,
@@ -243,6 +250,7 @@ impl HostApp {
             .map(|preview| preview_texture(&cc.egui_ctx, "host-key-visual", preview))
             .transpose()?;
         Ok(Self {
+            layout,
             state,
             outfit,
             wake_rx,
@@ -252,6 +260,7 @@ impl HostApp {
             logo,
             key_visual,
             action,
+            nearby_message: None,
             exit_requested: false,
         })
     }
@@ -293,19 +302,50 @@ impl HostApp {
     }
 
     fn poll_dropped_site(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
-        if let Some(path) = dropped
+        let dropped = ctx
+            .input(|input| input.raw.dropped_files.clone())
             .into_iter()
             .map(|file| file.path().to_path_buf())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.eq_ignore_ascii_case("site.clew"))
-            })
-        {
-            self.request_action(ctx, HostGuiAction::OpenSite(path));
+            .collect::<Vec<_>>();
+        if let Some(path) = dropped.iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("site.clew"))
+        }) {
+            self.request_action(ctx, HostGuiAction::OpenSite(path.clone()));
+            return;
         }
+        let Some(path) = dropped.iter().find(|path| is_nearby_connector_file(path)) else {
+            return;
+        };
+        let (Some(controller), Some(site_id)) = (self.state.controller(), self.state.site_id())
+        else {
+            self.nearby_message = Some(
+                "Open the matching Site invitation before adding a nearby connection file.".into(),
+            );
+            return;
+        };
+        self.nearby_message = Some(
+            match NearbyConnectorStore::new(self.layout.clone()).import_path(
+                path,
+                &controller,
+                site_id,
+            ) {
+                Ok(_) => "Nearby connection file added. Clew will retry automatically.".into(),
+                Err(error) => format!("Nearby connection file was rejected: {error}"),
+            },
+        );
+        ctx.request_repaint();
     }
+}
+
+fn is_nearby_connector_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case(NEARBY_CONNECTOR_FILE_NAME)
+                || name == LEGACY_NEARBY_CONNECTOR_FILE_NAME
+        })
 }
 
 impl Drop for HostApp {
@@ -357,6 +397,34 @@ impl eframe::App for HostApp {
                 ui.add_space(10.0);
                 ui.label(format!("DeviceId: {}", membership.marker.device_id));
                 ui.label("Local identity restored. Closing this window only hides it to the tray.");
+                if membership.device.capabilities.connector
+                    && ui.button("Save Nearby Connection File...").clicked()
+                {
+                    let controller = membership.marker.controller;
+                    let site_id = membership.marker.site_id;
+                    self.nearby_message = Some(
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name(NEARBY_CONNECTOR_FILE_NAME)
+                            .add_filter("Clew nearby connection", &["clew"])
+                            .save_file()
+                        {
+                            match NearbyConnectorStore::new(self.layout.clone()).export_latest(
+                                &controller,
+                                site_id,
+                                &path,
+                            ) {
+                                Ok(()) => {
+                                    format!("Nearby connection file saved to {}", path.display())
+                                }
+                                Err(error) => {
+                                    format!("Nearby connection file is not ready: {error}")
+                                }
+                            }
+                        } else {
+                            "Nearby connection file save was cancelled.".into()
+                        },
+                    );
+                }
             }
             HostLaunchState::AwaitingEnrollment {
                 site_file,
@@ -375,6 +443,9 @@ impl eframe::App for HostApp {
                 ui.label(format!("Device name: {hostname}"));
                 ui.label(
                     "The DeviceKey is stored in this operating-system user's Clew state, not in the Site Kit directory.",
+                );
+                ui.label(
+                    "If local discovery is blocked, drop nearby-connection.clew onto this window. Clew will keep retrying in the background.",
                 );
             }
             HostLaunchState::MissingInvite { view, .. } => {
@@ -423,6 +494,11 @@ impl eframe::App for HostApp {
         }
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+            if let Some(message) = &self.nearby_message {
+                ui.add_space(8.0);
+                ui.label(message);
+            }
+
             ui.horizontal(|ui| {
                 if ui.button(&outfit.resources.exit_and_disconnect).clicked() {
                     self.request_action(&ctx, HostGuiAction::Exit);

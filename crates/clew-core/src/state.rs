@@ -179,6 +179,28 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn nearby_connector_import_path(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("nearby-connector.import.json")
+    }
+
+    #[must_use]
+    pub fn nearby_connector_export_path(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("nearby-connector.export.json")
+    }
+
+    #[must_use]
     pub fn device_record_path(
         &self,
         controller_id: ControllerId,

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use clew_core::{DeviceId, InviteId};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchState, OutfitPreset, SignedSiteClew,
-    acquire_host_instance, resolve_host_launch, serve_networked_membership_until,
+    acquire_host_instance, resolve_host_launch, serve_networked_membership_until_with_layout,
     verify_outfit_asset_bytes, wait_for_networked_activation_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
@@ -690,8 +690,12 @@ async fn run_host_network_lifecycle(
     if let HostLaunchState::Active { membership, .. } = state
         && membership.marker.controller_endpoint.is_some()
     {
-        return serve_networked_membership_until(&membership, wait_for_host_shutdown(shutdown))
-            .await;
+        return serve_networked_membership_until_with_layout(
+            &layout,
+            &membership,
+            wait_for_host_shutdown(shutdown),
+        )
+        .await;
     }
     wait_for_host_shutdown(shutdown).await;
     Ok(())
@@ -736,7 +740,8 @@ async fn run_host_foreground(
         if let HostLaunchState::Active { membership, .. } = state
             && membership.marker.controller_endpoint.is_some()
         {
-            serve_networked_membership_until(
+            serve_networked_membership_until_with_layout(
+                layout,
                 &membership,
                 wait_for_host_shutdown(shutdown_rx.clone()),
             )

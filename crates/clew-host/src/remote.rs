@@ -6,17 +6,19 @@ use clew_transport::{
     BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
     ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
-    InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery, ReadErrorCode, ReadReply,
-    ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
-    SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional, read_bootstrap,
-    read_connector_open, read_connector_ready, write_bootstrap, write_connector_open,
-    write_connector_ready,
+    InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery, NearbyConnectorFile,
+    ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError,
+    SealedBootstrapSession, SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional,
+    read_bootstrap, read_connector_open, read_connector_ready, write_bootstrap,
+    write_connector_open, write_connector_ready,
 };
 use iroh::EndpointAddr;
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
-use crate::{HostLaunchState, HostMembership, HostMembershipStore, HostReadService};
+use crate::{
+    HostLaunchState, HostMembership, HostMembershipStore, HostReadService, NearbyConnectorStore,
+};
 
 const MAX_CONNECTOR_TUNNELS: usize = 64;
 const CONNECTOR_LEASE_RENEW_MARGIN: Duration = Duration::from_secs(30);
@@ -67,6 +69,7 @@ async fn complete_networked_activation_with_window(
             };
             let outer = IrohOuter::bind().await?;
             let mut channel = connect_bootstrap_channel(
+                layout,
                 &outer,
                 endpoint.clone(),
                 controller,
@@ -169,6 +172,7 @@ async fn resume_pending_controller_activation_with_window(
         .ok_or(HostRemoteError::MissingNetworkConfig)?;
     let outer = IrohOuter::bind().await?;
     let mut channel = connect_bootstrap_channel(
+        layout,
         &outer,
         endpoint,
         membership.marker.controller,
@@ -265,6 +269,28 @@ pub async fn serve_networked_membership_until<F>(
 where
     F: Future<Output = ()>,
 {
+    serve_networked_membership_until_inner(membership, None, shutdown).await
+}
+
+pub async fn serve_networked_membership_until_with_layout<F>(
+    layout: &StateLayout,
+    membership: &HostMembership,
+    shutdown: F,
+) -> Result<(), HostRemoteError>
+where
+    F: Future<Output = ()>,
+{
+    serve_networked_membership_until_inner(membership, Some(layout), shutdown).await
+}
+
+async fn serve_networked_membership_until_inner<F>(
+    membership: &HostMembership,
+    layout: Option<&StateLayout>,
+    shutdown: F,
+) -> Result<(), HostRemoteError>
+where
+    F: Future<Output = ()>,
+{
     let (endpoint, service) = member_remote_config(membership)?;
     tokio::pin!(shutdown);
     let outer = tokio::select! {
@@ -279,6 +305,7 @@ where
                 &outer,
                 endpoint.clone(),
                 &service,
+                layout,
             ) => result,
         };
         if matches!(
@@ -299,7 +326,17 @@ pub async fn serve_networked_membership_once(
 ) -> Result<(), HostRemoteError> {
     let (endpoint, service) = member_remote_config(membership)?;
     let outer = IrohOuter::bind().await?;
-    serve_networked_membership_with_outer(membership, &outer, endpoint, &service).await
+    serve_networked_membership_with_outer(membership, &outer, endpoint, &service, None).await
+}
+
+pub async fn serve_networked_membership_once_with_layout(
+    layout: &StateLayout,
+    membership: &HostMembership,
+) -> Result<(), HostRemoteError> {
+    let (endpoint, service) = member_remote_config(membership)?;
+    let outer = IrohOuter::bind().await?;
+    serve_networked_membership_with_outer(membership, &outer, endpoint, &service, Some(layout))
+        .await
 }
 
 fn member_remote_config(
@@ -384,6 +421,7 @@ async fn confirm_sealed_activation(
 }
 
 async fn connect_bootstrap_channel(
+    layout: &StateLayout,
     outer: &IrohOuter,
     controller_endpoint: EndpointAddr,
     controller: ControllerPublicIdentity,
@@ -405,6 +443,28 @@ async fn connect_bootstrap_channel(
     let discovery =
         MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
     let mut events = discovery.subscribe().await;
+    let fallback_candidate = NearbyConnectorStore::new(layout.clone())
+        .load_import(&controller, site_id)
+        .ok()
+        .flatten()
+        .map(|file| file.connector_candidate().addr);
+    let fallback = async {
+        match fallback_candidate {
+            Some(candidate) => {
+                connect_bootstrap_via_candidate(
+                    outer,
+                    candidate,
+                    controller,
+                    site_id,
+                    bootstrap_key,
+                )
+                .await
+            }
+            None => std::future::pending::<Result<HostBootstrapChannel, HostRemoteError>>().await,
+        }
+    };
+    tokio::pin!(fallback);
+    let mut fallback_done = false;
     let deadline = tokio::time::sleep(path_window);
     tokio::pin!(deadline);
     let mut direct_done = false;
@@ -415,6 +475,12 @@ async fn connect_bootstrap_channel(
                 match result {
                     Ok(stream) => return Ok(HostBootstrapChannel::Direct(stream)),
                     Err(_) => direct_done = true,
+                }
+            }
+            result = &mut fallback, if !fallback_done => {
+                fallback_done = true;
+                if let Ok(channel) = result {
+                    return Ok(channel);
                 }
             }
             event = events.next() => {
@@ -475,6 +541,7 @@ enum MemberOuterPath {
 }
 
 async fn connect_member_stream(
+    layout: Option<&StateLayout>,
     outer: &IrohOuter,
     controller_endpoint: EndpointAddr,
     controller: ControllerPublicIdentity,
@@ -485,6 +552,26 @@ async fn connect_member_stream(
     let discovery =
         MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
     let mut events = discovery.subscribe().await;
+    let fallback_candidate = layout
+        .and_then(|layout| {
+            NearbyConnectorStore::new(layout.clone())
+                .load_import(&controller, site_id)
+                .ok()
+                .flatten()
+        })
+        .map(|file| file.connector_candidate().addr);
+    let fallback = async {
+        match fallback_candidate {
+            Some(candidate) => {
+                connect_member_via_candidate(outer, candidate, controller, site_id).await
+            }
+            None => {
+                std::future::pending::<Result<clew_transport::IrohStream, HostRemoteError>>().await
+            }
+        }
+    };
+    tokio::pin!(fallback);
+    let mut fallback_done = false;
     let deadline = tokio::time::sleep(ACTIVE_MEMBER_PATH_WINDOW);
     tokio::pin!(deadline);
     let mut direct_done = false;
@@ -495,6 +582,12 @@ async fn connect_member_stream(
                 match result {
                     Ok(stream) => return Ok((stream, MemberOuterPath::Direct)),
                     Err(_) => direct_done = true,
+                }
+            }
+            result = &mut fallback, if !fallback_done => {
+                fallback_done = true;
+                if let Ok(stream) = result {
+                    return Ok((stream, MemberOuterPath::Connector));
                 }
             }
             event = events.next() => {
@@ -542,8 +635,10 @@ async fn serve_networked_membership_with_outer(
     outer: &IrohOuter,
     endpoint: EndpointAddr,
     service: &Option<HostReadService>,
+    layout: Option<&StateLayout>,
 ) -> Result<(), HostRemoteError> {
     let (mut stream, outer_path) = connect_member_stream(
+        layout,
         outer,
         endpoint.clone(),
         membership.marker.controller,
@@ -582,6 +677,15 @@ async fn serve_networked_membership_with_outer(
             membership.marker.site_id,
             true,
         )?);
+        if let Some(layout) = layout
+            && let Ok(file) = NearbyConnectorFile::from_helper(outer.addr(), lease.clone())
+        {
+            let _ = NearbyConnectorStore::new(layout.clone()).save_export(
+                &file,
+                &membership.marker.controller,
+                membership.marker.site_id,
+            );
+        }
         connector_lease = Some(lease);
         Instant::now() + Duration::from_millis(renew_in_ms)
     } else {
@@ -883,8 +987,24 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NoPublicDiscovery {
+        MdnsDelayed,
+        NearbyFile,
+    }
+
     #[tokio::test]
+    #[ignore = "requires working multicast mDNS on the test network"]
     async fn sealed_bootstrap_and_active_read_use_real_mdns_connector_when_direct_is_unreachable() {
+        run_no_public_connector_flow(NoPublicDiscovery::MdnsDelayed).await;
+    }
+
+    #[tokio::test]
+    async fn sealed_bootstrap_and_active_read_use_nearby_file_when_mdns_is_unavailable() {
+        run_no_public_connector_flow(NoPublicDiscovery::NearbyFile).await;
+    }
+
+    async fn run_no_public_connector_flow(discovery_mode: NoPublicDiscovery) {
         let temp = tempdir().unwrap();
         let layout = StateLayout::new(temp.path().join("target-state"));
         let controller = ControllerIdentity::from_secret([111_u8; 32]);
@@ -934,6 +1054,13 @@ mod tests {
             now + 60_000,
         )
         .unwrap();
+        if discovery_mode == NoPublicDiscovery::NearbyFile {
+            let file = NearbyConnectorFile::from_helper(helper_addr.clone(), helper_lease.clone())
+                .unwrap();
+            NearbyConnectorStore::new(layout.clone())
+                .import_file(&file, &controller_public, site_id)
+                .unwrap();
+        }
 
         let controller_task = tokio::spawn({
             let controller_outer = controller_outer.clone();
@@ -1044,15 +1171,22 @@ mod tests {
         let helper_task = tokio::spawn({
             let helper_outer = helper_outer.clone();
             let controller_addr = controller_addr.clone();
+            let use_mdns = discovery_mode == NoPublicDiscovery::MdnsDelayed;
             async move {
-                tokio::time::sleep(Duration::from_millis(8_500)).await;
-                let _advertisement = MdnsConnectorDiscovery::attach(
-                    &helper_outer,
-                    controller_public.controller_id,
-                    site_id,
-                    true,
-                )
-                .unwrap();
+                let _advertisement = if use_mdns {
+                    tokio::time::sleep(Duration::from_millis(8_500)).await;
+                    Some(
+                        MdnsConnectorDiscovery::attach(
+                            &helper_outer,
+                            controller_public.controller_id,
+                            site_id,
+                            true,
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
                 let (protocol, inbound) = helper_outer.accept_classified().await.unwrap();
                 assert_eq!(protocol, IrohProtocol::Connector);
                 serve_one_connector_tunnel(
@@ -1098,13 +1232,17 @@ mod tests {
         };
         let (_activation_shutdown_tx, activation_shutdown_rx) = tokio::sync::watch::channel(false);
         let activation_started = Instant::now();
+        let (activation_timeout, path_window) = match discovery_mode {
+            NoPublicDiscovery::MdnsDelayed => (Duration::from_secs(35), Duration::from_secs(8)),
+            NoPublicDiscovery::NearbyFile => (Duration::from_secs(15), Duration::from_secs(10)),
+        };
         let activated = tokio::time::timeout(
-            Duration::from_secs(35),
+            activation_timeout,
             wait_for_networked_activation_until_with_timing(
                 &layout,
                 initial,
                 activation_shutdown_rx,
-                Duration::from_secs(8),
+                path_window,
                 Duration::from_millis(25),
             ),
         )
@@ -1112,10 +1250,12 @@ mod tests {
         .expect("Connector bootstrap activation timed out")
         .unwrap()
         .expect("activation retry loop stopped unexpectedly");
-        assert!(
-            activation_started.elapsed() >= Duration::from_secs(8),
-            "Target unexpectedly activated before the delayed Helper was online"
-        );
+        if discovery_mode == NoPublicDiscovery::MdnsDelayed {
+            assert!(
+                activation_started.elapsed() >= Duration::from_secs(8),
+                "Target unexpectedly activated before the delayed Helper was online"
+            );
+        }
         let HostLaunchState::Active { membership, .. } = activated else {
             panic!("Target did not become active");
         };
@@ -1148,13 +1288,25 @@ mod tests {
             read_now + 60_000,
         )
         .unwrap();
-        let _read_advertisement = MdnsConnectorDiscovery::attach(
-            &helper_outer,
-            controller_public.controller_id,
-            site_id,
-            true,
-        )
-        .unwrap();
+        let _read_advertisement = if discovery_mode == NoPublicDiscovery::MdnsDelayed {
+            Some(
+                MdnsConnectorDiscovery::attach(
+                    &helper_outer,
+                    controller_public.controller_id,
+                    site_id,
+                    true,
+                )
+                .unwrap(),
+            )
+        } else {
+            let file =
+                NearbyConnectorFile::from_helper(helper_addr.clone(), helper_read_lease.clone())
+                    .unwrap();
+            NearbyConnectorStore::new(layout.clone())
+                .import_file(&file, &controller_public, site_id)
+                .unwrap();
+            None
+        };
 
         let controller_read_task = tokio::spawn({
             let controller_outer = controller_outer.clone();
@@ -1221,8 +1373,10 @@ mod tests {
             }
         });
         let target_membership = membership.clone();
-        let target_read_task =
-            tokio::spawn(async move { serve_networked_membership_once(&target_membership).await });
+        let target_layout = layout.clone();
+        let target_read_task = tokio::spawn(async move {
+            serve_networked_membership_once_with_layout(&target_layout, &target_membership).await
+        });
 
         tokio::time::timeout(Duration::from_secs(12), controller_read_task)
             .await

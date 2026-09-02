@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::{
     ClientFlavor, HostInstanceKey, HostMembership, HostMembershipError, HostMembershipMarker,
-    HostMembershipStore, MAX_OUTFIT_ASSET_BYTES, OutfitError, OutfitProfile, OutfitRuntimeView,
-    SignedSiteClew, SiteClewError, observed_hostname, verify_outfit_asset_bytes,
+    HostMembershipStore, LEGACY_NEARBY_CONNECTOR_FILE_NAME, MAX_OUTFIT_ASSET_BYTES,
+    NEARBY_CONNECTOR_FILE_NAME, NearbyConnectorStore, OutfitError, OutfitProfile,
+    OutfitRuntimeView, SignedSiteClew, SiteClewError, observed_hostname, verify_outfit_asset_bytes,
 };
 
 #[derive(Clone, Debug)]
@@ -183,10 +184,18 @@ pub fn resolve_host_launch(context: HostLaunchContext) -> Result<HostLaunchState
     let memberships = HostMembershipStore::new(context.state_layout.clone())
         .recover_for_runtime(&context.client_flavor)?;
     match memberships.as_slice() {
-        [only] => Ok(HostLaunchState::Active {
-            membership: only.clone(),
-            source: HostSiteSource::LocalMembership,
-        }),
+        [only] => {
+            import_nearby_connector_sibling(
+                &context.state_layout,
+                &sibling,
+                only.marker.controller,
+                only.marker.site_id,
+            );
+            Ok(HostLaunchState::Active {
+                membership: only.clone(),
+                source: HostSiteSource::LocalMembership,
+            })
+        }
         [] => Ok(HostLaunchState::MissingInvite {
             view: missing_invite_view(context.archive_temp_detected),
             client_flavor: context.client_flavor,
@@ -210,6 +219,7 @@ fn resolve_site_file(
     }
     let controller = site_file.verify()?;
     let site_id = site_file.payload.bootstrap.payload.site_id;
+    import_nearby_connector_sibling(&context.state_layout, site_path, controller, site_id);
     let site_name = site_file.payload.bootstrap.payload.site_name.clone();
     let memberships = HostMembershipStore::new(context.state_layout.clone());
     if let Some(membership) = memberships.recover_active_from_site(
@@ -371,6 +381,27 @@ fn read_bounded_outfit_asset(path: &Path) -> Result<Vec<u8>, HostLaunchError> {
     Ok(bytes)
 }
 
+fn import_nearby_connector_sibling(
+    layout: &StateLayout,
+    anchor: &Path,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+) {
+    let Some(parent) = anchor.parent() else {
+        return;
+    };
+    let store = NearbyConnectorStore::new(layout.clone());
+    for name in [
+        NEARBY_CONNECTOR_FILE_NAME,
+        LEGACY_NEARBY_CONNECTOR_FILE_NAME,
+    ] {
+        let candidate = parent.join(name);
+        if candidate.is_file() && store.import_path(&candidate, &controller, site_id).is_ok() {
+            return;
+        }
+    }
+}
+
 fn site_clew_sibling(executable_path: &Path) -> Result<PathBuf, HostLaunchError> {
     #[cfg(target_os = "macos")]
     {
@@ -452,6 +483,8 @@ mod tests {
     use clew_identity::{
         ControllerIdentity, EnrollmentRegistry, PermissionGrant, SiteBootstrapSpec,
     };
+    use clew_transport::{NearbyConnectorFile, SignedConnectorLease, noise_static_public};
+    use iroh::{EndpointAddr, SecretKey, TransportAddr};
     use tempfile::tempdir;
 
     use super::*;
@@ -650,6 +683,89 @@ mod tests {
             }),
             Err(HostLaunchError::MissingOutfitAsset(_))
         ));
+    }
+
+    #[test]
+    fn fixed_sibling_nearby_file_is_imported_for_the_matching_site() {
+        let temp = tempdir().unwrap();
+        let kit = temp.path().join("kit");
+        std::fs::create_dir_all(&kit).unwrap();
+        let state = StateLayout::new(temp.path().join("state"));
+        let controller = ControllerIdentity::from_secret([94_u8; 32]);
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let mut registry = EnrollmentRegistry::new(
+            controller.controller_id(),
+            PermissionGrant::EXECUTE_READ_CONNECTOR,
+        );
+        let pass = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Nearby Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+                    not_before_unix_ms: 1,
+                    expires_unix_ms: 86_400_000,
+                    deployment_window_ms: 60_000,
+                    max_claims: 2,
+                },
+            )
+            .unwrap();
+        let bogus_controller = EndpointAddr::new(SecretKey::from_bytes(&[95_u8; 32]).public());
+        let site = SignedSiteClew::issue_networked_outfit_sealed(
+            &controller,
+            OutfitProfile::preset(OutfitPreset::ClewOriginal),
+            pass,
+            HostRoleHint::ExecutePreferred,
+            bogus_controller,
+            clew_core::ReadPolicy::new(vec![kit.to_string_lossy().into_owned()], 4096, 2_000)
+                .unwrap(),
+            noise_static_public([96_u8; 32]).unwrap(),
+        )
+        .unwrap();
+        site.write(&kit.join("site.clew")).unwrap();
+
+        let helper_endpoint = SecretKey::from_bytes(&[97_u8; 32]).public();
+        let mut helper_addr = EndpointAddr::new(helper_endpoint);
+        helper_addr
+            .addrs
+            .insert(TransportAddr::Ip("127.0.0.1:4545".parse().unwrap()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let lease = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            clew_core::DeviceId::new(),
+            helper_endpoint,
+            now.saturating_sub(1_000),
+            now + 60_000,
+        )
+        .unwrap();
+        let nearby = NearbyConnectorFile::from_helper(helper_addr.clone(), lease).unwrap();
+        std::fs::write(
+            kit.join(NEARBY_CONNECTOR_FILE_NAME),
+            nearby.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let result = resolve_host_launch(HostLaunchContext {
+            explicit_site: None,
+            executable_path: kit.join(if cfg!(windows) { "Clew.exe" } else { "Clew" }),
+            state_layout: state.clone(),
+            client_flavor: ClientFlavor::clew_original_current(),
+            archive_temp_detected: false,
+        })
+        .unwrap();
+        assert!(matches!(result, HostLaunchState::AwaitingEnrollment { .. }));
+        let imported = NearbyConnectorStore::new(state)
+            .load_import(&controller.public_identity(), site_id)
+            .unwrap()
+            .expect("fixed sibling nearby file was not imported");
+        assert_eq!(imported.candidate, helper_addr);
     }
 
     #[test]

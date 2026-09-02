@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry next）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE on Windows/cap00，macOS exact-commit gate next；V1.5d multiple-helper failover/resume follows）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -599,9 +599,48 @@ V1.5c-1 acceptance / validation evidence：
 
 V1.5c-1 known / next：
 
-- `Target 先开、Helper 后开` 仍未达到“谁先开都一样”：desktop 目前会在 GUI 出现前尝试一次 20 秒 activation；V1.5c-2 必须先显示 Host 状态，再在后台持续 direct/helper discovery + enrollment retry，helper 后出现时无需重启 Target；
 - active path 已具备重新进入 discovery race 的基础，但 multiple-helper explicit health ranking、Helper-A 断线→Helper-B 自动切换的真实 acceptance 仍需 V1.5d；
-- `附近连接.clew` fallback 与 suspend/resume re-advertise 仍后续。
+- suspend/resume re-advertise 仍后续。
+
+### V1.5c-2 — Order-independent visible Host runtime
+
+**Status：DONE（2026-09-02）**
+
+实际落地：
+
+- desktop 不再在创建 GUI 前同步等待一次 20 秒 enrollment。Host 窗口立即显示 `AwaitingEnrollment`，同一 instance 的后台 network lifecycle 持续竞速 direct + verified Connector path；Helper 晚出现时无需退出/重启 Target；
+- background activation 使用可取消 `watch` state machine。GUI 退出、切换 Site、选择 membership 都会先停止旧 network task；即使当前 discovery window 为 30 秒，shutdown focused test 约 50 ms 后发出取消并在 1 秒 gate 内结束，不留下网络 timeout 尾巴；
+- activation 成功后通过本地 mpsc state channel 原地把 GUI 从 Awaiting 更新为 Active，并在同一后台 lifecycle 继续长期 member/Connector runtime；second-launch wake/tray 语义保持不变；Linux/`--foreground` 同样持续 retry，`Ctrl-C` 明确取消；
+- Controller 自动 lease issuance 已由真实 authenticated Connector member test 覆盖：Helper 先完成 DeviceKey InnerSession，Controller 才按 catalog/registry 实时状态与 QUIC `remote_id()` 签 endpoint-bound lease；
+- 顺序 acceptance 真实把 Helper 延迟 8.5 秒、单次 discovery window 固定 8 秒，因此第一轮必失败；Target 第二轮自动恢复并完成 sealed enrollment + active Read，证明不是“Helper 恰好已在线”的测试。
+
+Acceptance / validation evidence：
+
+- [x] delayed Helper order gate（cap00/Windows multicast）**1/1 PASS**；
+- [x] activation cancellation focused **1/1 PASS**；authenticated Connector lease focused **1/1 PASS**；
+- [x] Windows interactive Host GUI/tray smoke **1/1 PASS**；
+- [x] 当前 workspace `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；workspace tests **134 passed / 0 failed / 4 ignored**（interactive Windows GUI、2 个显式 multicast integration、public n0 relay）；两条 multicast integration 在 cap00 又分别显式运行并 **1/1 PASS**。
+
+### V1.5c-3 — Nearby Connector file fallback
+
+**Status：IMPLEMENTED + CAP00 ACCEPTED（2026-09-02；macOS exact-commit acceptance pending）**
+
+实际落地：
+
+- canonical friend-facing 文件名为英文 `nearby-connection.clew`，避免 macOS 上缺字字体造成方框；读取层继续兼容设计文档旧名 `附近连接.clew`。文件只在明确 Site Kit sibling、显式 drag/drop 或 per-Site imported state 中读取，**不**扩大 cwd/全盘扫描；
+- v1 文件格式 hard bound 32 KiB、最多 16 个 direct-IP hints，绑定 SiteDiscoveryTag、Helper iroh EndpointId 与 Controller-signed Connector lease；relay/custom transport hint、wrong Site/endpoint、tamper、oversize 全 fail closed；文件读取使用 `File::open + take(MAX+1)`，在 JSON decode/可增长分配前执行 hard bound，避免 metadata→read 的 TOCTOU；
+- 文件里的短期 lease 只作为 Controller-signed **historical route binding**。因此文件可跨 lease expiry/重启长期保留；真正每次拨 Helper 仍必须现场读取 `ConnectorReady` 并按当前时间验证 fresh Controller-signed lease。旧/revoked Helper 最多形成失败 candidate，无法获得 sealed bootstrap 或 InnerSession 权限；
+- per-Site state 将 `import` 与本机 Helper `export` 分槽，防止 Target 把别人给的 candidate 当作自己可分发的 Helper hint；Helper 只有 direct authenticated uplink 获得自身 fresh lease 后才刷新 export；
+- bootstrap 与 active member 两条 path race 现在都是 direct + mDNS + verified imported nearby candidate。坏/过期 route 文件不会阻塞 direct/mDNS；candidate 真正使用前仍执行现有 fresh lease gate；
+- GUI Awaiting 页面提示可拖入 `nearby-connection.clew`，导入成功后后台 retry 自动接管；Active connector-capable Host 提供 `Save Nearby Connection File...`；固定 sibling 文件也会在 `site.clew` resolve 时自动验证并导入；
+- no-mDNS real integration 完全不启动 mDNS advertiser、并故意使用不可达 signed Controller endpoint；Target 只靠 imported nearby candidate 完成 sealed enrollment，随后刷新 route file 后再次经 same Helper 完成 active DeviceKey InnerSession/Read，**1/1 PASS**。
+- cap00 validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **134 passed / 0 failed / 4 ignored**（interactive Windows GUI、2 个显式 multicast integration、public n0 relay）；两条 multicast integration 又分别显式 **1/1 PASS**，Windows interactive Host GUI/tray **1/1 PASS**。
+
+平台事实 / gate：
+
+- `macos-3dv0`（QEMU）上 exact `eaacd5e` 的 full no-public mDNS test 失败；继续缩小到 `clew-transport::real_mdns_discovers_only_same_site_and_connects` 后同样在 10 秒内收不到同机 advertiser。由此冻结为该 VM/network 的 multicast/mDNS 不可用事实，不再靠调大 timeout 掩盖；
+- 这正是 nearby fallback 的目标环境。下一步用 fallback implementation 的 exact commit 在 `macos-3dv0` 的 `/Users/inter/Documents/Scratch/scratchpad/...` 做 native workspace + Aqua gate；通过后再把本小节改为 DONE；
+- V1.5d 继续 multiple-helper health/failover、Helper-A→Helper-B 自动切换与 suspend/resume re-advertise。
 
 计划：
 
@@ -613,7 +652,7 @@ V1.5c-1 known / next：
 - auto Connector promotion；
 - multiple Connector health/failover；
 - helper-only `EXECUTE=false`；
-- mDNS 失败时 `附近连接.clew` 文件 fallback；
+- mDNS 失败时 `nearby-connection.clew` 文件 fallback（legacy `附近连接.clew` 仍可读）；
 - suspend/resume 后 helper 重新广播。
 
 硬门禁：

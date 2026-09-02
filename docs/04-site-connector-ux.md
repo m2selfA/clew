@@ -589,27 +589,29 @@ Target -> SiteId -> any healthy Connector in Site
 
 建议 fallback：
 
-Helper 窗口：
+Helper 窗口（v1 UI 使用英文，避免缺字字体问题）：
 
 ```text
-[ 生成附近连接文件 ]
+[ Save Nearby Connection File... ]
 ```
 
-得到：
+得到 canonical 文件：
 
 ```text
-附近连接.clew
+nearby-connection.clew
 ```
 
-朋友把这个小文件复制到目标电脑 Clew 同目录并重新打开/拖进去即可。
+读取层兼容早期设计名 `附近连接.clew`。朋友把这个小文件复制到目标电脑 Clew/Site Kit 同目录并重新打开，或直接拖进 Host 窗口即可。
 
-这个文件可以携带：
+这个文件携带：
 
-- helper 的当前 LAN address hints；
-- SiteId；
-- 短期 connector lease；
+- helper 的 direct LAN address hints；
+- same-Site equality tag；
+- Controller-signed、绑定 Helper EndpointId 的短期 connector lease，作为 route-binding proof；
 
-这样即使 mDNS 被禁，也只增加一次“复制文件”，不增加网络知识。
+短期 lease 到期后，已导入文件仍只可作为“去哪里尝试连接”的 signed routing hint；**不能**直接授权 tunnel。Target 每次真正使用 candidate 时都必须从 Helper 现场取得新的 `ConnectorReady`，并再次验证当前有效的 Controller-signed lease / Site / EndpointId。被 revoke 或已经失去 Controller uplink 的旧 helper 因拿不到 fresh lease，只会成为一次失败 candidate。
+
+这样即使 mDNS 被禁，也只增加一次“复制文件”，不增加网络知识，也不引入新的长期授权凭据。
 
 ## 16. Session mode、托盘与长期在线
 
