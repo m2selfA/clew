@@ -1,4 +1,8 @@
-use std::{future::Future, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    future::Future,
+    time::Duration,
+};
 
 use clew_core::{DeviceId, DeviceRecord, SiteId, StateLayout};
 use clew_identity::{ControllerPublicIdentity, DeviceIdentityStore};
@@ -12,7 +16,7 @@ use clew_transport::{
     read_bootstrap, read_connector_open, read_connector_ready, write_bootstrap,
     write_connector_open, write_connector_ready,
 };
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
@@ -24,6 +28,9 @@ const MAX_CONNECTOR_TUNNELS: usize = 64;
 const CONNECTOR_LEASE_RENEW_MARGIN: Duration = Duration::from_secs(30);
 const INITIAL_BOOTSTRAP_PATH_WINDOW: Duration = Duration::from_secs(20);
 const ACTIVE_MEMBER_PATH_WINDOW: Duration = Duration::from_secs(20);
+const MAX_CONCURRENT_CONNECTOR_DIALS: usize = 4;
+const MAX_CONNECTOR_CANDIDATES_PER_WINDOW: usize = 32;
+const CONNECTOR_CANDIDATE_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub async fn complete_networked_activation(
     layout: &StateLayout,
@@ -420,6 +427,79 @@ async fn confirm_sealed_activation(
     }
 }
 
+#[derive(Default)]
+struct ConnectorCandidateQueue {
+    seen: BTreeSet<EndpointId>,
+    pending: VecDeque<EndpointAddr>,
+}
+
+impl ConnectorCandidateQueue {
+    fn push(&mut self, candidate: EndpointAddr) {
+        if self.seen.len() >= MAX_CONNECTOR_CANDIDATES_PER_WINDOW || !self.seen.insert(candidate.id)
+        {
+            return;
+        }
+        self.pending.push_back(candidate);
+    }
+
+    fn pop(&mut self) -> Option<EndpointAddr> {
+        self.pending.pop_front()
+    }
+}
+
+fn fill_bootstrap_candidate_dials(
+    tasks: &mut JoinSet<Result<HostBootstrapChannel, HostRemoteError>>,
+    queue: &mut ConnectorCandidateQueue,
+    outer: &IrohOuter,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+    bootstrap_key: [u8; 32],
+) {
+    while tasks.len() < MAX_CONCURRENT_CONNECTOR_DIALS {
+        let Some(candidate) = queue.pop() else {
+            break;
+        };
+        let outer = outer.clone();
+        tasks.spawn(async move {
+            tokio::time::timeout(
+                CONNECTOR_CANDIDATE_DIAL_TIMEOUT,
+                connect_bootstrap_via_candidate(
+                    &outer,
+                    candidate,
+                    controller,
+                    site_id,
+                    bootstrap_key,
+                ),
+            )
+            .await
+            .map_err(|_| HostRemoteError::ConnectorCandidateTimeout)?
+        });
+    }
+}
+
+fn fill_member_candidate_dials(
+    tasks: &mut JoinSet<Result<clew_transport::IrohStream, HostRemoteError>>,
+    queue: &mut ConnectorCandidateQueue,
+    outer: &IrohOuter,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+) {
+    while tasks.len() < MAX_CONCURRENT_CONNECTOR_DIALS {
+        let Some(candidate) = queue.pop() else {
+            break;
+        };
+        let outer = outer.clone();
+        tasks.spawn(async move {
+            tokio::time::timeout(
+                CONNECTOR_CANDIDATE_DIAL_TIMEOUT,
+                connect_member_via_candidate(&outer, candidate, controller, site_id),
+            )
+            .await
+            .map_err(|_| HostRemoteError::ConnectorCandidateTimeout)?
+        });
+    }
+}
+
 async fn connect_bootstrap_channel(
     layout: &StateLayout,
     outer: &IrohOuter,
@@ -443,28 +523,24 @@ async fn connect_bootstrap_channel(
     let discovery =
         MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
     let mut events = discovery.subscribe().await;
-    let fallback_candidate = NearbyConnectorStore::new(layout.clone())
+    let mut candidates = ConnectorCandidateQueue::default();
+    if let Some(candidate) = NearbyConnectorStore::new(layout.clone())
         .load_import(&controller, site_id)
         .ok()
         .flatten()
-        .map(|file| file.connector_candidate().addr);
-    let fallback = async {
-        match fallback_candidate {
-            Some(candidate) => {
-                connect_bootstrap_via_candidate(
-                    outer,
-                    candidate,
-                    controller,
-                    site_id,
-                    bootstrap_key,
-                )
-                .await
-            }
-            None => std::future::pending::<Result<HostBootstrapChannel, HostRemoteError>>().await,
-        }
-    };
-    tokio::pin!(fallback);
-    let mut fallback_done = false;
+        .map(|file| file.connector_candidate().addr)
+    {
+        candidates.push(candidate);
+    }
+    let mut candidate_tasks = JoinSet::new();
+    fill_bootstrap_candidate_dials(
+        &mut candidate_tasks,
+        &mut candidates,
+        outer,
+        controller,
+        site_id,
+        bootstrap_key,
+    );
     let deadline = tokio::time::sleep(path_window);
     tokio::pin!(deadline);
     let mut direct_done = false;
@@ -477,10 +553,22 @@ async fn connect_bootstrap_channel(
                     Err(_) => direct_done = true,
                 }
             }
-            result = &mut fallback, if !fallback_done => {
-                fallback_done = true;
-                if let Ok(channel) = result {
-                    return Ok(channel);
+            joined = candidate_tasks.join_next(), if !candidate_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(channel))) => return Ok(channel),
+                    Some(Ok(Err(_))) | None => {
+                        fill_bootstrap_candidate_dials(
+                            &mut candidate_tasks,
+                            &mut candidates,
+                            outer,
+                            controller,
+                            site_id,
+                            bootstrap_key,
+                        );
+                    }
+                    Some(Err(error)) => {
+                        return Err(HostRemoteError::ConnectorTask(error.to_string()));
+                    }
                 }
             }
             event = events.next() => {
@@ -490,15 +578,15 @@ async fn connect_bootstrap_channel(
                 let ConnectorDiscoveryEvent::Candidate(candidate) = event else {
                     continue;
                 };
-                if let Ok(channel) = connect_bootstrap_via_candidate(
+                candidates.push(candidate.addr);
+                fill_bootstrap_candidate_dials(
+                    &mut candidate_tasks,
+                    &mut candidates,
                     outer,
-                    candidate.addr,
                     controller,
                     site_id,
                     bootstrap_key,
-                ).await {
-                    return Ok(channel);
-                }
+                );
             }
             _ = &mut deadline => return Err(HostRemoteError::BootstrapPathUnavailable),
         }
@@ -552,26 +640,26 @@ async fn connect_member_stream(
     let discovery =
         MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
     let mut events = discovery.subscribe().await;
-    let fallback_candidate = layout
+    let mut candidates = ConnectorCandidateQueue::default();
+    if let Some(candidate) = layout
         .and_then(|layout| {
             NearbyConnectorStore::new(layout.clone())
                 .load_import(&controller, site_id)
                 .ok()
                 .flatten()
         })
-        .map(|file| file.connector_candidate().addr);
-    let fallback = async {
-        match fallback_candidate {
-            Some(candidate) => {
-                connect_member_via_candidate(outer, candidate, controller, site_id).await
-            }
-            None => {
-                std::future::pending::<Result<clew_transport::IrohStream, HostRemoteError>>().await
-            }
-        }
-    };
-    tokio::pin!(fallback);
-    let mut fallback_done = false;
+        .map(|file| file.connector_candidate().addr)
+    {
+        candidates.push(candidate);
+    }
+    let mut candidate_tasks = JoinSet::new();
+    fill_member_candidate_dials(
+        &mut candidate_tasks,
+        &mut candidates,
+        outer,
+        controller,
+        site_id,
+    );
     let deadline = tokio::time::sleep(ACTIVE_MEMBER_PATH_WINDOW);
     tokio::pin!(deadline);
     let mut direct_done = false;
@@ -584,10 +672,21 @@ async fn connect_member_stream(
                     Err(_) => direct_done = true,
                 }
             }
-            result = &mut fallback, if !fallback_done => {
-                fallback_done = true;
-                if let Ok(stream) = result {
-                    return Ok((stream, MemberOuterPath::Connector));
+            joined = candidate_tasks.join_next(), if !candidate_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(stream))) => return Ok((stream, MemberOuterPath::Connector)),
+                    Some(Ok(Err(_))) | None => {
+                        fill_member_candidate_dials(
+                            &mut candidate_tasks,
+                            &mut candidates,
+                            outer,
+                            controller,
+                            site_id,
+                        );
+                    }
+                    Some(Err(error)) => {
+                        return Err(HostRemoteError::ConnectorTask(error.to_string()));
+                    }
                 }
             }
             event = events.next() => {
@@ -597,14 +696,14 @@ async fn connect_member_stream(
                 let ConnectorDiscoveryEvent::Candidate(candidate) = event else {
                     continue;
                 };
-                if let Ok(stream) = connect_member_via_candidate(
+                candidates.push(candidate.addr);
+                fill_member_candidate_dials(
+                    &mut candidate_tasks,
+                    &mut candidates,
                     outer,
-                    candidate.addr,
                     controller,
                     site_id,
-                ).await {
-                    return Ok((stream, MemberOuterPath::Connector));
-                }
+                );
             }
             _ = &mut deadline => return Err(HostRemoteError::MemberPathUnavailable),
         }
@@ -844,6 +943,8 @@ pub enum HostRemoteError {
     ConnectorSiteMismatch,
     #[error("Connector lease renewal requires an authenticated Controller reconnect")]
     ConnectorLeaseRefreshRequired,
+    #[error("Connector candidate did not complete its verified dial before timeout")]
+    ConnectorCandidateTimeout,
     #[error("Connector tunnel task failed: {0}")]
     ConnectorTask(String),
     #[error("system clock is before the Unix epoch")]
@@ -985,6 +1086,208 @@ mod tests {
             .expect("activation retry ignored shutdown")
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn connector_candidate_queue_is_bounded_and_deduplicated() {
+        let mut queue = ConnectorCandidateQueue::default();
+        let first = EndpointAddr::new(SecretKey::from_bytes(&[1_u8; 32]).public());
+        queue.push(first.clone());
+        queue.push(first);
+        for byte in 2_u8..=40 {
+            queue.push(EndpointAddr::new(
+                SecretKey::from_bytes(&[byte; 32]).public(),
+            ));
+        }
+        assert_eq!(queue.seen.len(), MAX_CONNECTOR_CANDIDATES_PER_WINDOW);
+        assert_eq!(queue.pending.len(), MAX_CONNECTOR_CANDIDATES_PER_WINDOW);
+    }
+
+    #[tokio::test]
+    async fn stalled_connector_dial_does_not_block_healthy_candidate() {
+        let controller = ControllerIdentity::from_secret([104_u8; 32]);
+        let controller_public = controller.public_identity();
+        let site_id = SiteId::new();
+        let now = unix_ms().unwrap();
+        let target_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let bad_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let healthy_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let bad_addr = bad_outer.addr();
+        let healthy_addr = healthy_outer.addr();
+        let healthy_lease = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            DeviceId::new(),
+            healthy_addr.id,
+            now.saturating_sub(1_000),
+            now + 60_000,
+        )
+        .unwrap();
+
+        let (bad_open_tx, bad_open_rx) = tokio::sync::oneshot::channel();
+        let bad_task = tokio::spawn({
+            let bad_outer = bad_outer.clone();
+            async move {
+                let (protocol, mut stream) = bad_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                let request = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(request.purpose, ConnectorTunnelPurpose::InnerSession);
+                let _ = bad_open_tx.send(());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                stream
+            }
+        });
+        let (healthy_release_tx, healthy_release_rx) = tokio::sync::oneshot::channel();
+        let healthy_task = tokio::spawn({
+            let healthy_outer = healthy_outer.clone();
+            async move {
+                let (protocol, mut stream) = healthy_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                let request = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(request.purpose, ConnectorTunnelPurpose::InnerSession);
+                bad_open_rx
+                    .await
+                    .expect("stalled Helper never received its ConnectorOpen");
+                write_connector_ready(&mut stream, &ConnectorReady::new(healthy_lease))
+                    .await
+                    .unwrap();
+                let _ = healthy_release_rx.await;
+                stream
+            }
+        });
+
+        let mut queue = ConnectorCandidateQueue::default();
+        queue.push(bad_addr);
+        queue.push(healthy_addr.clone());
+        let mut tasks = JoinSet::new();
+        fill_member_candidate_dials(
+            &mut tasks,
+            &mut queue,
+            &target_outer,
+            controller_public,
+            site_id,
+        );
+        assert_eq!(tasks.len(), 2);
+
+        let winner = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tasks.join_next().await {
+                    Some(Ok(Ok(stream))) => break stream,
+                    Some(Ok(Err(_))) => continue,
+                    Some(Err(error)) => panic!("candidate dial task failed: {error}"),
+                    None => panic!("all candidate dials ended without a healthy Helper"),
+                }
+            }
+        })
+        .await
+        .expect("healthy Helper was blocked behind the stalled candidate");
+        assert_eq!(winner.connection().remote_id(), healthy_addr.id);
+
+        tasks.abort_all();
+        drop(winner);
+        let _ = healthy_release_tx.send(());
+        healthy_task.await.unwrap();
+        bad_task.abort();
+        let _ = bad_task.await;
+        target_outer.close().await;
+        healthy_outer.close().await;
+        bad_outer.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires working multicast mDNS on the test network"]
+    async fn real_mdns_healthy_helper_wins_while_first_helper_stalls() {
+        let controller = ControllerIdentity::from_secret([105_u8; 32]);
+        let controller_public = controller.public_identity();
+        let site_id = SiteId::new();
+        let now = unix_ms().unwrap();
+        let target_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let bad_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let healthy_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let bad_addr = bad_outer.addr();
+        let healthy_addr = healthy_outer.addr();
+        let _bad_advertisement = MdnsConnectorDiscovery::attach(
+            &bad_outer,
+            controller_public.controller_id,
+            site_id,
+            true,
+        )
+        .unwrap();
+        let healthy_lease = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            DeviceId::new(),
+            healthy_addr.id,
+            now.saturating_sub(1_000),
+            now + 60_000,
+        )
+        .unwrap();
+
+        let (bad_open_tx, bad_open_rx) = tokio::sync::oneshot::channel();
+        let bad_task = tokio::spawn({
+            let bad_outer = bad_outer.clone();
+            async move {
+                let (protocol, mut stream) = bad_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                let request = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(request.purpose, ConnectorTunnelPurpose::InnerSession);
+                let _ = bad_open_tx.send(());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                stream
+            }
+        });
+        let (healthy_release_tx, healthy_release_rx) = tokio::sync::oneshot::channel();
+        let healthy_task = tokio::spawn({
+            let healthy_outer = healthy_outer.clone();
+            async move {
+                bad_open_rx
+                    .await
+                    .expect("stalled Helper never received its ConnectorOpen");
+                let _healthy_advertisement = MdnsConnectorDiscovery::attach(
+                    &healthy_outer,
+                    controller_public.controller_id,
+                    site_id,
+                    true,
+                )
+                .unwrap();
+                let (protocol, mut stream) = healthy_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                let request = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(request.purpose, ConnectorTunnelPurpose::InnerSession);
+                write_connector_ready(&mut stream, &ConnectorReady::new(healthy_lease))
+                    .await
+                    .unwrap();
+                let _ = healthy_release_rx.await;
+                stream
+            }
+        });
+
+        let bogus_controller = EndpointAddr::new(SecretKey::from_bytes(&[106_u8; 32]).public());
+        let (winner, path) = tokio::time::timeout(
+            Duration::from_secs(8),
+            connect_member_stream(
+                None,
+                &target_outer,
+                bogus_controller,
+                controller_public,
+                site_id,
+            ),
+        )
+        .await
+        .expect("healthy mDNS Helper was blocked behind the stalled first candidate")
+        .unwrap();
+        assert_eq!(path, MemberOuterPath::Connector);
+        assert_eq!(winner.connection().remote_id(), healthy_addr.id);
+        assert_ne!(winner.connection().remote_id(), bad_addr.id);
+
+        drop(winner);
+        let _ = healthy_release_tx.send(());
+        healthy_task.await.unwrap();
+        bad_task.abort();
+        let _ = bad_task.await;
+        target_outer.close().await;
+        healthy_outer.close().await;
+        bad_outer.close().await;
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

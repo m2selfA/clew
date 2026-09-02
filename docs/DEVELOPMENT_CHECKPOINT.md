@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE on Windows + macOS；当前进入 V1.5d multiple-helper failover/resume）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE；V1.5d-1 bounded concurrent helper selection DONE；当前进入 V1.5d-2 Helper-A→Helper-B session failover）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -642,6 +642,22 @@ Acceptance / validation evidence：
 - 这正是 nearby fallback 的目标环境。exact implementation commit `c4fbae6` 的 tracked source archive（SHA-256 `6356f533c82427fdef8454d4d09b691e0186ef750af4303534777596e9a85dc4`）已放入 `macos-3dv0:/Users/inter/Documents/Scratch/scratchpad/clew-v15c3-c4fbae6`；在该已知 mDNS 不可用环境中，no-mDNS sealed enrollment + active DeviceKey InnerSession/Read **1/1 PASS（3.33s）**；native `cargo fmt -- --check`、workspace check 均 PASS，workspace tests **135 passed / 0 failed / 3 ignored**（Host mDNS、transport mDNS、public n0 relay）；
 - [x] **macOS Aqua Host/tray smoke**：`gui/501` domain 可用；exact `c4fbae6` standalone binary 在隔离 `aqua-smoke-state` 中持续运行超过 15 秒且 stderr 为空，second launch 179 ms 返回 `already running; requested the existing window to show`，证明本轮新增 Nearby store/drag-drop/export UI 未破坏 AppKit/tray/single-instance wake；随后 smoke job/state 已清理；
 - V1.5d 继续 multiple-helper health/failover、Helper-A→Helper-B 自动切换与 suspend/resume re-advertise。
+
+### V1.5d-1 — Bounded concurrent Helper selection
+
+**Status：DONE（2026-09-03）**
+
+实际落地：
+
+- Target 不再在 mDNS `Candidate` 分支里串行 `await` 单个 Helper。bootstrap 与 active member 两条 path race 统一使用 bounded candidate queue + `JoinSet`：最多 **4 个并发 verified dials**、单个 candidate 最长 **12 秒**、单 path window 最多接受 **32 个不同 EndpointId**；fallback 与 mDNS candidate 共用 EndpointId 去重；
+- direct Controller dial 继续作为独立 future 并行存在，坏/慢 Helper 不再阻塞 direct；多个 Helper 中**第一个完成 outer connect + fresh Controller-signed lease gate（bootstrap 还包括 sealed Noise 建链）**的候选获胜，实际等价于按可达性/验证完成速度选择健康路径；
+- candidate task 超时/普通连接错误只淘汰该候选并继续队列；task panic/join failure 才上升为 runtime error。path window 到期时 JoinSet 随 future drop 自动取消剩余 speculative dials，不留下后台连接；
+- 默认无 mDNS real-iroh regression 明确把 stalled Helper 放队首、healthy Helper 放第二，并要求 healthy 在发送 lease 前确认 stalled 已经收到 `ConnectorOpen`；两条 dial 真并发时 **1/1 PASS（1.46s）**，串行实现会卡死在第一条；candidate queue 32 上限 + EndpointId 去重 focused **1/1 PASS**；
+- cap00 explicit real-mDNS regression 让 bad Helper 先广播，只有它收到 `ConnectorOpen` 后 healthy Helper 才开始广播；Target 在 **5.00s** 内切到 healthy EndpointId，**1/1 PASS**，证明主 discovery loop 在 stalled dial 期间仍处理后来出现的 Helper。
+
+Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **136 passed / 0 failed / 5 ignored**（interactive Windows GUI、3 个显式 multicast integration、public n0 relay）；real-mDNS stalled-first acceptance 另显式 1/1 PASS。
+
+下一块 V1.5d-2：在已经建立并实际承载 InnerSession/Read 的 Helper-A 断开后，让长期 Host runtime 自动回到 path race，选择 Helper-B 并恢复同一 DeviceKey session；Target 仍只绑定 Site，不持久绑定 HelperId。
 
 计划：
 
