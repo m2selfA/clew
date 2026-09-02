@@ -16,6 +16,7 @@ pub const MAX_OUTFIT_ASSETS: usize = 128;
 pub const MAX_OUTFIT_ASSET_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_OUTFIT_RASTER_DIMENSION: u32 = 2048;
 pub const MAX_OUTFIT_SVG_DIMENSION: f32 = 4096.0;
+pub const MAX_OUTFIT_PREVIEW_EDGE: u32 = 256;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const ASSET_ID_PREFIX: &str = "sha256-";
@@ -50,6 +51,14 @@ pub struct OutfitAssetInfo {
 pub struct OutfitAssetData {
     pub info: OutfitAssetInfo,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutfitAssetPreview {
+    pub asset_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +211,62 @@ impl OutfitAssetStore {
                 height,
             },
             bytes,
+        })
+    }
+
+    pub fn render_preview(
+        &self,
+        asset_id: &str,
+        max_edge: u32,
+    ) -> Result<OutfitAssetPreview, OutfitAssetError> {
+        if max_edge == 0 || max_edge > MAX_OUTFIT_PREVIEW_EDGE {
+            return Err(OutfitAssetError::InvalidPreviewEdge(max_edge));
+        }
+        let asset = self.read(asset_id)?;
+        let (width, height, rgba) = match asset.info.format {
+            OutfitAssetFormat::Png => {
+                let image = image::load_from_memory_with_format(&asset.bytes, ImageFormat::Png)
+                    .map_err(|error| OutfitAssetError::InvalidPng(error.to_string()))?;
+                let thumbnail = image.thumbnail(max_edge, max_edge).to_rgba8();
+                let (width, height) = thumbnail.dimensions();
+                (width, height, thumbnail.into_raw())
+            }
+            OutfitAssetFormat::Svg => {
+                let options = resvg::usvg::Options::default();
+                let tree = resvg::usvg::Tree::from_data(&asset.bytes, &options)
+                    .map_err(|error| OutfitAssetError::InvalidSvg(error.to_string()))?;
+                let source = tree.size();
+                let source_width = source.width();
+                let source_height = source.height();
+                let scale = (max_edge as f32 / source_width.max(source_height)).min(1.0);
+                let width = (source_width * scale).ceil().max(1.0) as u32;
+                let height = (source_height * scale).ceil().max(1.0) as u32;
+                let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+                    .ok_or(OutfitAssetError::PreviewAllocationFailed)?;
+                let transform = resvg::tiny_skia::Transform::from_scale(
+                    width as f32 / source_width,
+                    height as f32 / source_height,
+                );
+                resvg::render(&tree, transform, &mut pixmap.as_mut());
+                (width, height, pixmap.take())
+            }
+        };
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .map(|height| width * height * 4)
+            })
+            .ok_or(OutfitAssetError::PreviewAllocationFailed)?;
+        if rgba.len() != expected {
+            return Err(OutfitAssetError::PreviewAllocationFailed);
+        }
+        Ok(OutfitAssetPreview {
+            asset_id: asset.info.asset_id,
+            width,
+            height,
+            rgba,
         })
     }
 
@@ -407,6 +472,10 @@ pub enum OutfitAssetError {
     CorruptAsset(String),
     #[error("outfit asset hash collision detected: {0:?}")]
     HashCollision(String),
+    #[error("outfit asset preview edge must be in 1..={MAX_OUTFIT_PREVIEW_EDGE}, got {0}")]
+    InvalidPreviewEdge(u32),
+    #[error("outfit asset preview allocation failed")]
+    PreviewAllocationFailed,
     #[error("outfit asset store contains too many assets: {0}")]
     TooManyAssets(usize),
     #[error("outfit asset store exceeds its byte budget: {0}")]
@@ -467,6 +536,30 @@ mod tests {
         ));
         let local_gradient = br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><defs><linearGradient id="g"><stop stop-color="#fff"/></linearGradient></defs><rect fill="url(#g)" width="32" height="24"/></svg>"##;
         assert!(store.import_bytes(local_gradient).is_ok());
+    }
+
+    #[test]
+    fn png_and_svg_preview_are_bounded_rgba() {
+        let temp = tempdir().unwrap();
+        let store = OutfitAssetStore::load_or_create(StateLayout::new(temp.path())).unwrap();
+        let png = store.import_bytes(&png_fixture()).unwrap();
+        let png_preview = store.render_preview(&png.asset_id, 8).unwrap();
+        assert!(png_preview.width <= 8 && png_preview.height <= 8);
+        assert_eq!(
+            png_preview.rgba.len(),
+            (png_preview.width * png_preview.height * 4) as usize
+        );
+
+        let svg = store
+            .import_bytes(br##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32"><rect width="64" height="32" fill="#2684ff"/></svg>"##)
+            .unwrap();
+        let svg_preview = store.render_preview(&svg.asset_id, 16).unwrap();
+        assert_eq!((svg_preview.width, svg_preview.height), (16, 8));
+        assert_eq!(svg_preview.rgba.len(), 16 * 8 * 4);
+        assert!(matches!(
+            store.render_preview(&svg.asset_id, MAX_OUTFIT_PREVIEW_EDGE + 1),
+            Err(OutfitAssetError::InvalidPreviewEdge(_))
+        ));
     }
 
     #[test]

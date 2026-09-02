@@ -6,10 +6,15 @@ use std::{
 };
 
 use clew_core::ActivityResult;
+use clew_host::OutfitProfile;
 use clew_runtime::{
     ActivityList, BackupExportRequest, ControllerConfig, ControllerStatus, DeviceList,
-    LocalApiClient, RecoveryStatus,
+    LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
+    OutfitAssetPreviewResponse, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
+    OutfitSetAssetRequest, OutfitUpdateRequest, RecoveryStatus,
 };
+
+use crate::studio::{StudioAction, StudioState};
 use eframe::egui;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -22,8 +27,8 @@ pub async fn run(config: ControllerConfig) -> Result<(), Box<dyn std::error::Err
     ensure_controller(&config).await?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 520.0])
-            .with_min_inner_size([560.0, 360.0]),
+            .with_inner_size([920.0, 700.0])
+            .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -62,6 +67,14 @@ async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn std:
 
 enum BackendCommand {
     Refresh,
+    OutfitShow(String),
+    OutfitCreate(OutfitCreateRequest),
+    OutfitClone(OutfitCloneRequest),
+    OutfitUpdate(OutfitUpdateRequest),
+    OutfitSetDefault(String),
+    OutfitAssetImport(String),
+    OutfitSetAsset(OutfitSetAssetRequest),
+    OutfitAssetPreview(String),
     BackupExport { path: String, passphrase: String },
     RecoveryConfirm,
     ActivityClear,
@@ -74,7 +87,17 @@ enum BackendEvent {
         devices: DeviceList,
         activity: ActivityList,
         recovery: RecoveryStatus,
+        outfits: OutfitList,
+        outfit_assets: OutfitAssetList,
     },
+    OutfitProfileLoaded(OutfitProfile),
+    OutfitProfileSaved {
+        profile: OutfitProfile,
+        notice: String,
+    },
+    OutfitDefaultChanged(String),
+    OutfitAssetImported(OutfitAssetInfo),
+    OutfitAssetPreview(OutfitAssetPreviewResponse),
     BackupExportComplete(String),
     RecoveryConfirmed(RecoveryStatus),
     ActivityCleared,
@@ -108,20 +131,97 @@ impl Backend {
                                 let devices = client.device_list().await?;
                                 let activity = client.activity_list(20).await?;
                                 let recovery = client.recovery_status().await?;
+                                let outfits = client.outfit_list().await?;
+                                let outfit_assets = client.outfit_asset_list().await?;
                                 Ok::<_, clew_runtime::LocalApiClientError>((
-                                    status, devices, activity, recovery,
+                                    status,
+                                    devices,
+                                    activity,
+                                    recovery,
+                                    outfits,
+                                    outfit_assets,
                                 ))
                             }
                             .await;
                             match result {
-                                Ok((status, devices, activity, recovery)) => {
-                                    BackendEvent::Snapshot {
-                                        status,
-                                        devices,
-                                        activity,
-                                        recovery,
-                                    }
-                                }
+                                Ok((
+                                    status,
+                                    devices,
+                                    activity,
+                                    recovery,
+                                    outfits,
+                                    outfit_assets,
+                                )) => BackendEvent::Snapshot {
+                                    status,
+                                    devices,
+                                    activity,
+                                    recovery,
+                                    outfits,
+                                    outfit_assets,
+                                },
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitShow(outfit_id) => runtime.block_on(async {
+                            match client.outfit_show(outfit_id).await {
+                                Ok(profile) => BackendEvent::OutfitProfileLoaded(profile),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitCreate(request) => runtime.block_on(async {
+                            match client.outfit_create(request).await {
+                                Ok(profile) => BackendEvent::OutfitProfileSaved {
+                                    profile,
+                                    notice: "Outfit created.".into(),
+                                },
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitClone(request) => runtime.block_on(async {
+                            match client.outfit_clone(request).await {
+                                Ok(profile) => BackendEvent::OutfitProfileSaved {
+                                    profile,
+                                    notice: "Outfit cloned.".into(),
+                                },
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitUpdate(request) => runtime.block_on(async {
+                            match client.outfit_update(request).await {
+                                Ok(profile) => BackendEvent::OutfitProfileSaved {
+                                    profile,
+                                    notice: "Outfit changes saved.".into(),
+                                },
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitSetDefault(outfit_id) => runtime.block_on(async {
+                            match client.outfit_set_default(outfit_id.clone()).await {
+                                Ok(()) => BackendEvent::OutfitDefaultChanged(outfit_id),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitAssetImport(path) => runtime.block_on(async {
+                            match client
+                                .outfit_asset_import(OutfitAssetImportRequest { path })
+                                .await
+                            {
+                                Ok(info) => BackendEvent::OutfitAssetImported(info),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitSetAsset(request) => runtime.block_on(async {
+                            match client.outfit_set_asset(request).await {
+                                Ok(profile) => BackendEvent::OutfitProfileSaved {
+                                    profile,
+                                    notice: "Visual asset assigned.".into(),
+                                },
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::OutfitAssetPreview(asset_id) => runtime.block_on(async {
+                            match client.outfit_asset_preview(asset_id, 192).await {
+                                Ok(preview) => BackendEvent::OutfitAssetPreview(preview),
                                 Err(error) => BackendEvent::Error(error.to_string()),
                             }
                         }),
@@ -176,6 +276,38 @@ impl Backend {
 
     fn refresh(&self) {
         let _ = self.tx.send(BackendCommand::Refresh);
+    }
+
+    fn outfit_show(&self, outfit_id: String) {
+        let _ = self.tx.send(BackendCommand::OutfitShow(outfit_id));
+    }
+
+    fn outfit_create(&self, request: OutfitCreateRequest) {
+        let _ = self.tx.send(BackendCommand::OutfitCreate(request));
+    }
+
+    fn outfit_clone(&self, request: OutfitCloneRequest) {
+        let _ = self.tx.send(BackendCommand::OutfitClone(request));
+    }
+
+    fn outfit_update(&self, request: OutfitUpdateRequest) {
+        let _ = self.tx.send(BackendCommand::OutfitUpdate(request));
+    }
+
+    fn outfit_set_default(&self, outfit_id: String) {
+        let _ = self.tx.send(BackendCommand::OutfitSetDefault(outfit_id));
+    }
+
+    fn outfit_asset_import(&self, path: String) {
+        let _ = self.tx.send(BackendCommand::OutfitAssetImport(path));
+    }
+
+    fn outfit_set_asset(&self, request: OutfitSetAssetRequest) {
+        let _ = self.tx.send(BackendCommand::OutfitSetAsset(request));
+    }
+
+    fn outfit_asset_preview(&self, asset_id: String) {
+        let _ = self.tx.send(BackendCommand::OutfitAssetPreview(asset_id));
     }
 
     fn backup_export(&self, path: String, passphrase: String) {
@@ -276,6 +408,7 @@ struct ControllerApp {
     devices: DeviceList,
     activity: ActivityList,
     recovery: RecoveryStatus,
+    studio: StudioState,
     error: Option<String>,
     notice: Option<String>,
     backup_passphrase: String,
@@ -304,6 +437,7 @@ impl ControllerApp {
             },
             activity: ActivityList { events: Vec::new() },
             recovery: RecoveryStatus { review: None },
+            studio: StudioState::new(),
             error: None,
             notice: None,
             backup_passphrase: String::new(),
@@ -325,12 +459,59 @@ impl ControllerApp {
                     devices,
                     activity,
                     recovery,
+                    outfits,
+                    outfit_assets,
                 } => {
                     self.status = Some(status);
                     self.devices = devices;
                     self.activity = activity;
                     self.recovery = recovery;
                     self.error = None;
+                    if let Some(action) = self.studio.set_catalogs(outfits, outfit_assets) {
+                        self.dispatch_studio_action(action);
+                    }
+                }
+                BackendEvent::OutfitProfileLoaded(profile) => {
+                    let actions = self.studio.accept_profile(profile);
+                    for action in actions {
+                        self.dispatch_studio_action(action);
+                    }
+                    self.error = None;
+                }
+                BackendEvent::OutfitProfileSaved { profile, notice } => {
+                    let actions = self.studio.accept_profile(profile);
+                    for action in actions {
+                        self.dispatch_studio_action(action);
+                    }
+                    self.notice = Some(notice);
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::OutfitDefaultChanged(outfit_id) => {
+                    self.studio.accept_default_change();
+                    self.notice = Some(format!("Default Outfit set to {outfit_id}."));
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::OutfitAssetImported(info) => {
+                    let actions = self.studio.accept_asset_import(info);
+                    for action in actions {
+                        self.dispatch_studio_action(action);
+                    }
+                    self.notice = Some("Outfit asset imported.".into());
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::OutfitAssetPreview(preview) => {
+                    if let Err(error) = self.studio.accept_preview(ctx, preview) {
+                        self.error = Some(error);
+                    }
                 }
                 BackendEvent::BackupExportComplete(path) => {
                     self.backup_export_in_flight = false;
@@ -354,6 +535,7 @@ impl ControllerApp {
                 }
                 BackendEvent::Error(error) => {
                     self.backup_export_in_flight = false;
+                    self.studio.accept_error();
                     self.error = Some(error);
                 }
                 BackendEvent::ShutdownComplete => {
@@ -380,6 +562,29 @@ impl ControllerApp {
             self.backend.refresh();
             self.refresh_in_flight = true;
             self.last_refresh = Instant::now();
+        }
+    }
+
+    fn dispatch_studio_action(&mut self, action: StudioAction) {
+        match action {
+            StudioAction::SelectOutfit(outfit_id) => self.backend.outfit_show(outfit_id),
+            StudioAction::Create(request) => self.backend.outfit_create(request),
+            StudioAction::Clone(request) => self.backend.outfit_clone(request),
+            StudioAction::Update(request) => self.backend.outfit_update(request),
+            StudioAction::SetDefault(outfit_id) => self.backend.outfit_set_default(outfit_id),
+            StudioAction::ImportAsset => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Outfit asset", &["png", "svg"])
+                    .pick_file()
+                {
+                    match path.to_str() {
+                        Some(path) => self.backend.outfit_asset_import(path.to_owned()),
+                        None => self.error = Some("The asset path must be valid UTF-8.".into()),
+                    }
+                }
+            }
+            StudioAction::SetAsset(request) => self.backend.outfit_set_asset(request),
+            StudioAction::PreviewAsset(asset_id) => self.backend.outfit_asset_preview(asset_id),
         }
     }
 }
@@ -476,6 +681,22 @@ impl eframe::App for ControllerApp {
                     ));
                 });
             }
+        }
+
+        ui.separator();
+        let mut studio_actions = Vec::new();
+        egui::CollapsingHeader::new("Outfit Studio")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("outfit-studio-scroll")
+                    .max_height(560.0)
+                    .show(ui, |ui| {
+                        studio_actions = self.studio.ui(ui);
+                    });
+            });
+        for action in studio_actions {
+            self.dispatch_studio_action(action);
         }
 
         ui.separator();

@@ -4,6 +4,8 @@ use std::{io::Write, path::PathBuf, process::ExitCode};
 mod gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod host_gui;
+#[cfg(any(windows, target_os = "macos"))]
+mod studio;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, Subcommand};
@@ -755,7 +757,7 @@ async fn run_host_desktop(
         } else {
             None
         };
-        let action = host_gui::run(state, wake_rx)?;
+        let action = host_gui::run(&layout, state, wake_rx)?;
         let _ = shutdown_tx.send(());
         server.await??;
         if let Some((remote_shutdown_tx, task)) = remote {

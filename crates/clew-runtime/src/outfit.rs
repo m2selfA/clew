@@ -8,7 +8,10 @@ use std::{
 use clew_core::{
     MAX_STATE_DOCUMENT_SIZE, StateCodecError, StateLayout, decode_state_json, encode_state_json,
 };
-use clew_host::{OutfitAssetRef, OutfitError, OutfitPreset, OutfitProfile};
+use clew_host::{
+    KEY_AWAITING_ENROLLMENT, KEY_MISSING_INVITE_BODY, KEY_MISSING_INVITE_TITLE, KEY_READY,
+    OutfitAssetRef, OutfitError, OutfitPreset, OutfitProfile,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -32,6 +35,21 @@ pub struct OutfitLibrarySnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_outfit_id: Option<String>,
     pub custom: BTreeMap<String, OutfitProfile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitEditPatch {
+    pub display_name: String,
+    pub app_display_name: String,
+    pub window_title: String,
+    pub primary_color: String,
+    pub ready_text: String,
+    pub awaiting_enrollment_text: String,
+    pub missing_invite_title: String,
+    pub missing_invite_body: String,
+    pub start_here_title: String,
+    pub start_here_body: String,
+    pub chat_message_template: String,
 }
 
 impl OutfitLibrarySnapshot {
@@ -286,6 +304,75 @@ impl OutfitLibrary {
         })
     }
 
+    pub fn update_editable(
+        &mut self,
+        outfit_id: &str,
+        patch: OutfitEditPatch,
+    ) -> Result<OutfitProfile, OutfitStoreError> {
+        if preset_by_id(outfit_id).is_some() {
+            return Err(OutfitStoreError::BuiltInIsReadOnly(outfit_id.into()));
+        }
+        let outfit_id = outfit_id.to_owned();
+        self.transaction(move |snapshot| {
+            let profile = snapshot
+                .custom
+                .get_mut(&outfit_id)
+                .ok_or_else(|| OutfitStoreError::UnknownOutfit(outfit_id.clone()))?;
+            let mut changed = false;
+            changed |= replace_if_changed(&mut profile.display_name, patch.display_name);
+            changed |= replace_if_changed(
+                &mut profile.identity.app_display_name,
+                patch.app_display_name,
+            );
+            changed |= replace_if_changed(&mut profile.identity.window_title, patch.window_title);
+            changed |= replace_if_changed(&mut profile.visuals.primary_color, patch.primary_color);
+
+            let locale = profile.strings.locale_default.clone();
+            let resources = profile
+                .strings
+                .resources_by_locale
+                .entry(locale)
+                .or_default();
+            changed |= replace_resource_if_changed(resources, KEY_READY, patch.ready_text);
+            changed |= replace_resource_if_changed(
+                resources,
+                KEY_AWAITING_ENROLLMENT,
+                patch.awaiting_enrollment_text,
+            );
+            changed |= replace_resource_if_changed(
+                resources,
+                KEY_MISSING_INVITE_TITLE,
+                patch.missing_invite_title,
+            );
+            changed |= replace_resource_if_changed(
+                resources,
+                KEY_MISSING_INVITE_BODY,
+                patch.missing_invite_body,
+            );
+            changed |= replace_if_changed(
+                &mut profile.distribution_copy.start_here_title,
+                patch.start_here_title,
+            );
+            changed |= replace_if_changed(
+                &mut profile.distribution_copy.start_here_body,
+                patch.start_here_body,
+            );
+            changed |= replace_if_changed(
+                &mut profile.distribution_copy.chat_message_template,
+                patch.chat_message_template,
+            );
+            if changed {
+                profile.revision = profile
+                    .revision
+                    .checked_add(1)
+                    .ok_or(OutfitStoreError::RevisionOverflow)?;
+            }
+            profile.validate()?;
+            snapshot.recent_outfit_id = Some(profile.outfit_id.clone());
+            Ok(profile.clone())
+        })
+    }
+
     pub fn set_asset(
         &mut self,
         outfit_id: &str,
@@ -381,6 +468,18 @@ fn replace_if_changed(target: &mut String, value: String) -> bool {
         return false;
     }
     *target = value;
+    true
+}
+
+fn replace_resource_if_changed(
+    resources: &mut BTreeMap<String, String>,
+    key: &str,
+    value: String,
+) -> bool {
+    if resources.get(key) == Some(&value) {
+        return false;
+    }
+    resources.insert(key.to_owned(), value);
     true
 }
 
@@ -556,6 +655,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edited.revision, 2);
+    }
+
+    #[test]
+    fn batch_edit_updates_default_locale_and_increments_revision_once() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path());
+        let mut store = OutfitLibrary::load_or_create(layout).unwrap();
+        let created = store
+            .create_from_preset(
+                "studio-lab".into(),
+                "Studio Lab".into(),
+                OutfitPreset::ResearchLab,
+            )
+            .unwrap();
+        let patch = OutfitEditPatch {
+            display_name: "Studio Lab 2".into(),
+            app_display_name: "Studio Connect".into(),
+            window_title: "Studio Connect".into(),
+            primary_color: "#345678".into(),
+            ready_text: "Studio ready.".into(),
+            awaiting_enrollment_text: "Studio connecting.".into(),
+            missing_invite_title: "Invitation needed".into(),
+            missing_invite_body: "Keep site.clew with this app.".into(),
+            start_here_title: "Start Studio".into(),
+            start_here_body: "Open the Studio Site Kit.".into(),
+            chat_message_template: "Open this Studio Site Kit.".into(),
+        };
+        let updated = store.update_editable("studio-lab", patch.clone()).unwrap();
+        assert_eq!(updated.revision, created.revision + 1);
+        assert_eq!(updated.identity.app_display_name, "Studio Connect");
+        assert_eq!(
+            updated.resolve_resource(&updated.strings.locale_default, KEY_READY),
+            "Studio ready."
+        );
+        let unchanged = store.update_editable("studio-lab", patch).unwrap();
+        assert_eq!(unchanged.revision, updated.revision);
     }
 
     #[test]

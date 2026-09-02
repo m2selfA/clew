@@ -25,7 +25,8 @@ use tokio::{
 
 use crate::{
     ControllerConfig, ControllerControlStore, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore,
-    OutfitLibrary, OutfitLibraryEntry, RemoteHub, export_controller_backup, transport,
+    OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub, export_controller_backup,
+    transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -145,6 +146,12 @@ pub struct OutfitSetFieldRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitUpdateRequest {
+    pub outfit_id: String,
+    pub patch: OutfitEditPatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutfitAssetImportRequest {
     pub path: String,
 }
@@ -165,6 +172,14 @@ pub struct OutfitAssetList {
 pub struct OutfitAssetDataResponse {
     pub info: OutfitAssetInfo,
     pub data_base64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitAssetPreviewResponse {
+    pub asset_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba_base64: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -305,10 +320,15 @@ enum LocalMethod {
         outfit_id: String,
     },
     OutfitSetField(OutfitSetFieldRequest),
+    OutfitUpdate(OutfitUpdateRequest),
     OutfitAssetList,
     OutfitAssetImport(OutfitAssetImportRequest),
     OutfitAssetGet {
         asset_id: String,
+    },
+    OutfitAssetPreview {
+        asset_id: String,
+        max_edge: u32,
     },
     OutfitSetAsset(OutfitSetAssetRequest),
     BackupExport(BackupExportRequest),
@@ -332,6 +352,7 @@ enum LocalResponse {
     OutfitAssetList(OutfitAssetList),
     OutfitAssetInfo(OutfitAssetInfo),
     OutfitAssetData(OutfitAssetDataResponse),
+    OutfitAssetPreview(OutfitAssetPreviewResponse),
     RecoveryStatus(RecoveryStatus),
     Ack,
     Error(LocalApiErrorBody),
@@ -524,6 +545,14 @@ async fn dispatch(
             .unwrap_or_else(LocalResponse::Error);
             (response, false)
         }
+        LocalMethod::OutfitUpdate(request) => {
+            let response = with_outfits(state, |store| {
+                store.update_editable(&request.outfit_id, request.patch)
+            })
+            .map(LocalResponse::OutfitProfile)
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
         LocalMethod::OutfitAssetList => {
             let response = with_outfit_assets(state, |store| store.list())
                 .map(|assets| LocalResponse::OutfitAssetList(OutfitAssetList { assets }))
@@ -543,6 +572,20 @@ async fn dispatch(
                     })
                 })
                 .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitAssetPreview { asset_id, max_edge } => {
+            let response =
+                with_outfit_assets(state, |store| store.render_preview(&asset_id, max_edge))
+                    .map(|preview| {
+                        LocalResponse::OutfitAssetPreview(OutfitAssetPreviewResponse {
+                            asset_id: preview.asset_id,
+                            width: preview.width,
+                            height: preview.height,
+                            rgba_base64: BASE64_STANDARD.encode(preview.rgba),
+                        })
+                    })
+                    .unwrap_or_else(LocalResponse::Error);
             (response, false)
         }
         LocalMethod::OutfitSetAsset(request) => {
@@ -1087,6 +1130,17 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn outfit_update(
+        &self,
+        request: OutfitUpdateRequest,
+    ) -> Result<OutfitProfile, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitUpdate(request)).await? {
+            LocalResponse::OutfitProfile(profile) => Ok(profile),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn outfit_asset_list(&self) -> Result<OutfitAssetList, LocalApiClientError> {
         match self.request(LocalMethod::OutfitAssetList).await? {
             LocalResponse::OutfitAssetList(result) => Ok(result),
@@ -1118,6 +1172,21 @@ impl LocalApiClient {
             .await?
         {
             LocalResponse::OutfitAssetData(data) => Ok(data),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_asset_preview(
+        &self,
+        asset_id: String,
+        max_edge: u32,
+    ) -> Result<OutfitAssetPreviewResponse, LocalApiClientError> {
+        match self
+            .request(LocalMethod::OutfitAssetPreview { asset_id, max_edge })
+            .await?
+        {
+            LocalResponse::OutfitAssetPreview(preview) => Ok(preview),
             LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
@@ -1367,6 +1436,19 @@ mod tests {
                 height: 2048,
             },
             data_base64: BASE64_STANDARD.encode(bytes),
+        });
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= MAX_LOCAL_API_FRAME_SIZE);
+    }
+
+    #[test]
+    fn maximum_asset_preview_response_stays_within_local_api_frame_bound() {
+        let rgba = vec![0_u8; (crate::MAX_OUTFIT_PREVIEW_EDGE as usize).pow(2) * 4];
+        let response = LocalResponse::OutfitAssetPreview(OutfitAssetPreviewResponse {
+            asset_id: format!("sha256-{}", "b".repeat(64)),
+            width: crate::MAX_OUTFIT_PREVIEW_EDGE,
+            height: crate::MAX_OUTFIT_PREVIEW_EDGE,
+            rgba_base64: BASE64_STANDARD.encode(rgba),
         });
         let encoded = serde_json::to_vec(&response).unwrap();
         assert!(encoded.len() <= MAX_LOCAL_API_FRAME_SIZE);

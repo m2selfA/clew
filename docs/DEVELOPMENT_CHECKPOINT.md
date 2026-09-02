@@ -445,7 +445,7 @@ Known / release blockers：
 
 ## 7. V1.25 — Distribution Studio Foundation
 
-**Status：IN PROGRESS（V1.25a DONE；V1.25b-1 bounded asset distribution DONE；V1.25b-2 Studio GUI/live preview 待继续）**
+**Status：IN PROGRESS（V1.25a DONE；V1.25b-1 DONE；V1.25b-2 implementation complete；macOS Studio/Host visual gate pending）**
 
 **Date：2026-09-02**
 
@@ -498,12 +498,28 @@ V1.25b-1 validation：
 - `cargo test --workspace --all-targets`：PASS，**109 tests passed / 0 failed**；另 2 项默认 ignored（interactive Windows Host GUI / public relay）；
 - Runtime focused **24/24 PASS**，Host focused **26/26 PASS**；asset smoke Controller/Host 进程与 `%TEMP%\\clew-v125-asset-smoke` 已确认清理。
 
-V1.25b-2 继续：
+V1.25b-2 Studio GUI/live preview implementation 已落地：
 
-- Controller GUI Outfit library/editor；
-- live preview：主窗口 / helper / tray / Site Kit；
-- imported PNG/SVG thumbnail/app+tray/logo/key-visual projection；
-- 用 GUI 创建/编辑一套带 imported visual asset 的真实 Outfit，再跑 Site Kit acceptance。
+- Controller GUI 新增默认展开的 Outfit Studio；library/recent/default、create-from-preset、clone、batch edit、set-default、asset import/slot assignment 全部只通过 Local API，GUI 仅持可丢弃 draft/texture cache，不直接读写 OutfitLibrary/asset state；
+- `OutfitEditPatch` 把 identity/color/default-locale core copy/Site Kit copy 合成单个 Controller transaction：一次 Apply 最多 revision +1，内容不变不增 revision；built-in 仍 read-only；
+- asset preview 继续由 Controller runtime 负责解析/render：PNG/SVG 复用同一安全 parser，max edge 256，输出 bounded RGBA，再经 Local API base64 返回；最大 256×256 RGBA response 仍在既有 1 MiB Local API frame 内；
+- Studio live preview 已覆盖 Main window / Helper / Tray / Site Kit，unsaved draft 只投影到 preview clone；imported app/tray/logo/key-visual 使用 bounded thumbnail texture；
+- Host desktop 不再只消费 Outfit 文案：从**已验证的 Host state asset cache**加载 imported app icon / tray icon / logo / key visual；app icon 进入 window icon/header，tray icon 真正进入系统 tray，primary color 进入窗口 accent；signed imported asset cache 缺失/损坏时 fail closed，不静默回退为 Clew Original。
+
+V1.25b-2 Windows acceptance evidence：
+
+- [x] 隔离 Controller state 创建 `studio-smoke`，同一 170-byte SVG content id `sha256-3937a6d6...0ee5eb` 分配到 app/tray/logo/key-visual，primary color `#C25435`，revision 1→6 并设 default；
+- [x] Controller Studio GUI 在 custom default/recent profile 下默认展开并持续运行，stderr 为空；WebCodex runner 中途发生 `runner_instance_replaced` 后，旧 smoke 进程消失但 Outfit 双槽/asset/site state 保留，新 runner 重启 Controller/Studio 后 GUI 再次稳定运行，证明 Studio catalog/profile/asset preview 不依赖旧进程内存；
+- [x] 同一 profile 生成真实 network Site Kit；Windows desktop Host 使用 imported window/tray visual 完成 enrollment，GUI 持续运行，second launch wake PASS；Controller 显示 DeviceId `91d7f530-...` `online=true / executable=true`，bounded Read 返回 `CLEW-V125-STUDIO-PROOF`；
+- [x] Host state cache 唯一 SVG 的实际 SHA-256 与 signed content id 完全一致；停止 Host 后删除整个 Site Kit，再仅以 Host state 启动 desktop Host：仍恢复同一 DeviceId、branded visual event loop 持续运行，第二次 Read 同样成功；朋友侧没有增加 route/code/IP/额外 enrollment 动作。
+
+V1.25b-2 implementation validation：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**114 tests passed / 0 failed**；另 2 项默认 ignored（interactive Windows Host GUI / public relay）；
+- Runtime focused 28/28、root/Studio/CLI focused 5 passed + 1 Windows interactive default ignored；Windows branded Studio/Host smoke 进程与 `%TEMP%\\clew-v125-studio-smoke` 已确认清理；
+- **remaining gate：**同一 implementation commit 还需在 `macos-3dv0:scratchpad` 做 native workspace check/test + Aqua Studio GUI + imported-tray Host GUI smoke。该 gate 通过前不把 V1.25 标 DONE，也不进入 V1.5。
 
 最终 V1.25 Acceptance：从 preset 创建一套自定义 Outfit（含可选 imported visual assets）用于真实 Site Kit；朋友侧连接动作数与 Clew Original 完全相同。
 
@@ -652,14 +668,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.25 — Distribution Studio Foundation（IN PROGRESS；V1.25a + V1.25b-1 DONE）**
+**Current block：V1.25 — Distribution Studio Foundation（IN PROGRESS；V1.25b-2 implementation complete）**
 
-**Next block：V1.25b-2 — Studio GUI/editor + imported-asset live preview**
+**Next gate：macOS native Studio + imported-visual Host acceptance；PASS 后封板 V1.25，再进入 V1.5 discovery spike**
 
-V1.25a 已完成 Outfit schema/library/custom Site Kit；V1.25b-1 已完成 bounded PNG/SVG asset store、Local API/CLI、content-addressed Site Kit distribution、Host verified state cache 与 build/cache key，并通过删除整包后的同 DeviceId/Read 恢复。下一步只推进 Studio GUI/editor/live preview，不提前进入 V1.5。
+V1.25a/b-1/b-2 代码面已完成 Outfit schema/library、bounded asset distribution、Controller Studio editor/live preview，以及 Host imported app/tray/logo/key-visual runtime projection；Windows real Studio/Host/no-sidecar Read acceptance 已闭合。当前唯一剩余项是 exact implementation commit 的 macOS native/Aqua gate；该 gate 通过前不提前进入 V1.5。
 
 ### Change log
 
+- **2026-09-02** — V1.25b-2 implementation complete / macOS gate pending：Controller GUI 新增 Local-API-only Outfit Studio、单 revision batch edit、bounded PNG/SVG thumbnail/live preview；Host runtime 真正消费 imported window/tray/logo/key-visual + primary accent。Windows `studio-smoke` Studio GUI、network branded Host、second-launch wake、Read、删除整包后的同 DeviceId branded restart/再 Read 全 PASS；workspace 114/0。下一步只做 exact commit macOS native/Aqua gate。
 - **2026-09-02** — V1.25b-1 asset distribution DONE：新增 Controller-owned bounded PNG/SVG content-addressed store、asset Local API/CLI、asset revision binding、deterministic build/cache key、`invite` sibling asset export 与 Host signed-hash state cache；真实 asset-lab Site Kit enrollment/Read + 删除整个 kit 后同 DeviceId 无 sidecar restart/再 Read PASS。workspace 109/0，下一块 V1.25b-2 Studio GUI/editor/live preview。
 
 - **2026-09-02** — V1.25a foundation DONE：新增 bounded OutfitProfile/四 preset、Controller-owned 双槽 OutfitLibrary、`clew outfit` Local API/CLI、`clew invite --outfit`、signed OutfitProfile→ClientFlavor→Host runtime→membership recovery vertical slice；真实 `huang-lab` Site Kit enrollment/Read 与无 sidecar 同 DeviceId 重启/再 Read PASS。workspace 102/0，下一块 V1.25b Studio GUI/assets/preview。

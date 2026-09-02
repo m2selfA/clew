@@ -19,16 +19,18 @@ pub use local_api::{
     ActivityList, BackupExportRequest, ControllerStatus, DeviceList, InviteIssueRequest,
     InviteIssueResult, LOCAL_API_VERSION, LocalApiClient, LocalApiClientError, LocalApiErrorCode,
     MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
-    OutfitAssetImportRequest, OutfitAssetList, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
-    OutfitSetAssetRequest, OutfitSetFieldRequest, RecoveryStatus, RemoteReadRequest,
-    RemoteReadResult,
+    OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
+    OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
+    OutfitUpdateRequest, RecoveryStatus, RemoteReadRequest, RemoteReadResult,
 };
 pub use outfit::{
-    MAX_CUSTOM_OUTFITS, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot, OutfitStoreError,
+    MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
+    OutfitStoreError,
 };
 pub use outfit_asset::{
-    MAX_OUTFIT_ASSET_BYTES, MAX_OUTFIT_ASSET_TOTAL_BYTES, MAX_OUTFIT_ASSETS, OutfitAssetData,
-    OutfitAssetError, OutfitAssetFormat, OutfitAssetInfo, OutfitAssetStore,
+    MAX_OUTFIT_ASSET_BYTES, MAX_OUTFIT_ASSET_TOTAL_BYTES, MAX_OUTFIT_ASSETS,
+    MAX_OUTFIT_PREVIEW_EDGE, OutfitAssetData, OutfitAssetError, OutfitAssetFormat, OutfitAssetInfo,
+    OutfitAssetPreview, OutfitAssetStore,
 };
 pub use remote::{
     MAX_REMOTE_CONNECTIONS, RemoteConnectionError, RemoteHub, RemoteHubError,
