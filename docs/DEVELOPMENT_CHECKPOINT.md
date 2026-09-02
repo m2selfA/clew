@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE on Windows/cap00，macOS exact-commit gate next；V1.5d multiple-helper failover/resume follows）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE on Windows + macOS；当前进入 V1.5d multiple-helper failover/resume）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -623,7 +623,7 @@ Acceptance / validation evidence：
 
 ### V1.5c-3 — Nearby Connector file fallback
 
-**Status：IMPLEMENTED + CAP00 ACCEPTED（2026-09-02；macOS exact-commit acceptance pending）**
+**Status：DONE（2026-09-03）**
 
 实际落地：
 
@@ -639,7 +639,8 @@ Acceptance / validation evidence：
 平台事实 / gate：
 
 - `macos-3dv0`（QEMU）上 exact `eaacd5e` 的 full no-public mDNS test 失败；继续缩小到 `clew-transport::real_mdns_discovers_only_same_site_and_connects` 后同样在 10 秒内收不到同机 advertiser。由此冻结为该 VM/network 的 multicast/mDNS 不可用事实，不再靠调大 timeout 掩盖；
-- 这正是 nearby fallback 的目标环境。下一步用 fallback implementation 的 exact commit 在 `macos-3dv0` 的 `/Users/inter/Documents/Scratch/scratchpad/...` 做 native workspace + Aqua gate；通过后再把本小节改为 DONE；
+- 这正是 nearby fallback 的目标环境。exact implementation commit `c4fbae6` 的 tracked source archive（SHA-256 `6356f533c82427fdef8454d4d09b691e0186ef750af4303534777596e9a85dc4`）已放入 `macos-3dv0:/Users/inter/Documents/Scratch/scratchpad/clew-v15c3-c4fbae6`；在该已知 mDNS 不可用环境中，no-mDNS sealed enrollment + active DeviceKey InnerSession/Read **1/1 PASS（3.33s）**；native `cargo fmt -- --check`、workspace check 均 PASS，workspace tests **135 passed / 0 failed / 3 ignored**（Host mDNS、transport mDNS、public n0 relay）；
+- [x] **macOS Aqua Host/tray smoke**：`gui/501` domain 可用；exact `c4fbae6` standalone binary 在隔离 `aqua-smoke-state` 中持续运行超过 15 秒且 stderr 为空，second launch 179 ms 返回 `already running; requested the existing window to show`，证明本轮新增 Nearby store/drag-drop/export UI 未破坏 AppKit/tray/single-instance wake；随后 smoke job/state 已清理；
 - V1.5d 继续 multiple-helper health/failover、Helper-A→Helper-B 自动切换与 suspend/resume re-advertise。
 
 计划：
@@ -783,11 +784,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current block：V1.5 — Zero-config Site Connector（IN PROGRESS；V1.5a DONE）**
 
-**Next block：V1.5b — sealed-to-Controller first enrollment + Controller/Host runtime integration**
+**Next block：V1.5d — multiple-helper health/failover + suspend/resume**
 
-V1.5a 已用当前 `iroh 1.1.0` + `iroh-mdns-address-lookup 0.5.0` 真机/真实 endpoint spike 证明 same-Site LAN candidate discovery、Controller-signed helper lease 与 opaque InnerSession tunnel 可行；Helper 不需要也不得终止业务会话。下一步先把首次 enrollment 的 BootstrapRequest 也做 Target→Controller E2E sealing，再把 Connector ALPN 从 runtime fail-closed 状态接入 Controller/Host；在 sealed bootstrap 完成前禁止 helper 转发现有明文 bootstrap。
+V1.5a–c 已把 discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序与 mDNS-blocked fallback 全部闭环。V1.5d 不再扩张协议角色：先把 candidate race 改成 bounded concurrent health selection，证明坏/慢 Helper 不会阻塞其它候选；再做 Helper-A 断线→Helper-B 自动恢复的真实 acceptance，并补 helper suspend/resume 后 endpoint/lease/mDNS refresh。Target 仍只绑定 Site，不持久绑定具体 HelperId。
 
 ### Change log
+
+- **2026-09-03** — V1.5c-3 nearby fallback DONE：commit `c4fbae6` 增加 bounded/versioned `nearby-connection.clew`、Controller-signed historical route binding、per-Site import/export、direct+mDNS+fallback race 与 Host drag/drop/export UI；cap00 workspace **134/0/4**，两条 explicit multicast 与 Windows GUI 分别 1/1 PASS。exact source 在已知 mDNS 不可用的 `macos-3dv0` 上 no-mDNS enrollment+Read **1/1 PASS**、workspace **135/0/3**、Aqua Host/tray >15s + second-launch wake PASS。下一块 V1.5d multiple-helper failover/resume。
 
 - **2026-09-02** — V1.5a discovery/opaque-transport spike DONE：确认 iroh 1.1 的 mDNS 已拆到 `iroh-mdns-address-lookup 0.5.0`；落地 same-Site bounded candidate tag、direct-IP-only mDNS、Controller-signed 10-min ConnectorLease、16 KiB outer preface 与 `clew/connector/1` opaque pump。real mDNS wrong-Site filter + EndpointAddr connect PASS，real Target→Helper→Controller Noise/Read plaintext-negative tap PASS；workspace 121/0/2。Controller Connector runtime 继续 fail closed，下一块 V1.5b sealed bootstrap/runtime integration。
 - **2026-09-02** — V1.25 DONE：exact `073acc0` source 在 `macos-3dv0:scratchpad` 完成 native fmt/check/workspace **115/0/1**，Aqua Controller Studio + imported app/tray/logo/key-visual Host 真运行、second-launch wake、Read、asset hash、删除整个 Site Kit 后同 DeviceId branded restart/再 Read 全 PASS。Windows + macOS desktop gate 至此闭合，下一块进入 V1.5 discovery spike。
