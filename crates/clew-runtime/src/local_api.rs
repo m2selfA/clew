@@ -14,7 +14,7 @@ use clew_core::{
 };
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
-use clew_transport::{IrohOuter, ReadErrorCode, ReadReply, ReadRequest};
+use clew_transport::{IrohOuter, ReadErrorCode, ReadReply, ReadRequest, noise_static_public};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -700,7 +700,7 @@ async fn issue_invite_response(
             site_id,
             invite_id,
             site_name: request.site_name.clone(),
-            grant: PermissionGrant::EXECUTE_READ,
+            grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
             not_before_unix_ms: now,
             expires_unix_ms,
             deployment_window_ms: request.deployment_window_ms,
@@ -738,13 +738,24 @@ async fn issue_invite_response(
         Ok(profile) => profile,
         Err(error) => return LocalResponse::Error(error),
     };
-    let site_file = match SignedSiteClew::issue_networked_outfit(
+    let controller_bootstrap_noise_public_key =
+        match noise_static_public(state.controller_identity.bootstrap_noise_static_secret()) {
+            Ok(key) => key,
+            Err(error) => {
+                return local_error(
+                    LocalApiErrorCode::Internal,
+                    format!("Controller bootstrap key derivation failed: {error}"),
+                );
+            }
+        };
+    let site_file = match SignedSiteClew::issue_networked_outfit_sealed(
         state.controller_identity.identity(),
         outfit_profile,
         pass.clone(),
         HostRoleHint::ExecutePreferred,
         controller_endpoint,
         read_policy.clone(),
+        controller_bootstrap_noise_public_key,
     ) {
         Ok(site_file) => site_file,
         Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),

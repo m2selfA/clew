@@ -530,14 +530,14 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport spike DONE；V1.5b sealed bootstrap + runtime integration next）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c active no-public InnerSession/Read + order-independent retry next）**
 
-V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`，通过现有 Endpoint 的 runtime `AddressLookupServices` 动态挂载。Clew 不按旧版 iroh discovery 示例编码。
+V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
 V1.5a 已落地：
 
 - 新增 `clew/connector/1` 独立 ALPN；现有 Controller runtime 在 V1.5b 接线前对该 ALPN **显式 fail closed**，不会把 Connector 误当普通 member 或开放半成品入口；
-- LAN discovery 使用 `iroh-mdns-address-lookup 0.5.0`、自定义 service `clewv1` 和 `AddrFilter::ip_only()`，只广播 direct IP candidates；`UserData` 仅携带 bounded/versioned `clew1;c;<site-tag>`，严格低于 iroh 245-byte hard bound；
+- LAN discovery 使用 `iroh-mdns-address-lookup 0.5.0`、自定义 service `clewv1` 和 `AddrFilter::ip_only()`，独立 publish 当前 iroh Endpoint 的 direct IP candidates；mDNS TXT `UserData` 仅携带 bounded/versioned `clew1;c;<site-tag>`，严格低于 iroh 245-byte hard bound，且不会进入 N0 DNS/Pkarr AddressLookup publisher；
 - `SiteDiscoveryTag` 是 domain-separated SHA-256(`ControllerId`,`SiteId`) 的 16-byte/32-lowercase-hex 非秘密 equality tag；它**只用于候选过滤，不是授权证明**。missing/malformed/wrong-Site/self/未来未知 mDNS event 都忽略；`Expired` 只对先前 same-Site matched EndpointId 生效；
 - 新增 Controller-signed `SignedConnectorLease`，独立签名 domain `clew/connector-lease/v1`，绑定 ControllerId / SiteId / helper DeviceId / helper iroh EndpointId / Connector role / issued+expires；最长 10 分钟、encoded ≤8 KiB；wrong Controller/Site/endpoint、tamper、过期/未生效/过长 lifetime 全 fail closed；
 - Target→Helper 先交换 bounded outer control preface（version/site-tag/purpose，max 16 KiB）；Helper 返回 signed lease，Target 验证 Controller pin + Site + **实际发现的 helper EndpointId** + validity 后才允许开始 InnerSession；oversized control frame 在 payload allocation 前拒绝；
@@ -551,11 +551,34 @@ V1.5a acceptance evidence：
 - [x] bounds/security：noncanonical Site tag、wrong control version、>16 KiB preface、wrong/tampered/expired lease 均 fail closed；mDNS 只发布 direct IP candidate；
 - [x] transport focused：**21 passed / 0 failed / 1 ignored**（public n0 relay）；workspace `cargo check --workspace --all-targets` PASS，0 warnings；workspace tests **121 passed / 0 failed / 2 ignored**（interactive Windows Host GUI / public n0 relay）。
 
-V1.5a known/deferred：
+### V1.5b — Sealed enrollment + authenticated Helper runtime
 
-- Controller 还没有从 active `CONNECTOR` member/control store 签发并投递 lease；当前 runtime Connector ALPN 因此保持 `ConnectorNotEnabled` fail-closed；
-- V1.4 `BootstrapRequest` 仍是 direct outer plaintext；**不得**直接经 helper 转发，否则 bearer/device identity/hostname 会被 helper 看见。V1.5b 必须先实现 Controller-authenticated sealed bootstrap，再允许首次 enrollment 走 Connector；
-- mDNS fallback、multiple-helper health/failover、resume re-advertise、Host helper supervisor 仍属于后续 V1.5 子块。
+**Status：DONE（2026-09-02）**
+
+实际落地：
+
+- 首次 enrollment 新增独立 `Noise_NK_25519_ChaChaPoly_BLAKE2s` sealed bootstrap；prologue 绑定 wire major / ControllerId / SiteId，bootstrap bearer、fresh DevicePublicKey、hostname 与后续 Persisted/Activated 全程只在 Controller-pinned ciphertext 内。Controller bootstrap static key 从 transport seed 以独立 HKDF info 派生，与 V1.3 InnerSession Noise key、iroh Endpoint key 三者互相 key-separated；签名 `site.clew` 携带对应 public pin，active membership 也持久化该非秘密 pin，sidecar 丢失后的 pending activation recovery 仍可经 Connector 完成；
+- Controller `clew/connector/1` runtime 已启用：只解析 bounded outer `ConnectorOpen`，按 SiteDiscoveryTag 找到唯一未 revoke Site；`Bootstrap` 进入 sealed channel，`InnerSession` 仍交给原 V1.3 mutual-auth handler，不存在 helper 终止业务会话的兼容分支；
+- `CONNECTOR` member 先用自己的 DeviceKey 完成普通 InnerSession。Controller 仅在 catalog/registry 实时确认 Site/device 未 revoke、DeviceId/Site 匹配且 `connector=true` 后，签发 5 分钟 `SignedConnectorLease`；lease 的 helper EndpointId 直接取该**已认证 QUIC connection 的 `remote_id()`**，不是信任 mDNS 声明；
+- Host 只有收到并验证 Controller-signed lease（Controller/Site/自己的 DeviceId/自己的当前 iroh EndpointId/expiry）后才开始 mDNS advertise。lease 到期前 30 秒撤广播、结束 tunnel 并重连 Controller 换新 lease；单 helper 同时 tunnel hard cap 为 64；每条 tunnel 只读 outer preface/lease，之后纯 opaque `copy_bidirectional`，正常 `NotConnected/BrokenPipe/ConnectionReset/ConnectionAborted/UnexpectedEof` 只结束该 tunnel，不误杀 Helper runtime；
+- 同一 Site Kit 的 signed pass 默认可授予 `EXECUTE + READ + CONNECTOR`，支持普通 Target 自动兼任 Connector；`BootstrapMemberMode` 只是**继续收窄**的 per-claim ceiling。`ConnectorOnly` 必然与 signed pass + Controller ceiling 再做 intersection，最终 `EXECUTE=false/read=false/write=false/shell=false/connector=true`，客户端不能靠 role hint 升权；
+- Target 首次 activation 使用同一个 iroh endpoint 并行竞速 signed Controller endpoint 与 same-Site mDNS candidate。假/错误 helper 在 lease 验证前拿不到任何 bootstrap plaintext，candidate 失败不会消费 credential，也不会终止仍在进行的 direct attempt；verified helper 收到 `ConnectorReady` 后，Target 才启动 sealed Noise NK；
+- `ActivatedAck` 的 sealed path 增加 `ActivationConfirmed`：Target 只有真正收到 Controller 确认后才清本机 pending-controller-activation。Target 随后发送无授权语义的 drain ACK，Controller 最多保活 2 秒 best-effort drain，避免 QUIC application-close 抢在确认帧交付前；direct V1.4 wire 行为不要求该终态，保持滚动兼容；
+- mDNS privacy hardening：Clew Site tag 现在由 standalone `MdnsAddressLookup` 直接发布/订阅，不再调用 endpoint-global `set_user_data_for_address_lookup`，从实现上保证 Site equality hint 只进入 LAN mDNS TXT，而不是 N0 DNS/Pkarr。
+
+V1.5b acceptance / validation evidence：
+
+- [x] **forced Connector first enrollment**：真实三角色 iroh integration 中，signed `site.clew` 的 Controller EndpointId 被故意替换成不可达值；同 Site Helper 通过真实 mDNS 被发现，Target 经 production `serve_one_connector_tunnel` 完成 sealed `Claim → Claimed → Persisted → Activated → ActivatedAck/ActivationConfirmed`，最终 Active DeviceId 与 Controller record 一致；该 test **1/1 PASS**；
+- [x] helper-only narrowing focused test **1/1 PASS**；同一 signed pass 在 `CONNECTOR_ONLY` ceiling 下不能获得 EXECUTE/Read/Write/Shell；
+- [x] `clew-transport --all-targets`：**25 passed / 0 failed / 1 ignored**（public n0 relay）；其中 sealed wire tap 对 bearer/hostname/Site marker 全阴性、wrong pin/context/oversize fail closed、real mDNS 与 real opaque InnerSession tunnel 均 PASS；
+- [x] `clew-host --all-targets`：**28 passed / 0 failed**；`clew-runtime --all-targets`：**28 passed / 0 failed**；
+- [x] unified DoD：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **128 passed / 0 failed / 2 ignored**（interactive Windows Host GUI / public n0 relay）。
+
+V1.5b known / next：
+
+- 已 enrollment 的**无公网 Target**当前 active business session 仍需补 direct+Connector path selection；`serve_networked_membership_until` 还会先等待自身 outer relay-online，并直接拨 signed Controller endpoint。V1.5c 必须让 existing DeviceKey 的 InnerSession/Read 也通过 verified Connector，同时保持 helper 无业务 key；
+- desktop 首次 activation 目前仍发生在 GUI 展示前，单次 direct/helper discovery window 为 20 秒。`Target 先开、Helper 晚开` 的真正顺序无关体验不能靠无限阻塞 GUI；V1.5c 要把 AwaitingEnrollment 重试搬到 GUI/runtime 存续期间的 background state machine；
+- multiple-helper health/failover、mDNS 失败时 `附近连接.clew` fallback、suspend/resume re-advertise 仍未闭合；helper-only protocol/role ceiling 已有，但最终分发包里的 friend-facing helper-only role hint 入口仍需后续 UX 接线。
 
 计划：
 

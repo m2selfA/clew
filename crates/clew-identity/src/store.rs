@@ -19,6 +19,7 @@ use crate::{
 };
 
 const CONTROLLER_NOISE_STATIC_INFO: &[u8] = b"clew/controller-noise-static/v1";
+const CONTROLLER_BOOTSTRAP_NOISE_STATIC_INFO: &[u8] = b"clew/controller-bootstrap-noise-static/v1";
 const CONTROLLER_IROH_ENDPOINT_INFO: &[u8] = b"clew/controller-iroh-endpoint/v1";
 
 #[derive(Clone)]
@@ -54,6 +55,14 @@ impl StoredControllerIdentity {
         derive_transport_key(
             &self.transport_identity_secret,
             CONTROLLER_NOISE_STATIC_INFO,
+        )
+    }
+
+    #[must_use]
+    pub fn bootstrap_noise_static_secret(&self) -> [u8; 32] {
+        derive_transport_key(
+            &self.transport_identity_secret,
+            CONTROLLER_BOOTSTRAP_NOISE_STATIC_INFO,
         )
     }
 
@@ -674,18 +683,34 @@ mod tests {
     use crate::{EnrollmentRegistry, PermissionGrant, SiteBootstrapSpec};
 
     #[test]
-    fn controller_transport_seed_derives_stable_separated_noise_and_iroh_keys() {
+    fn controller_transport_seed_derives_stable_separated_transport_keys() {
         let temp = tempdir().unwrap();
         let store = ControllerIdentityStore::new(StateLayout::new(temp.path()));
         let first = store.load_or_create().unwrap();
         let reopened = store.load().unwrap().unwrap();
         assert_eq!(first.noise_static_secret(), reopened.noise_static_secret());
         assert_eq!(
+            first.bootstrap_noise_static_secret(),
+            reopened.bootstrap_noise_static_secret()
+        );
+        assert_eq!(
             first.iroh_endpoint_secret(),
             reopened.iroh_endpoint_secret()
         );
+        assert_ne!(
+            first.noise_static_secret(),
+            first.bootstrap_noise_static_secret()
+        );
         assert_ne!(first.noise_static_secret(), first.iroh_endpoint_secret());
+        assert_ne!(
+            first.bootstrap_noise_static_secret(),
+            first.iroh_endpoint_secret()
+        );
         assert_ne!(first.noise_static_secret(), first.transport_identity_seed());
+        assert_ne!(
+            first.bootstrap_noise_static_secret(),
+            first.transport_identity_seed()
+        );
         assert_ne!(
             first.iroh_endpoint_secret(),
             first.transport_identity_seed()

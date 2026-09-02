@@ -36,6 +36,8 @@ pub struct HostMembershipMarker {
     pub controller_endpoint: Option<EndpointAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_policy: Option<ReadPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_bootstrap_noise_public_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +76,7 @@ impl HostMembershipStore {
             hostname,
             None,
             None,
+            None,
         )
     }
 
@@ -87,6 +90,7 @@ impl HostMembershipStore {
         hostname: &str,
         controller_endpoint: EndpointAddr,
         read_policy: ReadPolicy,
+        controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     ) -> Result<HostMembership, HostMembershipError> {
         read_policy.validate()?;
         validate_flavor_profile(&client_flavor, outfit_profile.as_ref())?;
@@ -101,6 +105,7 @@ impl HostMembershipStore {
             hostname,
             Some(controller_endpoint),
             Some(read_policy),
+            controller_bootstrap_noise_public_key,
         )
     }
 
@@ -115,6 +120,7 @@ impl HostMembershipStore {
         hostname: &str,
         controller_endpoint: Option<EndpointAddr>,
         read_policy: Option<ReadPolicy>,
+        controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     ) -> Result<HostMembership, HostMembershipError> {
         if receipt.controller_id != pending.controller().controller_id
             || receipt.site_id != pending.site_id()
@@ -163,6 +169,7 @@ impl HostMembershipStore {
             invite_id: receipt.invite_id,
             controller_endpoint,
             read_policy,
+            controller_bootstrap_noise_public_key,
         };
         write_or_verify_state(
             &self
@@ -225,6 +232,7 @@ impl HostMembershipStore {
         site_name: &str,
         controller_endpoint: Option<EndpointAddr>,
         read_policy: Option<ReadPolicy>,
+        controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     ) -> Result<Option<HostMembership>, HostMembershipError> {
         controller.validate()?;
         validate_flavor_profile(&client_flavor, outfit_profile.as_ref())?;
@@ -258,6 +266,7 @@ impl HostMembershipStore {
             invite_id: identity.invite_id(),
             controller_endpoint,
             read_policy,
+            controller_bootstrap_noise_public_key,
         };
         write_or_verify_state(
             &self
@@ -629,6 +638,7 @@ mod tests {
                 &pending,
                 &receipt,
                 "GPU-02",
+                None,
                 None,
                 None,
             )

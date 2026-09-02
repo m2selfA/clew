@@ -17,6 +17,14 @@ pub const MAX_BOOTSTRAP_FRAME_BYTES: usize = 64 * 1024;
 const BOOTSTRAP_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REMOTE_ERROR_MESSAGE_BYTES: usize = 512;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapMemberMode {
+    #[default]
+    ExecutePreferred,
+    ConnectorOnly,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum BootstrapRequest {
@@ -24,6 +32,8 @@ pub enum BootstrapRequest {
         bootstrap: SignedSiteBootstrapPass,
         device_identity: DevicePublicIdentity,
         hostname: String,
+        #[serde(default)]
+        mode: BootstrapMemberMode,
     },
     Persisted {
         invite_id: InviteId,
@@ -35,6 +45,10 @@ pub enum BootstrapRequest {
         invite_id: InviteId,
         device_id: DeviceId,
     },
+    ActivationConfirmedAck {
+        invite_id: InviteId,
+        device_id: DeviceId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,6 +56,10 @@ pub enum BootstrapRequest {
 pub enum BootstrapResponse {
     Claimed(EnrollmentReceipt),
     Activated(DeviceRecord),
+    ActivationConfirmed {
+        invite_id: InviteId,
+        device_id: DeviceId,
+    },
     Error(BootstrapErrorBody),
 }
 

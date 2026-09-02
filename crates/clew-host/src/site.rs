@@ -133,6 +133,8 @@ pub struct SiteClewPayload {
     pub controller_endpoint: Option<EndpointAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_policy: Option<ReadPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_bootstrap_noise_public_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,6 +168,7 @@ impl SignedSiteClew {
             role_hint,
             None,
             None,
+            None,
         )
     }
 
@@ -186,6 +189,7 @@ impl SignedSiteClew {
             role_hint,
             Some(controller_endpoint),
             Some(read_policy),
+            None,
         )
     }
 
@@ -208,6 +212,31 @@ impl SignedSiteClew {
             role_hint,
             Some(controller_endpoint),
             Some(read_policy),
+            None,
+        )
+    }
+
+    pub fn issue_networked_outfit_sealed(
+        controller: &ControllerIdentity,
+        outfit_profile: OutfitProfile,
+        bootstrap: SignedSiteBootstrapPass,
+        role_hint: HostRoleHint,
+        controller_endpoint: EndpointAddr,
+        read_policy: ReadPolicy,
+        controller_bootstrap_noise_public_key: [u8; 32],
+    ) -> Result<Self, SiteClewError> {
+        outfit_profile.validate()?;
+        read_policy.validate()?;
+        let client_flavor = ClientFlavor::from_outfit_current(&outfit_profile)?;
+        Self::issue_with_network(
+            controller,
+            client_flavor,
+            Some(outfit_profile),
+            bootstrap,
+            role_hint,
+            Some(controller_endpoint),
+            Some(read_policy),
+            Some(controller_bootstrap_noise_public_key),
         )
     }
 
@@ -219,6 +248,7 @@ impl SignedSiteClew {
         role_hint: HostRoleHint,
         controller_endpoint: Option<EndpointAddr>,
         read_policy: Option<ReadPolicy>,
+        controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     ) -> Result<Self, SiteClewError> {
         let bootstrap_controller = bootstrap.verify()?;
         if bootstrap_controller != controller.public_identity() {
@@ -227,6 +257,7 @@ impl SignedSiteClew {
         if let Some(policy) = &read_policy {
             policy.validate()?;
         }
+        validate_controller_bootstrap_noise_public_key(controller_bootstrap_noise_public_key)?;
         if let Some(profile) = &outfit_profile {
             profile.validate()?;
             if profile.outfit_id != client_flavor.outfit_id
@@ -245,6 +276,7 @@ impl SignedSiteClew {
             role_hint,
             controller_endpoint,
             read_policy,
+            controller_bootstrap_noise_public_key,
         };
         let signature = controller.sign_site_config(&payload)?;
         Ok(Self { payload, signature })
@@ -268,6 +300,9 @@ impl SignedSiteClew {
         if let Some(policy) = &self.payload.read_policy {
             policy.validate()?;
         }
+        validate_controller_bootstrap_noise_public_key(
+            self.payload.controller_bootstrap_noise_public_key,
+        )?;
         if self.payload.controller_endpoint.is_some() != self.payload.read_policy.is_some() {
             return Err(SiteClewError::IncompleteNetworkConfig);
         }
@@ -382,6 +417,15 @@ impl SiteKitContract {
     }
 }
 
+fn validate_controller_bootstrap_noise_public_key(
+    key: Option<[u8; 32]>,
+) -> Result<(), SiteClewError> {
+    if key.is_some_and(|value| value == [0_u8; 32]) {
+        return Err(SiteClewError::InvalidControllerBootstrapNoisePublicKey);
+    }
+    Ok(())
+}
+
 fn check_size(actual: usize) -> Result<(), SiteClewError> {
     if actual > MAX_SITE_CLEW_BYTES {
         return Err(SiteClewError::TooLarge {
@@ -420,6 +464,8 @@ pub enum SiteClewError {
     Policy(#[from] clew_core::ControlModelError),
     #[error("site.clew network config must contain both endpoint and read policy")]
     IncompleteNetworkConfig,
+    #[error("site.clew Controller sealed-bootstrap Noise public key is invalid")]
+    InvalidControllerBootstrapNoisePublicKey,
     #[error("site.clew belongs to a different Controller")]
     ControllerMismatch,
     #[error("site.clew ClientFlavor fingerprint does not match its descriptor")]
@@ -516,6 +562,7 @@ mod tests {
             HostRoleHint::ExecutePreferred,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -588,6 +635,63 @@ mod tests {
         assert!(matches!(
             tampered.verify(),
             Err(SiteClewError::Identity(IdentityError::InvalidSignature))
+        ));
+    }
+
+    #[test]
+    fn sealed_networked_site_file_signs_controller_bootstrap_noise_public_key() {
+        let controller = ControllerIdentity::from_secret([81_u8; 32]);
+        let mut registry =
+            EnrollmentRegistry::new(controller.controller_id(), PermissionGrant::EXECUTE_READ);
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id: SiteId::new(),
+                    invite_id: InviteId::new(),
+                    site_name: "Sealed Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ,
+                    not_before_unix_ms: 1,
+                    expires_unix_ms: 10_000,
+                    deployment_window_ms: 1_000,
+                    max_claims: 2,
+                },
+            )
+            .unwrap();
+        let endpoint = EndpointAddr {
+            id: iroh::SecretKey::from_bytes(&[82_u8; 32]).public(),
+            addrs: Default::default(),
+        };
+        let profile = OutfitProfile::preset(OutfitPreset::ClewOriginal);
+        let policy = ReadPolicy::new(vec!["D:/sealed".into()], 4096, 2_000).unwrap();
+        let key = [83_u8; 32];
+        let file = SignedSiteClew::issue_networked_outfit_sealed(
+            &controller,
+            profile,
+            bootstrap,
+            HostRoleHint::ExecutePreferred,
+            endpoint,
+            policy,
+            key,
+        )
+        .unwrap();
+        assert_eq!(
+            file.payload.controller_bootstrap_noise_public_key,
+            Some(key)
+        );
+        assert_eq!(
+            SignedSiteClew::from_bytes(&file.to_bytes().unwrap()).unwrap(),
+            file
+        );
+
+        let mut tampered = file.clone();
+        tampered.payload.controller_bootstrap_noise_public_key = Some([84_u8; 32]);
+        assert!(tampered.verify().is_err());
+        let mut invalid = file;
+        invalid.payload.controller_bootstrap_noise_public_key = Some([0_u8; 32]);
+        assert!(matches!(
+            invalid.verify(),
+            Err(SiteClewError::InvalidControllerBootstrapNoisePublicKey)
         ));
     }
 

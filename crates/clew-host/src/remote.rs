@@ -1,14 +1,26 @@
 use std::{future::Future, time::Duration};
 
-use clew_core::{DeviceRecord, StateLayout};
-use clew_identity::DeviceIdentityStore;
+use clew_core::{DeviceId, DeviceRecord, SiteId, StateLayout};
+use clew_identity::{ControllerPublicIdentity, DeviceIdentityStore};
 use clew_transport::{
-    BootstrapErrorCode, BootstrapRequest, BootstrapResponse, DeviceSessionIdentity, InnerSession,
-    IrohOuter, ReadErrorCode, ReadReply, ReadRequest, read_bootstrap, write_bootstrap,
+    BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
+    ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
+    ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
+    InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery, ReadErrorCode, ReadReply,
+    ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
+    SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional, read_bootstrap,
+    read_connector_open, read_connector_ready, write_bootstrap, write_connector_open,
+    write_connector_ready,
 };
+use iroh::EndpointAddr;
 use thiserror::Error;
+use tokio::{task::JoinSet, time::Instant};
 
 use crate::{HostLaunchState, HostMembership, HostMembershipStore, HostReadService};
+
+const MAX_CONNECTOR_TUNNELS: usize = 64;
+const CONNECTOR_LEASE_RENEW_MARGIN: Duration = Duration::from_secs(30);
+const INITIAL_BOOTSTRAP_PATH_WINDOW: Duration = Duration::from_secs(20);
 
 pub async fn complete_networked_activation(
     layout: &StateLayout,
@@ -35,18 +47,31 @@ pub async fn complete_networked_activation(
                 }
                 _ => return Err(HostRemoteError::MissingNetworkConfig),
             };
-            let outer = bind_online_outer().await?;
-            let mut stream = outer.connect_bootstrap(endpoint.clone()).await?;
-            write_bootstrap(
-                &mut stream,
-                &BootstrapRequest::Claim {
+            let outer = IrohOuter::bind().await?;
+            let controller = site_file.payload.bootstrap.payload.controller;
+            let site_id = site_file.payload.bootstrap.payload.site_id;
+            let mut channel = connect_bootstrap_channel(
+                &outer,
+                endpoint.clone(),
+                controller,
+                site_id,
+                site_file.payload.controller_bootstrap_noise_public_key,
+            )
+            .await?;
+            channel
+                .send(&BootstrapRequest::Claim {
                     bootstrap: site_file.payload.bootstrap.clone(),
                     device_identity: pending.public_identity(),
                     hostname: hostname.clone(),
-                },
-            )
-            .await?;
-            let receipt = match read_bootstrap::<BootstrapResponse, _>(&mut stream).await? {
+                    mode: match site_file.payload.role_hint {
+                        crate::HostRoleHint::ExecutePreferred => {
+                            BootstrapMemberMode::ExecutePreferred
+                        }
+                        crate::HostRoleHint::ConnectorOnly => BootstrapMemberMode::ConnectorOnly,
+                    },
+                })
+                .await?;
+            let receipt = match channel.recv::<BootstrapResponse>().await? {
                 BootstrapResponse::Claimed(receipt) => receipt,
                 BootstrapResponse::Error(error) => {
                     return Err(HostRemoteError::BootstrapRejected {
@@ -54,7 +79,7 @@ pub async fn complete_networked_activation(
                         message: error.message,
                     });
                 }
-                BootstrapResponse::Activated(_) => {
+                BootstrapResponse::Activated(_) | BootstrapResponse::ActivationConfirmed { .. } => {
                     return Err(HostRemoteError::UnexpectedBootstrapResponse);
                 }
             };
@@ -67,27 +92,25 @@ pub async fn complete_networked_activation(
                 &hostname,
                 endpoint,
                 read_policy,
+                site_file.payload.controller_bootstrap_noise_public_key,
             )?;
-            write_bootstrap(
-                &mut stream,
-                &BootstrapRequest::Persisted {
+            channel
+                .send(&BootstrapRequest::Persisted {
                     invite_id: receipt.invite_id,
                     device_id: receipt.device_id,
                     persist_ack_token: *receipt.persist_ack_token(),
                     hostname: hostname.clone(),
-                },
-            )
-            .await?;
-            let activated = expect_activated(read_bootstrap(&mut stream).await?)?;
+                })
+                .await?;
+            let activated = expect_activated(channel.recv().await?)?;
             verify_activated(&membership, &activated)?;
-            write_bootstrap(
-                &mut stream,
-                &BootstrapRequest::ActivatedAck {
+            channel
+                .send(&BootstrapRequest::ActivatedAck {
                     invite_id: receipt.invite_id,
                     device_id: receipt.device_id,
-                },
-            )
-            .await?;
+                })
+                .await?;
+            confirm_sealed_activation(&mut channel, receipt.invite_id, receipt.device_id).await?;
             DeviceIdentityStore::new(layout.clone()).confirm_controller_activation(
                 membership.marker.controller.controller_id,
                 membership.marker.site_id,
@@ -125,28 +148,32 @@ async fn resume_pending_controller_activation(
         .controller_endpoint
         .clone()
         .ok_or(HostRemoteError::MissingNetworkConfig)?;
-    let outer = bind_online_outer().await?;
-    let mut stream = outer.connect_bootstrap(endpoint).await?;
-    write_bootstrap(
-        &mut stream,
-        &BootstrapRequest::Persisted {
+    let outer = IrohOuter::bind().await?;
+    let mut channel = connect_bootstrap_channel(
+        &outer,
+        endpoint,
+        membership.marker.controller,
+        membership.marker.site_id,
+        membership.marker.controller_bootstrap_noise_public_key,
+    )
+    .await?;
+    channel
+        .send(&BootstrapRequest::Persisted {
             invite_id: activation.invite_id(),
             device_id: activation.device_id(),
             persist_ack_token: *activation.persist_ack_token(),
             hostname: membership.device.hostname_observed.clone(),
-        },
-    )
-    .await?;
-    let activated = expect_activated(read_bootstrap(&mut stream).await?)?;
+        })
+        .await?;
+    let activated = expect_activated(channel.recv().await?)?;
     verify_activated(membership, &activated)?;
-    write_bootstrap(
-        &mut stream,
-        &BootstrapRequest::ActivatedAck {
+    channel
+        .send(&BootstrapRequest::ActivatedAck {
             invite_id: activation.invite_id(),
             device_id: activation.device_id(),
-        },
-    )
-    .await?;
+        })
+        .await?;
+    confirm_sealed_activation(&mut channel, activation.invite_id(), activation.device_id()).await?;
     identity_store.confirm_controller_activation(
         membership.marker.controller.controller_id,
         membership.marker.site_id,
@@ -215,8 +242,8 @@ pub async fn serve_networked_membership_once(
 
 fn member_remote_config(
     membership: &HostMembership,
-) -> Result<(iroh::EndpointAddr, HostReadService), HostRemoteError> {
-    if !membership.device.capabilities.execute {
+) -> Result<(EndpointAddr, Option<HostReadService>), HostRemoteError> {
+    if !membership.device.capabilities.execute && !membership.device.capabilities.connector {
         return Err(HostRemoteError::ExecutionDisabled);
     }
     let endpoint = membership
@@ -224,12 +251,158 @@ fn member_remote_config(
         .controller_endpoint
         .clone()
         .ok_or(HostRemoteError::MissingNetworkConfig)?;
-    let policy = membership
-        .marker
-        .read_policy
-        .clone()
-        .ok_or(HostRemoteError::MissingNetworkConfig)?;
-    Ok((endpoint, HostReadService::new(policy)?))
+    let service = if membership.device.capabilities.execute {
+        let policy = membership
+            .marker
+            .read_policy
+            .clone()
+            .ok_or(HostRemoteError::MissingNetworkConfig)?;
+        Some(HostReadService::new(policy)?)
+    } else {
+        None
+    };
+    Ok((endpoint, service))
+}
+
+enum HostBootstrapChannel {
+    Direct(clew_transport::IrohStream),
+    Sealed {
+        stream: clew_transport::IrohStream,
+        session: SealedBootstrapSession,
+    },
+}
+
+impl HostBootstrapChannel {
+    async fn send<T: serde::Serialize>(&mut self, value: &T) -> Result<(), HostRemoteError> {
+        match self {
+            Self::Direct(stream) => write_bootstrap(stream, value).await?,
+            Self::Sealed { stream, session } => session.send(stream, value).await?,
+        }
+        Ok(())
+    }
+
+    async fn recv<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, HostRemoteError> {
+        Ok(match self {
+            Self::Direct(stream) => read_bootstrap(stream).await?,
+            Self::Sealed { stream, session } => session.recv(stream).await?,
+        })
+    }
+    fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed { .. })
+    }
+}
+
+async fn confirm_sealed_activation(
+    channel: &mut HostBootstrapChannel,
+    invite_id: clew_core::InviteId,
+    device_id: DeviceId,
+) -> Result<(), HostRemoteError> {
+    if !channel.is_sealed() {
+        return Ok(());
+    }
+    match channel.recv::<BootstrapResponse>().await? {
+        BootstrapResponse::ActivationConfirmed {
+            invite_id: actual_invite,
+            device_id: actual_device,
+        } if actual_invite == invite_id && actual_device == device_id => {
+            channel
+                .send(&BootstrapRequest::ActivationConfirmedAck {
+                    invite_id,
+                    device_id,
+                })
+                .await?;
+            Ok(())
+        }
+        BootstrapResponse::Error(error) => Err(HostRemoteError::BootstrapRejected {
+            code: error.code,
+            message: error.message,
+        }),
+        _ => Err(HostRemoteError::UnexpectedBootstrapResponse),
+    }
+}
+
+async fn connect_bootstrap_channel(
+    outer: &IrohOuter,
+    controller_endpoint: EndpointAddr,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+    controller_bootstrap_noise_public_key: Option<[u8; 32]>,
+) -> Result<HostBootstrapChannel, HostRemoteError> {
+    let direct = outer.connect_bootstrap(controller_endpoint);
+    tokio::pin!(direct);
+
+    let Some(bootstrap_key) = controller_bootstrap_noise_public_key else {
+        return tokio::time::timeout(INITIAL_BOOTSTRAP_PATH_WINDOW, &mut direct)
+            .await
+            .map_err(|_| HostRemoteError::BootstrapPathUnavailable)?
+            .map(HostBootstrapChannel::Direct)
+            .map_err(HostRemoteError::from);
+    };
+
+    let discovery =
+        MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
+    let mut events = discovery.subscribe().await;
+    let deadline = tokio::time::sleep(INITIAL_BOOTSTRAP_PATH_WINDOW);
+    tokio::pin!(deadline);
+    let mut direct_done = false;
+
+    loop {
+        tokio::select! {
+            result = &mut direct, if !direct_done => {
+                match result {
+                    Ok(stream) => return Ok(HostBootstrapChannel::Direct(stream)),
+                    Err(_) => direct_done = true,
+                }
+            }
+            event = events.next() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                let ConnectorDiscoveryEvent::Candidate(candidate) = event else {
+                    continue;
+                };
+                if let Ok(channel) = connect_bootstrap_via_candidate(
+                    outer,
+                    candidate.addr,
+                    controller,
+                    site_id,
+                    bootstrap_key,
+                ).await {
+                    return Ok(channel);
+                }
+            }
+            _ = &mut deadline => return Err(HostRemoteError::BootstrapPathUnavailable),
+        }
+    }
+}
+
+async fn connect_bootstrap_via_candidate(
+    outer: &IrohOuter,
+    candidate: EndpointAddr,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+    controller_bootstrap_noise_public_key: [u8; 32],
+) -> Result<HostBootstrapChannel, HostRemoteError> {
+    let mut stream = outer.connect_connector(candidate.clone()).await?;
+    let open = ConnectorOpenRequest::new(
+        SiteDiscoveryTag::derive(controller.controller_id, site_id),
+        ConnectorTunnelPurpose::Bootstrap,
+    );
+    write_connector_open(&mut stream, &open).await?;
+    let ready = read_connector_ready(&mut stream).await?;
+    ready
+        .lease
+        .verify_for_candidate(&controller, site_id, candidate.id, unix_ms()?)?;
+    let session = SealedBootstrapSession::connect(
+        &mut stream,
+        SealedBootstrapContext {
+            controller_id: controller.controller_id,
+            site_id,
+        },
+        controller_bootstrap_noise_public_key,
+    )
+    .await?;
+    Ok(HostBootstrapChannel::Sealed { stream, session })
 }
 
 async fn bind_online_outer() -> Result<IrohOuter, HostRemoteError> {
@@ -241,26 +414,156 @@ async fn bind_online_outer() -> Result<IrohOuter, HostRemoteError> {
 async fn serve_networked_membership_with_outer(
     membership: &HostMembership,
     outer: &IrohOuter,
-    endpoint: iroh::EndpointAddr,
-    service: &HostReadService,
+    endpoint: EndpointAddr,
+    service: &Option<HostReadService>,
 ) -> Result<(), HostRemoteError> {
-    let mut stream = outer.connect(endpoint).await?;
+    let mut stream = outer.connect(endpoint.clone()).await?;
     let mut inner = InnerSession::connect(
         &mut stream,
         DeviceSessionIdentity::from_active(&membership.identity),
     )
     .await?;
-    loop {
+
+    let connector = membership.device.capabilities.connector;
+    let mut connector_discovery = None;
+    let mut connector_lease = None;
+    let renew_at = if connector {
         let message = inner.recv(&mut stream).await?;
-        let reply = match ReadRequest::from_message(&message) {
-            Ok(request) => service.execute(request).await,
-            Err(_) => ReadReply::error(
-                ReadErrorCode::InvalidRequest,
-                "unsupported or malformed v1 host request",
-            ),
-        };
-        inner.send(&mut stream, &reply.into_message()?).await?;
+        let lease = SignedConnectorLease::from_message(&message)?;
+        let now = unix_ms()?;
+        let lease_device = lease.verify_for_candidate(
+            &membership.marker.controller,
+            membership.marker.site_id,
+            outer.addr().id,
+            now,
+        )?;
+        if lease_device != membership.marker.device_id {
+            return Err(HostRemoteError::ConnectorLeaseDeviceMismatch);
+        }
+        let remaining_ms = lease.payload.expires_unix_ms.saturating_sub(now);
+        let renew_margin_ms = CONNECTOR_LEASE_RENEW_MARGIN.as_millis() as u64;
+        let renew_in_ms = remaining_ms.saturating_sub(renew_margin_ms).max(1_000);
+        connector_discovery = Some(MdnsConnectorDiscovery::attach(
+            outer,
+            membership.marker.controller.controller_id,
+            membership.marker.site_id,
+            true,
+        )?);
+        connector_lease = Some(lease);
+        Instant::now() + Duration::from_millis(renew_in_ms)
+    } else {
+        Instant::now() + Duration::from_secs(24 * 60 * 60)
+    };
+
+    let mut tunnels = JoinSet::new();
+    loop {
+        tokio::select! {
+            message = inner.recv(&mut stream) => {
+                let message = message?;
+                let reply = match (service.as_ref(), ReadRequest::from_message(&message)) {
+                    (Some(service), Ok(request)) => service.execute(request).await,
+                    (None, Ok(_)) => ReadReply::error(
+                        ReadErrorCode::Denied,
+                        "read is not permitted on this Connector-only device",
+                    ),
+                    (_, Err(_)) => ReadReply::error(
+                        ReadErrorCode::InvalidRequest,
+                        "unsupported or malformed v1 host request",
+                    ),
+                };
+                inner.send(&mut stream, &reply.into_message()?).await?;
+            }
+            accepted = outer.accept_classified(), if connector && tunnels.len() < MAX_CONNECTOR_TUNNELS => {
+                let (protocol, inbound) = accepted?;
+                if protocol != IrohProtocol::Connector {
+                    continue;
+                }
+                let lease = connector_lease
+                    .as_ref()
+                    .ok_or(HostRemoteError::MissingConnectorLease)?
+                    .clone();
+                let outer = outer.clone();
+                let controller_endpoint = endpoint.clone();
+                let controller = membership.marker.controller;
+                let site_id = membership.marker.site_id;
+                let device_id = membership.marker.device_id;
+                tunnels.spawn(async move {
+                    serve_one_connector_tunnel(
+                        &outer,
+                        inbound,
+                        controller_endpoint,
+                        controller,
+                        site_id,
+                        device_id,
+                        lease,
+                    )
+                    .await
+                });
+            }
+            joined = tunnels.join_next(), if !tunnels.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    return Err(HostRemoteError::ConnectorTask(error.to_string()));
+                }
+            }
+            _ = tokio::time::sleep_until(renew_at), if connector => {
+                drop(connector_discovery.take());
+                tunnels.abort_all();
+                while tunnels.join_next().await.is_some() {}
+                return Err(HostRemoteError::ConnectorLeaseRefreshRequired);
+            }
+        }
     }
+}
+
+async fn serve_one_connector_tunnel(
+    outer: &IrohOuter,
+    mut inbound: clew_transport::IrohStream,
+    controller_endpoint: EndpointAddr,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+    device_id: DeviceId,
+    lease: SignedConnectorLease,
+) -> Result<(), HostRemoteError> {
+    let request = read_connector_open(&mut inbound).await?;
+    let expected_tag = SiteDiscoveryTag::derive(controller.controller_id, site_id);
+    if request.validate()? != expected_tag {
+        return Err(HostRemoteError::ConnectorSiteMismatch);
+    }
+    let now = unix_ms()?;
+    let lease_device = lease.verify_for_candidate(&controller, site_id, outer.addr().id, now)?;
+    if lease_device != device_id {
+        return Err(HostRemoteError::ConnectorLeaseDeviceMismatch);
+    }
+
+    let mut outbound = outer.connect_connector(controller_endpoint).await?;
+    write_connector_open(&mut outbound, &request).await?;
+    write_connector_ready(&mut inbound, &ConnectorReady::new(lease)).await?;
+    match forward_opaque_bidirectional(&mut inbound, &mut outbound).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_normal_tunnel_close(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_normal_tunnel_close(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn unix_ms() -> Result<u64, HostRemoteError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HostRemoteError::ClockBeforeUnixEpoch)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| HostRemoteError::ClockOverflow)
 }
 
 fn expect_activated(response: BootstrapResponse) -> Result<DeviceRecord, HostRemoteError> {
@@ -270,7 +573,9 @@ fn expect_activated(response: BootstrapResponse) -> Result<DeviceRecord, HostRem
             code: error.code,
             message: error.message,
         }),
-        BootstrapResponse::Claimed(_) => Err(HostRemoteError::UnexpectedBootstrapResponse),
+        BootstrapResponse::Claimed(_) | BootstrapResponse::ActivationConfirmed { .. } => {
+            Err(HostRemoteError::UnexpectedBootstrapResponse)
+        }
     }
 }
 
@@ -292,8 +597,24 @@ fn verify_activated(
 pub enum HostRemoteError {
     #[error("this membership has no signed Controller endpoint/read policy")]
     MissingNetworkConfig,
-    #[error("this membership is not executable")]
+    #[error("this membership has neither EXECUTE nor CONNECTOR capability")]
     ExecutionDisabled,
+    #[error("Connector lease is missing from an authenticated Connector session")]
+    MissingConnectorLease,
+    #[error("Connector lease DeviceId does not match this Host membership")]
+    ConnectorLeaseDeviceMismatch,
+    #[error("Connector tunnel Site tag does not match this Host membership")]
+    ConnectorSiteMismatch,
+    #[error("Connector lease renewal requires an authenticated Controller reconnect")]
+    ConnectorLeaseRefreshRequired,
+    #[error("Connector tunnel task failed: {0}")]
+    ConnectorTask(String),
+    #[error("system clock is before the Unix epoch")]
+    ClockBeforeUnixEpoch,
+    #[error("system clock value does not fit in milliseconds")]
+    ClockOverflow,
+    #[error("no direct Controller or verified nearby Connector bootstrap path became available")]
+    BootstrapPathUnavailable,
     #[error("Controller activation response does not match the persisted membership")]
     ActivationScopeMismatch,
     #[error("Controller returned an unexpected bootstrap response")]
@@ -306,6 +627,16 @@ pub enum HostRemoteError {
     #[error(transparent)]
     Outer(#[from] clew_transport::IrohOuterError),
     #[error(transparent)]
+    ConnectorControl(#[from] ConnectorControlError),
+    #[error(transparent)]
+    ConnectorDiscovery(#[from] ConnectorDiscoveryError),
+    #[error(transparent)]
+    ConnectorLease(#[from] ConnectorLeaseError),
+    #[error(transparent)]
+    SealedBootstrap(#[from] SealedBootstrapError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Bootstrap(#[from] clew_transport::BootstrapProtocolError),
     #[error(transparent)]
     Inner(#[from] clew_transport::InnerSessionError),
@@ -317,4 +648,254 @@ pub enum HostRemoteError {
     IdentityStore(#[from] clew_identity::DeviceIdentityStoreError),
     #[error(transparent)]
     Model(#[from] clew_core::ControlModelError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clew_core::{DeviceNameOrigin, InviteId, MemberCapabilities, ReadPolicy};
+    use clew_identity::{
+        ControllerIdentity, EnrollmentRegistry, PermissionGrant, SiteBootstrapSpec,
+    };
+    use clew_transport::{BootstrapRequest, BootstrapResponse, noise_static_public};
+    use iroh::{EndpointAddr, SecretKey};
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn sealed_bootstrap_enrolls_through_real_mdns_connector_when_direct_is_unreachable() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path().join("target-state"));
+        let controller = ControllerIdentity::from_secret([111_u8; 32]);
+        let controller_public = controller.public_identity();
+        let controller_bootstrap_secret = [112_u8; 32];
+        let controller_bootstrap_public = noise_static_public(controller_bootstrap_secret).unwrap();
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let helper_device_id = DeviceId::new();
+        let now = unix_ms().unwrap();
+
+        let mut registry = EnrollmentRegistry::new(
+            controller.controller_id(),
+            PermissionGrant {
+                member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
+                read: true,
+                write: false,
+                shell: false,
+            },
+        );
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Connector Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+                    not_before_unix_ms: now.saturating_sub(1_000),
+                    expires_unix_ms: now + 60_000,
+                    deployment_window_ms: 60_000,
+                    max_claims: 2,
+                },
+            )
+            .unwrap();
+
+        let controller_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let controller_addr = controller_outer.addr();
+        let helper_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let helper_addr = helper_outer.addr();
+        let helper_lease = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            helper_device_id,
+            helper_addr.id,
+            now.saturating_sub(1_000),
+            now + 60_000,
+        )
+        .unwrap();
+
+        let controller_task = tokio::spawn({
+            let controller_outer = controller_outer.clone();
+            let controller = controller.clone();
+            async move {
+                let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                let open = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(open.purpose, ConnectorTunnelPurpose::Bootstrap);
+                assert_eq!(
+                    open.validate().unwrap(),
+                    SiteDiscoveryTag::derive(controller.controller_id(), site_id)
+                );
+                let mut sealed = SealedBootstrapSession::accept(
+                    &mut stream,
+                    SealedBootstrapContext {
+                        controller_id: controller.controller_id(),
+                        site_id,
+                    },
+                    controller_bootstrap_secret,
+                )
+                .await
+                .unwrap();
+                let first: BootstrapRequest = sealed.recv(&mut stream).await.unwrap();
+                let (pass, device_identity, hostname, mode) = match first {
+                    BootstrapRequest::Claim {
+                        bootstrap,
+                        device_identity,
+                        hostname,
+                        mode,
+                    } => (bootstrap, device_identity, hostname, mode),
+                    _ => panic!("expected Claim"),
+                };
+                let ceiling = match mode {
+                    BootstrapMemberMode::ExecutePreferred => {
+                        PermissionGrant::EXECUTE_READ_CONNECTOR
+                    }
+                    BootstrapMemberMode::ConnectorOnly => PermissionGrant::CONNECTOR_ONLY,
+                };
+                let receipt = registry
+                    .claim_with_ceiling(&pass, device_identity, now, ceiling)
+                    .unwrap();
+                sealed
+                    .send(&mut stream, &BootstrapResponse::Claimed(receipt.clone()))
+                    .await
+                    .unwrap();
+                let persisted: BootstrapRequest = sealed.recv(&mut stream).await.unwrap();
+                let persist_token = match persisted {
+                    BootstrapRequest::Persisted {
+                        invite_id: actual_invite,
+                        device_id,
+                        persist_ack_token,
+                        hostname: persisted_hostname,
+                    } => {
+                        assert_eq!(actual_invite, receipt.invite_id);
+                        assert_eq!(device_id, receipt.device_id);
+                        assert_eq!(persisted_hostname, hostname);
+                        persist_ack_token
+                    }
+                    _ => panic!("expected Persisted"),
+                };
+                let enrollment = registry
+                    .finalize_host_persist(receipt.invite_id, receipt.device_id, &persist_token)
+                    .unwrap();
+                let normalized = crate::normalize_hostname(&hostname);
+                let record = DeviceRecord {
+                    device_id: receipt.device_id,
+                    site_id,
+                    display_name: normalized.clone(),
+                    hostname_observed: normalized.clone(),
+                    capabilities: enrollment.effective_grant.member,
+                    enrolled_via_invite_id: receipt.invite_id,
+                    name_origin: DeviceNameOrigin::Automatic {
+                        base_hostname: normalized,
+                        tagged: false,
+                        tag_generation: 0,
+                    },
+                };
+                sealed
+                    .send(&mut stream, &BootstrapResponse::Activated(record.clone()))
+                    .await
+                    .unwrap();
+                let ack: BootstrapRequest = sealed.recv(&mut stream).await.unwrap();
+                assert!(matches!(
+                    ack,
+                    BootstrapRequest::ActivatedAck { invite_id: actual_invite, device_id }
+                        if actual_invite == receipt.invite_id && device_id == receipt.device_id
+                ));
+                sealed
+                    .send(
+                        &mut stream,
+                        &BootstrapResponse::ActivationConfirmed {
+                            invite_id: receipt.invite_id,
+                            device_id: receipt.device_id,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    sealed.recv::<_, BootstrapRequest>(&mut stream),
+                )
+                .await;
+                record
+            }
+        });
+
+        let helper_task = tokio::spawn({
+            let helper_outer = helper_outer.clone();
+            let controller_addr = controller_addr.clone();
+            async move {
+                let _advertisement = MdnsConnectorDiscovery::attach(
+                    &helper_outer,
+                    controller_public.controller_id,
+                    site_id,
+                    true,
+                )
+                .unwrap();
+                let (protocol, inbound) = helper_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                serve_one_connector_tunnel(
+                    &helper_outer,
+                    inbound,
+                    controller_addr,
+                    controller_public,
+                    site_id,
+                    helper_device_id,
+                    helper_lease,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let bogus_controller = EndpointAddr::new(SecretKey::from_bytes(&[113_u8; 32]).public());
+        let read_policy = ReadPolicy::new(
+            vec![temp.path().join("share").to_string_lossy().into_owned()],
+            4_096,
+            2_000,
+        )
+        .unwrap();
+        let profile = crate::OutfitProfile::preset(crate::OutfitPreset::ClewOriginal);
+        let site_file = crate::SignedSiteClew::issue_networked_outfit_sealed(
+            &controller,
+            profile,
+            bootstrap,
+            crate::HostRoleHint::ExecutePreferred,
+            bogus_controller,
+            read_policy,
+            controller_bootstrap_public,
+        )
+        .unwrap();
+        let pending = DeviceIdentityStore::new(layout.clone())
+            .prepare_pending(controller_public, site_id, invite_id)
+            .unwrap();
+        let initial = HostLaunchState::AwaitingEnrollment {
+            site_file,
+            pending,
+            hostname: "NO-PUBLIC-TARGET".into(),
+            source: crate::HostSiteSource::Explicit,
+        };
+        let activated = tokio::time::timeout(
+            Duration::from_secs(12),
+            complete_networked_activation(&layout, initial),
+        )
+        .await
+        .expect("Connector bootstrap activation timed out")
+        .unwrap();
+        let HostLaunchState::Active { membership, .. } = activated else {
+            panic!("Target did not become active");
+        };
+        assert!(membership.device.capabilities.execute);
+        assert!(membership.device.capabilities.connector);
+        assert_eq!(
+            membership.marker.controller_bootstrap_noise_public_key,
+            Some(controller_bootstrap_public)
+        );
+        let controller_record = controller_task.await.unwrap();
+        assert_eq!(controller_record.device_id, membership.marker.device_id);
+        tokio::time::timeout(Duration::from_secs(5), helper_task)
+            .await
+            .expect("Helper tunnel did not close after activation")
+            .unwrap();
+        helper_outer.close().await;
+        controller_outer.close().await;
+    }
 }

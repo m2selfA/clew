@@ -4,14 +4,17 @@ use std::{
     time::Duration,
 };
 
-use clew_core::{DeviceId, DeviceNameOrigin, DeviceRecord};
+use clew_core::{DeviceId, DeviceNameOrigin, DeviceRecord, SiteId};
 use clew_host::normalize_hostname;
 use clew_identity::{EnrollmentError, StoredControllerIdentity};
 use clew_transport::{
-    BootstrapErrorBody, BootstrapErrorCode, BootstrapRequest, BootstrapResponse,
+    BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest,
+    BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
     ControllerSessionAuthority, InnerSession, IrohProtocol, IrohStream, ReadReply, ReadRequest,
-    read_bootstrap, write_bootstrap,
+    SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease,
+    SiteDiscoveryTag, read_bootstrap, read_connector_open, write_bootstrap,
 };
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -19,6 +22,8 @@ use crate::{ControlStoreError, ControllerControlStore};
 
 pub const MAX_REMOTE_CONNECTIONS: usize = 128;
 const REMOTE_COMMAND_CAPACITY: usize = 16;
+const CONNECTOR_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
+const SEALED_ACTIVATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteHub {
@@ -144,9 +149,90 @@ pub async fn handle_remote_connection(
 ) -> Result<(), RemoteConnectionError> {
     match protocol {
         IrohProtocol::Bootstrap => handle_bootstrap(&mut stream, &identity, control).await,
-        IrohProtocol::InnerSession => handle_member(&mut stream, &identity, control, hub).await,
-        IrohProtocol::Connector => Err(RemoteConnectionError::ConnectorNotEnabled),
+        IrohProtocol::InnerSession => {
+            handle_member(&mut stream, &identity, control, hub, None).await
+        }
+        IrohProtocol::Connector => handle_connector(&mut stream, &identity, control, hub).await,
     }
+}
+
+enum BootstrapChannel<'a> {
+    Direct(&'a mut IrohStream),
+    Sealed {
+        stream: &'a mut IrohStream,
+        session: SealedBootstrapSession,
+    },
+}
+
+impl BootstrapChannel<'_> {
+    async fn send<T: Serialize>(&mut self, value: &T) -> Result<(), RemoteConnectionError> {
+        match self {
+            Self::Direct(stream) => Ok(write_bootstrap(&mut **stream, value).await?),
+            Self::Sealed { stream, session } => Ok(session.send(&mut **stream, value).await?),
+        }
+    }
+
+    async fn recv<T: DeserializeOwned>(&mut self) -> Result<T, RemoteConnectionError> {
+        match self {
+            Self::Direct(stream) => Ok(read_bootstrap(&mut **stream).await?),
+            Self::Sealed { stream, session } => Ok(session.recv(&mut **stream).await?),
+        }
+    }
+
+    fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed { .. })
+    }
+
+    fn stream_mut(&mut self) -> &mut IrohStream {
+        match self {
+            Self::Direct(stream) => stream,
+            Self::Sealed { stream, .. } => stream,
+        }
+    }
+}
+
+async fn handle_connector(
+    stream: &mut IrohStream,
+    identity: &StoredControllerIdentity,
+    control: Arc<Mutex<ControllerControlStore>>,
+    hub: RemoteHub,
+) -> Result<(), RemoteConnectionError> {
+    let request = read_connector_open(stream).await?;
+    let site_tag = request.validate()?;
+    let site_id =
+        resolve_connector_site(&control, identity.public_identity().controller_id, site_tag)?;
+    match request.purpose {
+        ConnectorTunnelPurpose::Bootstrap => {
+            handle_sealed_bootstrap(stream, identity, control, site_id).await
+        }
+        ConnectorTunnelPurpose::InnerSession => {
+            handle_member(stream, identity, control, hub, Some(site_tag)).await
+        }
+    }
+}
+
+fn resolve_connector_site(
+    control: &Arc<Mutex<ControllerControlStore>>,
+    controller_id: clew_core::ControllerId,
+    expected_tag: SiteDiscoveryTag,
+) -> Result<SiteId, RemoteConnectionError> {
+    let store = control
+        .lock()
+        .map_err(|_| RemoteConnectionError::StatePoisoned)?;
+    let mut matches = store
+        .snapshot()
+        .catalog
+        .sites
+        .values()
+        .filter(|site| {
+            !site.revoked && SiteDiscoveryTag::derive(controller_id, site.site_id) == expected_tag
+        })
+        .map(|site| site.site_id);
+    let site_id = matches.next().ok_or(RemoteConnectionError::Denied)?;
+    if matches.next().is_some() {
+        return Err(RemoteConnectionError::Denied);
+    }
+    Ok(site_id)
 }
 
 async fn handle_bootstrap(
@@ -154,22 +240,47 @@ async fn handle_bootstrap(
     identity: &StoredControllerIdentity,
     control: Arc<Mutex<ControllerControlStore>>,
 ) -> Result<(), RemoteConnectionError> {
-    let result = handle_bootstrap_inner(stream, identity, control).await;
+    let mut channel = BootstrapChannel::Direct(stream);
+    handle_bootstrap_channel(&mut channel, identity, control, None).await
+}
+
+async fn handle_sealed_bootstrap(
+    stream: &mut IrohStream,
+    identity: &StoredControllerIdentity,
+    control: Arc<Mutex<ControllerControlStore>>,
+    site_id: SiteId,
+) -> Result<(), RemoteConnectionError> {
+    let context = SealedBootstrapContext {
+        controller_id: identity.public_identity().controller_id,
+        site_id,
+    };
+    let session =
+        SealedBootstrapSession::accept(stream, context, identity.bootstrap_noise_static_secret())
+            .await?;
+    let mut channel = BootstrapChannel::Sealed { stream, session };
+    handle_bootstrap_channel(&mut channel, identity, control, Some(site_id)).await
+}
+
+async fn handle_bootstrap_channel(
+    channel: &mut BootstrapChannel<'_>,
+    identity: &StoredControllerIdentity,
+    control: Arc<Mutex<ControllerControlStore>>,
+    expected_site_id: Option<SiteId>,
+) -> Result<(), RemoteConnectionError> {
+    let result = handle_bootstrap_inner(channel, identity, control, expected_site_id).await;
     if let Err(error) = &result
         && let Some(body) = error.bootstrap_error_body()
     {
-        send_bootstrap_rejection(stream, body).await;
+        send_bootstrap_rejection(channel, body).await;
     }
     result
 }
 
-async fn send_bootstrap_rejection(stream: &mut IrohStream, body: BootstrapErrorBody) {
-    if write_bootstrap(stream, &BootstrapResponse::Error(body))
-        .await
-        .is_err()
-    {
+async fn send_bootstrap_rejection(channel: &mut BootstrapChannel<'_>, body: BootstrapErrorBody) {
+    if channel.send(&BootstrapResponse::Error(body)).await.is_err() {
         return;
     }
+    let stream = channel.stream_mut();
     let _ = tokio::io::AsyncWriteExt::shutdown(stream).await;
     let mut scratch = [0_u8; 1];
     let _ = tokio::time::timeout(
@@ -180,19 +291,21 @@ async fn send_bootstrap_rejection(stream: &mut IrohStream, body: BootstrapErrorB
 }
 
 async fn handle_bootstrap_inner(
-    stream: &mut IrohStream,
+    channel: &mut BootstrapChannel<'_>,
     identity: &StoredControllerIdentity,
     control: Arc<Mutex<ControllerControlStore>>,
+    expected_site_id: Option<SiteId>,
 ) -> Result<(), RemoteConnectionError> {
     if remote_access_paused(&control)? {
         return Err(RemoteConnectionError::RecoveryReviewRequired);
     }
-    let first: BootstrapRequest = read_bootstrap(stream).await?;
+    let first: BootstrapRequest = channel.recv().await?;
     match first {
         BootstrapRequest::Claim {
             bootstrap,
             device_identity,
             hostname,
+            mode,
         } => {
             validate_hostname(&hostname)?;
             let controller = bootstrap.verify()?;
@@ -200,6 +313,9 @@ async fn handle_bootstrap_inner(
                 return Err(RemoteConnectionError::Denied);
             }
             let site_id = bootstrap.payload.site_id;
+            if expected_site_id.is_some_and(|expected| expected != site_id) {
+                return Err(RemoteConnectionError::Denied);
+            }
             let site_name = bootstrap.payload.site_name.clone();
             let receipt = {
                 let mut store = control
@@ -214,13 +330,28 @@ async fn handle_bootstrap_inner(
                     return Err(RemoteConnectionError::Denied);
                 }
                 let now = unix_ms()?;
+                let claim_ceiling = match mode {
+                    BootstrapMemberMode::ExecutePreferred => {
+                        clew_identity::PermissionGrant::EXECUTE_READ_CONNECTOR
+                    }
+                    BootstrapMemberMode::ConnectorOnly => {
+                        clew_identity::PermissionGrant::CONNECTOR_ONLY
+                    }
+                };
                 store.transaction(|snapshot| {
-                    Ok(snapshot.registry.claim(&bootstrap, device_identity, now)?)
+                    Ok(snapshot.registry.claim_with_ceiling(
+                        &bootstrap,
+                        device_identity,
+                        now,
+                        claim_ceiling,
+                    )?)
                 })?
             };
-            write_bootstrap(stream, &BootstrapResponse::Claimed(receipt.clone())).await?;
+            channel
+                .send(&BootstrapResponse::Claimed(receipt.clone()))
+                .await?;
 
-            let persisted: BootstrapRequest = read_bootstrap(stream).await?;
+            let persisted: BootstrapRequest = channel.recv().await?;
             let (invite_id, device_id, persist_ack_token, persisted_hostname) = match persisted {
                 BootstrapRequest::Persisted {
                     invite_id,
@@ -243,8 +374,13 @@ async fn handle_bootstrap_inner(
                 &persist_ack_token,
                 &hostname,
             )?;
-            write_bootstrap(stream, &BootstrapResponse::Activated(canonical)).await?;
-            expect_activation_ack(stream, invite_id, device_id).await?;
+            if expected_site_id.is_some_and(|expected| expected != canonical.site_id) {
+                return Err(RemoteConnectionError::Denied);
+            }
+            channel
+                .send(&BootstrapResponse::Activated(canonical))
+                .await?;
+            expect_activation_ack(channel, invite_id, device_id).await?;
             Ok(())
         }
         BootstrapRequest::Persisted {
@@ -261,26 +397,46 @@ async fn handle_bootstrap_inner(
                 &persist_ack_token,
                 &hostname,
             )?;
-            write_bootstrap(stream, &BootstrapResponse::Activated(canonical)).await?;
-            expect_activation_ack(stream, invite_id, device_id).await?;
+            if expected_site_id.is_some_and(|expected| expected != canonical.site_id) {
+                return Err(RemoteConnectionError::Denied);
+            }
+            channel
+                .send(&BootstrapResponse::Activated(canonical))
+                .await?;
+            expect_activation_ack(channel, invite_id, device_id).await?;
             Ok(())
         }
-        BootstrapRequest::ActivatedAck { .. } => {
+        BootstrapRequest::ActivatedAck { .. } | BootstrapRequest::ActivationConfirmedAck { .. } => {
             Err(RemoteConnectionError::InvalidBootstrapSequence)
         }
     }
 }
 
 async fn expect_activation_ack(
-    stream: &mut IrohStream,
+    channel: &mut BootstrapChannel<'_>,
     invite_id: clew_core::InviteId,
     device_id: DeviceId,
 ) -> Result<(), RemoteConnectionError> {
-    match read_bootstrap::<BootstrapRequest, _>(stream).await? {
+    match channel.recv::<BootstrapRequest>().await? {
         BootstrapRequest::ActivatedAck {
             invite_id: actual_invite,
             device_id: actual_device,
-        } if actual_invite == invite_id && actual_device == device_id => Ok(()),
+        } if actual_invite == invite_id && actual_device == device_id => {
+            if channel.is_sealed() {
+                channel
+                    .send(&BootstrapResponse::ActivationConfirmed {
+                        invite_id,
+                        device_id,
+                    })
+                    .await?;
+                let _ = tokio::time::timeout(
+                    SEALED_ACTIVATION_DRAIN_TIMEOUT,
+                    channel.recv::<BootstrapRequest>(),
+                )
+                .await;
+            }
+            Ok(())
+        }
         BootstrapRequest::ActivatedAck { .. } => Err(RemoteConnectionError::Denied),
         _ => Err(RemoteConnectionError::InvalidBootstrapSequence),
     }
@@ -348,7 +504,9 @@ async fn handle_member(
     identity: &StoredControllerIdentity,
     control: Arc<Mutex<ControllerControlStore>>,
     hub: RemoteHub,
+    expected_site_tag: Option<SiteDiscoveryTag>,
 ) -> Result<(), RemoteConnectionError> {
+    let controller_id = identity.public_identity().controller_id;
     let authority = ControllerSessionAuthority::from_stored(identity);
     let control_for_auth = Arc::clone(&control);
     let mut inner = InnerSession::accept_authorized(stream, authority, move |claim| {
@@ -365,6 +523,11 @@ async fn handle_member(
         let Some(site) = store.snapshot().catalog.site(claim.site_id) else {
             return false;
         };
+        if expected_site_tag
+            .is_some_and(|tag| SiteDiscoveryTag::derive(controller_id, claim.site_id) != tag)
+        {
+            return false;
+        };
         let Some(catalog_device) = store.snapshot().catalog.device(claim.device_id) else {
             return false;
         };
@@ -379,6 +542,22 @@ async fn handle_member(
     })
     .await?;
     let device_id = inner.device_id();
+    let site_id = inner.site_id();
+    if connector_capability_enabled(&control, device_id, site_id)? {
+        let issued_unix_ms = unix_ms()?;
+        let expires_unix_ms = issued_unix_ms
+            .checked_add(CONNECTOR_LEASE_TTL_MS)
+            .ok_or(RemoteConnectionError::ClockOverflow)?;
+        let lease = SignedConnectorLease::issue(
+            identity.identity(),
+            site_id,
+            device_id,
+            stream.connection().remote_id(),
+            issued_unix_ms,
+            expires_unix_ms,
+        )?;
+        inner.send(stream, &lease.into_message()?).await?;
+    }
     let (token, mut commands) = hub.register(device_id)?;
     while let Some(command) = commands.recv().await {
         match command {
@@ -400,6 +579,27 @@ async fn handle_member(
     }
     hub.unregister(device_id, token);
     Ok(())
+}
+
+fn connector_capability_enabled(
+    control: &Arc<Mutex<ControllerControlStore>>,
+    device_id: DeviceId,
+    site_id: SiteId,
+) -> Result<bool, RemoteConnectionError> {
+    let store = control
+        .lock()
+        .map_err(|_| RemoteConnectionError::StatePoisoned)?;
+    let Some(site) = store.snapshot().catalog.site(site_id) else {
+        return Ok(false);
+    };
+    let Some(device) = store.snapshot().catalog.device(device_id) else {
+        return Ok(false);
+    };
+    Ok(!site.revoked
+        && !device.revoked
+        && device.device.site_id == site_id
+        && device.device.capabilities.connector
+        && store.snapshot().registry.is_device_active(device_id))
 }
 
 fn remote_access_paused(
@@ -458,8 +658,12 @@ pub enum RemoteConnectionError {
     RecoveryReviewRequired,
     #[error("remote connection was denied")]
     Denied,
-    #[error("Connector protocol is not enabled in the Controller runtime yet")]
-    ConnectorNotEnabled,
+    #[error(transparent)]
+    ConnectorControl(#[from] ConnectorControlError),
+    #[error(transparent)]
+    SealedBootstrap(#[from] SealedBootstrapError),
+    #[error(transparent)]
+    ConnectorLease(#[from] ConnectorLeaseError),
     #[error("bootstrap hostname is too long")]
     InvalidHostname,
     #[error("bootstrap request sequence is invalid")]
@@ -557,7 +761,9 @@ impl RemoteConnectionError {
             | Self::Inner(_)
             | Self::Read(_)
             | Self::Hub(_)
-            | Self::ConnectorNotEnabled => None,
+            | Self::ConnectorControl(_)
+            | Self::SealedBootstrap(_)
+            | Self::ConnectorLease(_) => None,
         }
     }
 
@@ -573,7 +779,9 @@ impl RemoteConnectionError {
             Self::Control(_) => "controller_state",
             Self::RecoveryReviewRequired => "recovery_review",
             Self::Denied => "denied",
-            Self::ConnectorNotEnabled => "connector_not_enabled",
+            Self::ConnectorControl(_) => "connector_control",
+            Self::SealedBootstrap(_) => "sealed_bootstrap",
+            Self::ConnectorLease(_) => "connector_lease",
             Self::InvalidHostname => "invalid_hostname",
             Self::InvalidBootstrapSequence => "bootstrap_sequence",
             Self::StatePoisoned => "state_poisoned",

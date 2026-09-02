@@ -68,10 +68,6 @@ impl IrohOuter {
         self.endpoint.addr()
     }
 
-    pub(crate) fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
-    }
-
     pub async fn online_addr(&self) -> Result<EndpointAddr, IrohOuterError> {
         tokio::time::timeout(Duration::from_secs(20), self.endpoint.online())
             .await

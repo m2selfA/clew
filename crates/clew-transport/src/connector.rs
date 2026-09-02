@@ -354,6 +354,9 @@ mod tests {
             async move {
                 let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
                 assert_eq!(protocol, IrohProtocol::Connector);
+                let request = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(request.validate().unwrap(), site_tag);
+                assert_eq!(request.purpose, ConnectorTunnelPurpose::InnerSession);
                 let mut inner = InnerSession::accept(&mut stream, controller_identity)
                     .await
                     .unwrap();
@@ -390,10 +393,11 @@ mod tests {
                 write_connector_ready(&mut inbound, &ConnectorReady::new(lease))
                     .await
                     .unwrap();
-                let outbound = helper_outer
+                let mut outbound = helper_outer
                     .connect_connector(controller_addr)
                     .await
                     .unwrap();
+                write_connector_open(&mut outbound, &request).await.unwrap();
                 let mut inbound = ObservedStream::new(inbound, Arc::clone(&observed));
                 let mut outbound = ObservedStream::new(outbound, observed);
                 forward_opaque_bidirectional(&mut inbound, &mut outbound)

@@ -17,6 +17,13 @@ impl PermissionGrant {
         shell: false,
     };
 
+    pub const EXECUTE_READ_CONNECTOR: Self = Self {
+        member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
+        read: true,
+        write: false,
+        shell: false,
+    };
+
     pub const CONNECTOR_ONLY: Self = Self {
         member: MemberCapabilities::CONNECTOR_ONLY,
         read: false,

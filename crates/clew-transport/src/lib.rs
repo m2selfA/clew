@@ -6,6 +6,7 @@ mod inner;
 mod lease;
 mod outer;
 mod protocol;
+mod sealed_bootstrap;
 
 pub use connector::{
     CONNECTOR_CONTROL_VERSION, ConnectorControlError, ConnectorOpenRequest, ConnectorReady,
@@ -23,12 +24,17 @@ pub use inner::{
     MAX_INNER_PLAINTEXT,
 };
 pub use lease::{
-    CONNECTOR_LEASE_VERSION, ConnectorLease, ConnectorLeaseError, ConnectorLeaseRole,
-    MAX_CONNECTOR_LEASE_ENCODED_BYTES, MAX_CONNECTOR_LEASE_LIFETIME_MS, SignedConnectorLease,
+    CONNECTOR_LEASE_MESSAGE_KIND, CONNECTOR_LEASE_VERSION, ConnectorLease, ConnectorLeaseError,
+    ConnectorLeaseRole, MAX_CONNECTOR_LEASE_ENCODED_BYTES, MAX_CONNECTOR_LEASE_LIFETIME_MS,
+    SignedConnectorLease,
 };
 pub use outer::{IrohOuter, IrohOuterError, IrohProtocol, IrohStream};
 pub use protocol::{
-    BootstrapErrorBody, BootstrapErrorCode, BootstrapProtocolError, BootstrapRequest,
-    BootstrapResponse, MAX_BOOTSTRAP_FRAME_BYTES, ReadErrorBody, ReadErrorCode, ReadProtocolError,
-    ReadReply, ReadRequest, read_bootstrap, write_bootstrap,
+    BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapProtocolError,
+    BootstrapRequest, BootstrapResponse, MAX_BOOTSTRAP_FRAME_BYTES, ReadErrorBody, ReadErrorCode,
+    ReadProtocolError, ReadReply, ReadRequest, read_bootstrap, write_bootstrap,
+};
+pub use sealed_bootstrap::{
+    MAX_SEALED_BOOTSTRAP_PLAINTEXT, SealedBootstrapContext, SealedBootstrapError,
+    SealedBootstrapSession, noise_static_public,
 };

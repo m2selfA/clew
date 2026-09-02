@@ -4,9 +4,12 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{InnerMessage, InnerSessionError};
+
 pub const CONNECTOR_LEASE_VERSION: u32 = 1;
 pub const MAX_CONNECTOR_LEASE_LIFETIME_MS: u64 = 10 * 60 * 1000;
 pub const MAX_CONNECTOR_LEASE_ENCODED_BYTES: usize = 8 * 1024;
+pub const CONNECTOR_LEASE_MESSAGE_KIND: &str = "connector_lease";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +104,22 @@ impl SignedConnectorLease {
         Ok(signed)
     }
 
+    pub fn into_message(self) -> Result<InnerMessage, ConnectorLeaseError> {
+        Ok(InnerMessage::new(
+            CONNECTOR_LEASE_MESSAGE_KIND,
+            self.to_bytes()?,
+        )?)
+    }
+
+    pub fn from_message(message: &InnerMessage) -> Result<Self, ConnectorLeaseError> {
+        if message.kind != CONNECTOR_LEASE_MESSAGE_KIND {
+            return Err(ConnectorLeaseError::UnexpectedMessageKind(
+                message.kind.clone(),
+            ));
+        }
+        Self::from_bytes(&message.payload)
+    }
+
     fn check_size(&self) -> Result<(), ConnectorLeaseError> {
         let len = serde_json::to_vec(self)?.len();
         if len > MAX_CONNECTOR_LEASE_ENCODED_BYTES {
@@ -149,6 +168,10 @@ pub enum ConnectorLeaseError {
     NotYetValid,
     #[error("connector lease has expired")]
     Expired,
+    #[error("unexpected inner message kind while waiting for Connector lease: {0}")]
+    UnexpectedMessageKind(String),
+    #[error(transparent)]
+    Inner(#[from] InnerSessionError),
     #[error("connector lease exceeds the encoded hard bound: {0} bytes")]
     EncodedTooLarge(usize),
 }
@@ -172,6 +195,10 @@ mod tests {
             SignedConnectorLease::issue(&controller, site, device, ep, 1_000, 61_000).unwrap();
         assert_eq!(
             SignedConnectorLease::from_bytes(&signed.to_bytes().unwrap()).unwrap(),
+            signed
+        );
+        assert_eq!(
+            SignedConnectorLease::from_message(&signed.clone().into_message().unwrap()).unwrap(),
             signed
         );
         assert_eq!(

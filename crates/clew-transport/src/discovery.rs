@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt, pin::Pin};
 use clew_core::{ControllerId, SiteId};
 use iroh::{
     EndpointAddr, EndpointId,
-    address_lookup::{AddrFilter, UserData},
+    address_lookup::{AddrFilter, AddressLookup, EndpointData, UserData},
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use sha2::{Digest, Sha256};
@@ -115,7 +115,12 @@ pub enum ConnectorDiscoveryEvent {
     Expired { endpoint_id: EndpointId },
 }
 
-/// One mDNS lookup service attached to an existing iroh endpoint.
+/// One Clew-only mDNS lookup service keyed to an existing iroh endpoint id.
+///
+/// The service is deliberately *not* registered in the endpoint-global iroh
+/// AddressLookupServices. Clew Site metadata therefore stays in LAN mDNS TXT
+/// records and is never copied into the N0 DNS/Pkarr publishers from the normal
+/// endpoint preset.
 ///
 /// Discovery is not authentication. Consumers must verify a Controller-signed
 /// Connector lease for every candidate before sending any Clew tunnel bytes.
@@ -134,23 +139,27 @@ impl MdnsConnectorDiscovery {
         advertise_connector: bool,
     ) -> Result<Self, ConnectorDiscoveryError> {
         let advertisement = ConnectorDiscoveryAdvertisement::for_site(controller_id, site_id);
-        let endpoint = outer.endpoint();
+        let endpoint_addr = outer.addr();
         let mdns = MdnsAddressLookup::builder()
             .service_name(MDNS_SERVICE_NAME)
             .advertise(advertise_connector)
             .addr_filter(AddrFilter::ip_only())
-            .build(endpoint.id())
+            .build(endpoint_addr.id)
             .map_err(|error| ConnectorDiscoveryError::Mdns(error.to_string()))?;
         if advertise_connector {
-            endpoint.set_user_data_for_address_lookup(Some(advertisement.to_user_data()?));
+            let direct = EndpointData::from_iter(
+                endpoint_addr
+                    .addrs
+                    .iter()
+                    .filter(|addr| addr.is_ip())
+                    .cloned(),
+            )
+            .with_user_data(advertisement.to_user_data()?);
+            mdns.publish(&direct);
         }
-        endpoint
-            .address_lookup()
-            .map_err(|error| ConnectorDiscoveryError::Iroh(error.to_string()))?
-            .add(mdns.clone());
         Ok(Self {
             mdns,
-            own_endpoint_id: endpoint.id(),
+            own_endpoint_id: endpoint_addr.id,
             expected_site_tag: advertisement.site_tag,
         })
     }

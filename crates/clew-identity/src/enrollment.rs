@@ -317,6 +317,16 @@ impl EnrollmentRegistry {
         device: DevicePublicIdentity,
         now_unix_ms: u64,
     ) -> Result<EnrollmentReceipt, EnrollmentError> {
+        self.claim_with_ceiling(pass, device, now_unix_ms, self.policy_ceiling)
+    }
+
+    pub fn claim_with_ceiling(
+        &mut self,
+        pass: &SignedSiteBootstrapPass,
+        device: DevicePublicIdentity,
+        now_unix_ms: u64,
+        claim_ceiling: PermissionGrant,
+    ) -> Result<EnrollmentReceipt, EnrollmentError> {
         let public = pass.verify()?;
         device.validate()?;
         if public.controller_id != self.controller_id {
@@ -374,7 +384,11 @@ impl EnrollmentRegistry {
         while self.devices.contains_key(&device_id) {
             device_id = DeviceId::new();
         }
-        let effective_grant = pass.payload.grant.intersect(self.policy_ceiling);
+        let effective_grant = pass
+            .payload
+            .grant
+            .intersect(self.policy_ceiling)
+            .intersect(claim_ceiling);
         let receipt = EnrollmentReceipt {
             controller_id: self.controller_id,
             site_id: pass.payload.site_id,
@@ -757,6 +771,23 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn claim_ceiling_can_make_same_site_pass_connector_only_without_escalation() {
+        let (controller, mut registry) = controller_and_registry();
+        let mut spec = spec(2);
+        spec.grant = PermissionGrant::EXECUTE_READ_CONNECTOR;
+        let pass = registry.issue_bootstrap(&controller, spec).unwrap();
+        let helper = DeviceIdentity::generate().unwrap().public_identity();
+        let receipt = registry
+            .claim_with_ceiling(&pass, helper, 1_100, PermissionGrant::CONNECTOR_ONLY)
+            .unwrap();
+        assert!(!receipt.effective_grant.member.execute);
+        assert!(receipt.effective_grant.member.connector);
+        assert!(!receipt.effective_grant.read);
+        assert!(!receipt.effective_grant.write);
+        assert!(!receipt.effective_grant.shell);
     }
 
     #[test]
