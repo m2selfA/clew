@@ -1,12 +1,14 @@
 use std::{env, fs, path::PathBuf};
 
 use clew_core::StateLayout;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(windows)]
 const PIPE_NAME_DOMAIN: &[u8] = b"clew/local-api-pipe/v1\0";
+#[cfg(target_os = "macos")]
+const MACOS_SOCKET_DOMAIN: &[u8] = b"clew/local-api-socket/v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControllerConfig {
@@ -58,7 +60,18 @@ impl ControllerConfig {
             let suffix = hex_prefix(&digest[..8]);
             LocalEndpoint::WindowsNamedPipe(format!(r"\\.\pipe\clew-controller-{suffix}"))
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            let mut hasher = Sha256::new();
+            hasher.update(MACOS_SOCKET_DOMAIN);
+            hasher.update(self.state_root.to_string_lossy().as_bytes());
+            let digest = hasher.finalize();
+            let suffix = hex_prefix(&digest[..8]);
+            LocalEndpoint::UnixSocket(
+                env::temp_dir().join(format!("clew-controller-{suffix}.sock")),
+            )
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             LocalEndpoint::UnixSocket(self.state_layout().local_api_socket_path())
         }
@@ -116,7 +129,7 @@ pub enum ControllerConfigError {
     UnsupportedPlatform,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn hex_prefix(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -135,6 +148,17 @@ mod tests {
     fn endpoint_is_deterministic_for_state_root() {
         let config = ControllerConfig::new("test-state");
         assert_eq!(config.local_endpoint(), config.local_endpoint());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_endpoint_uses_short_user_temp_socket_for_deep_state_root() {
+        let config = ControllerConfig::new(
+            "/Users/test/Documents/Scratch/scratchpad/a-very-long-clew-test-directory-name/nested-controller-state-directory",
+        );
+        let LocalEndpoint::UnixSocket(path) = config.local_endpoint();
+        assert!(path.starts_with(env::temp_dir()));
+        assert!(path.to_string_lossy().len() < 100);
     }
 
     #[cfg(windows)]

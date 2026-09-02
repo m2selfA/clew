@@ -21,6 +21,8 @@ use crate::ClientFlavorId;
 const INSTANCE_KEY_DOMAIN: &[u8] = b"clew/host-instance-key/v1\0";
 #[cfg(windows)]
 const PIPE_NAME_DOMAIN: &[u8] = b"clew/host-instance-pipe/v1\0";
+#[cfg(target_os = "macos")]
+const MACOS_SOCKET_DOMAIN: &[u8] = b"clew/host-instance-socket/v1\0";
 const MAX_WAKE_FRAME: usize = 4 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -193,7 +195,18 @@ fn endpoint(layout: &StateLayout, key: HostInstanceKey, _runtime_dir: &Path) -> 
         let digest = hasher.finalize();
         LocalEndpoint::WindowsNamedPipe(format!(r"\\.\pipe\clew-host-{}", hex(&digest[..8])))
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        let mut hasher = Sha256::new();
+        hasher.update(MACOS_SOCKET_DOMAIN);
+        hasher.update(layout.root().to_string_lossy().as_bytes());
+        hasher.update(key.0);
+        let digest = hasher.finalize();
+        LocalEndpoint::UnixSocket(
+            std::env::temp_dir().join(format!("clew-host-{}.sock", hex(&digest[..8]))),
+        )
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = (layout, key);
         LocalEndpoint::UnixSocket(_runtime_dir.join("wake.sock"))
@@ -476,6 +489,26 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_wake_socket_stays_short_for_deep_state_root() {
+        let deep_root = PathBuf::from("/Users/test/Documents/Scratch/scratchpad")
+            .join("a-very-long-clew-test-directory-name")
+            .join("nested-state-directory-that-would-overflow-sun-path");
+        let layout = StateLayout::new(deep_root);
+        let key = HostInstanceKey::membership(ControllerId::new(), SiteId::new());
+        let LocalEndpoint::UnixSocket(path) = endpoint(
+            &layout,
+            key,
+            &layout
+                .version_root()
+                .join("host-runtime")
+                .join(key.path_component()),
+        );
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(path.to_string_lossy().len() < 100);
+    }
 
     #[tokio::test]
     async fn second_instance_wakes_existing_and_owner_releases_cleanly() {
