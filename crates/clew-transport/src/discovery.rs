@@ -146,22 +146,46 @@ impl MdnsConnectorDiscovery {
             .addr_filter(AddrFilter::ip_only())
             .build(endpoint_addr.id)
             .map_err(|error| ConnectorDiscoveryError::Mdns(error.to_string()))?;
-        if advertise_connector {
-            let direct = EndpointData::from_iter(
-                endpoint_addr
-                    .addrs
-                    .iter()
-                    .filter(|addr| addr.is_ip())
-                    .cloned(),
-            )
-            .with_user_data(advertisement.to_user_data()?);
-            mdns.publish(&direct);
-        }
-        Ok(Self {
+        let discovery = Self {
             mdns,
             own_endpoint_id: endpoint_addr.id,
             expected_site_tag: advertisement.site_tag,
-        })
+        };
+        if advertise_connector {
+            discovery.publish_endpoint_addr(&endpoint_addr)?;
+        }
+        Ok(discovery)
+    }
+
+    /// Republishes the current direct-IP hints for the same iroh EndpointId.
+    ///
+    /// This is intentionally only a LAN-presence refresh. It grants no authority;
+    /// Targets still require a fresh Controller-signed Connector lease before use.
+    pub fn refresh_advertisement(&self, outer: &IrohOuter) -> Result<(), ConnectorDiscoveryError> {
+        let endpoint_addr = outer.addr();
+        if endpoint_addr.id != self.own_endpoint_id {
+            return Err(ConnectorDiscoveryError::EndpointIdentityChanged);
+        }
+        self.publish_endpoint_addr(&endpoint_addr)
+    }
+
+    fn publish_endpoint_addr(
+        &self,
+        endpoint_addr: &EndpointAddr,
+    ) -> Result<(), ConnectorDiscoveryError> {
+        let advertisement = ConnectorDiscoveryAdvertisement {
+            site_tag: self.expected_site_tag,
+        };
+        let direct = EndpointData::from_iter(
+            endpoint_addr
+                .addrs
+                .iter()
+                .filter(|addr| addr.is_ip())
+                .cloned(),
+        )
+        .with_user_data(advertisement.to_user_data()?);
+        self.mdns.publish(&direct);
+        Ok(())
     }
 
     pub async fn subscribe(&self) -> ConnectorDiscoveryEvents {
@@ -228,6 +252,8 @@ pub enum ConnectorDiscoveryError {
     InvalidAdvertisement,
     #[error("connector discovery advertisement exceeds the iroh user-data bound")]
     AdvertisementTooLarge,
+    #[error("mDNS advertisement refresh used a different iroh EndpointId")]
+    EndpointIdentityChanged,
     #[error("iroh mDNS discovery failed: {0}")]
     Mdns(String),
     #[error("iroh connector discovery failed: {0}")]
@@ -276,6 +302,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn advertisement_refresh_is_bound_to_original_endpoint_identity() {
+        let controller_id = ControllerId::from_bytes([45_u8; 16]).unwrap();
+        let site_id = SiteId::from_bytes([46_u8; 16]).unwrap();
+        let first_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let second_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let discovery =
+            MdnsConnectorDiscovery::attach(&first_outer, controller_id, site_id, true).unwrap();
+        discovery.refresh_advertisement(&first_outer).unwrap();
+        assert!(matches!(
+            discovery.refresh_advertisement(&second_outer),
+            Err(ConnectorDiscoveryError::EndpointIdentityChanged)
+        ));
+        first_outer.close().await;
+        second_outer.close().await;
+    }
+
     #[ignore = "requires working multicast mDNS on the test network"]
     #[tokio::test]
     async fn real_mdns_discovers_only_same_site_and_connects() {
@@ -295,9 +338,10 @@ mod tests {
             MdnsConnectorDiscovery::attach(&wrong_outer, controller_id, wrong_site, true).unwrap();
 
         let helper_outer = IrohOuter::bind_direct_only().await.unwrap();
-        let _helper =
+        let helper =
             MdnsConnectorDiscovery::attach(&helper_outer, controller_id, wanted_site, true)
                 .unwrap();
+        helper.refresh_advertisement(&helper_outer).unwrap();
 
         let candidate = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

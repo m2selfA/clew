@@ -31,6 +31,7 @@ const ACTIVE_MEMBER_PATH_WINDOW: Duration = Duration::from_secs(20);
 const MAX_CONCURRENT_CONNECTOR_DIALS: usize = 4;
 const MAX_CONNECTOR_CANDIDATES_PER_WINDOW: usize = 32;
 const CONNECTOR_CANDIDATE_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+const CONNECTOR_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 pub async fn complete_networked_activation(
     layout: &StateLayout,
@@ -736,6 +737,25 @@ async fn serve_networked_membership_with_outer(
     service: &Option<HostReadService>,
     layout: Option<&StateLayout>,
 ) -> Result<(), HostRemoteError> {
+    serve_networked_membership_with_outer_timing(
+        membership,
+        outer,
+        endpoint,
+        service,
+        layout,
+        CONNECTOR_PRESENCE_REFRESH_INTERVAL,
+    )
+    .await
+}
+
+async fn serve_networked_membership_with_outer_timing(
+    membership: &HostMembership,
+    outer: &IrohOuter,
+    endpoint: EndpointAddr,
+    service: &Option<HostReadService>,
+    layout: Option<&StateLayout>,
+    presence_refresh_interval: Duration,
+) -> Result<(), HostRemoteError> {
     let (mut stream, outer_path) = connect_member_stream(
         layout,
         outer,
@@ -754,6 +774,7 @@ async fn serve_networked_membership_with_outer(
         membership.device.capabilities.connector && outer_path == MemberOuterPath::Direct;
     let mut connector_discovery = None;
     let mut connector_lease = None;
+    let mut presence_refresh_at = Instant::now() + Duration::from_secs(24 * 60 * 60);
     let renew_at = if connector {
         let message = inner.recv(&mut stream).await?;
         let lease = SignedConnectorLease::from_message(&message)?;
@@ -776,16 +797,9 @@ async fn serve_networked_membership_with_outer(
             membership.marker.site_id,
             true,
         )?);
-        if let Some(layout) = layout
-            && let Ok(file) = NearbyConnectorFile::from_helper(outer.addr(), lease.clone())
-        {
-            let _ = NearbyConnectorStore::new(layout.clone()).save_export(
-                &file,
-                &membership.marker.controller,
-                membership.marker.site_id,
-            );
-        }
+        save_connector_export(layout, membership, outer, &lease);
         connector_lease = Some(lease);
+        presence_refresh_at = Instant::now() + presence_refresh_interval;
         Instant::now() + Duration::from_millis(renew_in_ms)
     } else {
         Instant::now() + Duration::from_secs(24 * 60 * 60)
@@ -841,6 +855,23 @@ async fn serve_networked_membership_with_outer(
                     return Err(HostRemoteError::ConnectorTask(error.to_string()));
                 }
             }
+            _ = tokio::time::sleep_until(presence_refresh_at), if connector => {
+                let discovery = connector_discovery
+                    .as_ref()
+                    .ok_or(HostRemoteError::MissingConnectorLease)?;
+                let lease = connector_lease
+                    .as_ref()
+                    .ok_or(HostRemoteError::MissingConnectorLease)?;
+                lease.verify_for_candidate(
+                    &membership.marker.controller,
+                    membership.marker.site_id,
+                    outer.addr().id,
+                    unix_ms()?,
+                )?;
+                discovery.refresh_advertisement(outer)?;
+                save_connector_export(layout, membership, outer, lease);
+                presence_refresh_at = Instant::now() + presence_refresh_interval;
+            }
             _ = tokio::time::sleep_until(renew_at), if connector => {
                 drop(connector_discovery.take());
                 tunnels.abort_all();
@@ -849,6 +880,25 @@ async fn serve_networked_membership_with_outer(
             }
         }
     }
+}
+
+fn save_connector_export(
+    layout: Option<&StateLayout>,
+    membership: &HostMembership,
+    outer: &IrohOuter,
+    lease: &SignedConnectorLease,
+) {
+    let Some(layout) = layout else {
+        return;
+    };
+    let Ok(file) = NearbyConnectorFile::from_helper(outer.addr(), lease.clone()) else {
+        return;
+    };
+    let _ = NearbyConnectorStore::new(layout.clone()).save_export(
+        &file,
+        &membership.marker.controller,
+        membership.marker.site_id,
+    );
 }
 
 async fn serve_one_connector_tunnel(
@@ -1086,6 +1136,165 @@ mod tests {
             .expect("activation retry ignored shutdown")
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn connector_presence_timer_republishes_export_without_session_reconnect() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path().join("presence-state"));
+        let controller = ControllerIdentity::from_secret([107_u8; 32]);
+        let controller_public = controller.public_identity();
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let now = unix_ms().unwrap();
+        let mut registry = EnrollmentRegistry::new(
+            controller.controller_id(),
+            PermissionGrant::EXECUTE_READ_CONNECTOR,
+        );
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Presence Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+                    not_before_unix_ms: now.saturating_sub(1_000),
+                    expires_unix_ms: now + 120_000,
+                    deployment_window_ms: 120_000,
+                    max_claims: 1,
+                },
+            )
+            .unwrap();
+        let pending = DeviceIdentityStore::new(layout.clone())
+            .prepare_pending(controller_public, site_id, invite_id)
+            .unwrap();
+        let receipt = registry
+            .claim(&bootstrap, pending.public_identity(), now)
+            .unwrap();
+        let controller_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let controller_addr = controller_outer.addr();
+        let host_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let membership = HostMembershipStore::new(layout.clone())
+            .activate_networked(
+                crate::ClientFlavor::clew_original_current(),
+                None,
+                "Presence Lab",
+                &pending,
+                &receipt,
+                "PRESENCE-HELPER",
+                controller_addr.clone(),
+                ReadPolicy::new(
+                    vec![temp.path().to_string_lossy().into_owned()],
+                    4_096,
+                    2_000,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        registry
+            .finalize_host_persist(invite_id, receipt.device_id, receipt.persist_ack_token())
+            .unwrap();
+        DeviceIdentityStore::new(layout.clone())
+            .confirm_controller_activation(controller.controller_id(), site_id, receipt.device_id)
+            .unwrap();
+
+        let expected_device = membership.identity.public_identity();
+        let expected_device_id = membership.marker.device_id;
+        let expected_endpoint_id = host_outer.addr().id;
+        let (controller_release_tx, controller_release_rx) = tokio::sync::oneshot::channel();
+        let controller_task = tokio::spawn({
+            let controller_outer = controller_outer.clone();
+            let controller = controller.clone();
+            async move {
+                let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::InnerSession);
+                assert_eq!(stream.connection().remote_id(), expected_endpoint_id);
+                let mut inner = InnerSession::accept(
+                    &mut stream,
+                    clew_transport::ControllerSessionIdentity {
+                        identity: controller.clone(),
+                        noise_static_secret: [108_u8; 32],
+                        expected_device,
+                        device_id: expected_device_id,
+                        site_id,
+                    },
+                )
+                .await
+                .unwrap();
+                let lease = SignedConnectorLease::issue(
+                    &controller,
+                    site_id,
+                    expected_device_id,
+                    expected_endpoint_id,
+                    now.saturating_sub(1_000),
+                    now + 60_000,
+                )
+                .unwrap();
+                inner
+                    .send(&mut stream, &lease.into_message().unwrap())
+                    .await
+                    .unwrap();
+                let _ = controller_release_rx.await;
+            }
+        });
+
+        let host_task = tokio::spawn({
+            let layout = layout.clone();
+            let membership = membership.clone();
+            let host_outer = host_outer.clone();
+            let controller_addr = controller_addr.clone();
+            async move {
+                serve_networked_membership_with_outer_timing(
+                    &membership,
+                    &host_outer,
+                    controller_addr,
+                    &None,
+                    Some(&layout),
+                    Duration::from_millis(100),
+                )
+                .await
+            }
+        });
+
+        let export_path = layout.nearby_connector_export_path(controller.controller_id(), site_id);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !export_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial Connector export was not created");
+        std::fs::remove_file(&export_path).unwrap();
+        assert!(!export_path.exists());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !export_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("presence refresh timer did not recreate the Connector export");
+        let refreshed = NearbyConnectorStore::new(layout.clone())
+            .load_export(&controller_public, site_id)
+            .unwrap()
+            .expect("refreshed Connector export did not verify");
+        assert_eq!(refreshed.candidate.id, expected_endpoint_id);
+        assert_eq!(
+            refreshed.lease.payload.connector_device_id,
+            expected_device_id
+        );
+
+        let _ = controller_release_tx.send(());
+        controller_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), host_task)
+            .await
+            .expect("Host session did not notice Controller close after presence test")
+            .unwrap()
+            .expect_err("single-session helper unexpectedly stayed alive after Controller close");
+        host_outer.close().await;
+        controller_outer.close().await;
     }
 
     #[test]

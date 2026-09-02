@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE；V1.5d-1 bounded concurrent helper selection DONE；V1.5d-2 Helper-A→Helper-B active session failover DONE；当前进入 V1.5d-3 suspend/resume presence refresh）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE；V1.5d-1 concurrent selection DONE；V1.5d-2 Helper failover DONE；V1.5d-3 resume presence refresh DONE；当前做 V1.5 final gap audit）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -673,6 +673,22 @@ Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-target
 Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **137 passed / 0 failed / 6 ignored**（interactive Windows GUI、4 个显式 multicast integration、public n0 relay）。
 
 下一块 V1.5d-3：刷新独立 LAN presence，使 helper 在系统 resume / 接口变化后用当前 `outer.addr()` 重建 mDNS advertisement 和 export hint；不伪造“睡眠”状态，没有 OS suspend event 时 UI 仍只显示 offline/reconnecting。
+
+### V1.5d-3 — Resume / interface-change LAN presence refresh
+
+**Status：DONE（2026-09-03）**
+
+实际落地：
+
+- Connector direct session 拿到 Controller-signed lease 后，除了原有 lease-renewal deadline，再维护 **30 秒 LAN presence refresh**；refresh 不关闭当前 Controller InnerSession、不终止正在转发的 tunnels，也不制造新的业务协议；
+- Clew 自己的 `MdnsConnectorDiscovery` 新增 current-address republish：每次从当前 `outer.addr()` 重新提取 direct-IP hints 并保留 same-Site tag。publisher 与创建时的 iroh EndpointId 强绑定；若拿另一个 EndpointId 刷旧 publisher，直接 `EndpointIdentityChanged` fail closed，避免把旧 lease/presence 错绑到新 transport identity；
+- 同一个 tick 同步刷新 per-Site nearby export，因此睡眠恢复、Wi-Fi/接口切换后用户新保存的 fallback 会拿当前 direct hints。export 失败仍是 best-effort，不反向杀死已认证 Controller session；真正 Helper 使用前仍必须验证 fresh lease；
+- 不伪造 OS 电源语义：Clew 没收到真实 suspend event 时 GUI 仍只说 offline/reconnecting。若睡眠导致 Controller connection 断开，V1.5c 的长期 retry 重建 session；若连接仍存活但 LAN 地址变化，presence timer republish 当前 hints；通用 task/session resume 仍保留给 V3 reliability；
+- 自动 timer integration 使用真实 direct Controller↔Helper InnerSession，只签发一次 lease并保持 session 不动：初始 export 生成后测试手工删除它，100 ms test tick 自动重建并通过 Controller/Site/EndpointId/device 验证，**1/1 PASS（0.53s）**；transport EndpointId binding focused **1/1 PASS（0.16s）**；cap00 real-mDNS integration 在显式 republish 后仍完成 same-Site discovery + Connector ping/pong，**1/1 PASS（1.13s）**。
+
+Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **139 passed / 0 failed / 6 ignored**（interactive Windows GUI、4 个显式 multicast integration、public n0 relay）。
+
+下一步：V1.5 final gap audit，确认 helper-only friend-facing 分发入口、最终跨平台/两机证据与文档一致后再决定整体封板；不把 V2/V3 的 agent tools/task-resume 工作提前塞回 V1.5。
 
 计划：
 
