@@ -19,9 +19,10 @@ pub use naming::{
     HostNamingError, apply_hostname_collision_policy, normalize_hostname, observed_hostname,
 };
 pub use outfit::{
-    MAX_OUTFIT_ENCODED_BYTES, OUTFIT_SCHEMA_VERSION, OutfitAssetRef, OutfitDistributionCopy,
-    OutfitError, OutfitIdentity, OutfitPreset, OutfitProfile, OutfitStrings, OutfitVisuals,
-    SurfaceStyle,
+    MAX_OUTFIT_ASSET_BYTES, MAX_OUTFIT_ENCODED_BYTES, OUTFIT_SCHEMA_VERSION, OutfitAssetRef,
+    OutfitDistributionCopy, OutfitError, OutfitIdentity, OutfitPreset, OutfitProfile,
+    OutfitStrings, OutfitVisuals, SurfaceStyle, outfit_asset_id_for_bytes,
+    verify_outfit_asset_bytes,
 };
 pub use read::HostReadService;
 pub use remote::{
@@ -30,7 +31,7 @@ pub use remote::{
 };
 pub use runtime::{
     HostLaunchContext, HostLaunchError, HostLaunchState, HostSiteSource, MissingInviteView,
-    detect_archive_temp_launch, resolve_host_launch,
+    cached_outfit_asset_path, detect_archive_temp_launch, resolve_host_launch,
 };
 pub use selection::{DeviceSelectionError, select_executable_device};
 pub use site::{

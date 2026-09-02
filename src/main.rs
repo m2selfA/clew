@@ -5,18 +5,21 @@ mod gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod host_gui;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, Subcommand};
 use clew_core::{DeviceId, InviteId};
 use clew_host::{
-    HostInstanceStart, HostLaunchContext, HostLaunchState, OutfitPreset, acquire_host_instance,
-    complete_networked_activation, resolve_host_launch, serve_networked_membership_until,
+    HostInstanceStart, HostLaunchContext, HostLaunchState, OutfitPreset, SignedSiteClew,
+    acquire_host_instance, complete_networked_activation, resolve_host_launch,
+    serve_networked_membership_until, verify_outfit_asset_bytes,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
-    OutfitCloneRequest, OutfitCreateRequest, OutfitSetFieldRequest, RemoteReadRequest,
-    restore_controller_backup, start_controller,
+    OutfitAssetFormat, OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest,
+    OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteReadRequest, restore_controller_backup,
+    start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -206,6 +209,25 @@ enum OutfitCommand {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
+    /// List imported content-addressed Outfit assets.
+    Assets {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Import one bounded PNG or SVG asset into the Controller-owned asset store.
+    ImportAsset {
+        path: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Bind one imported asset to app-icon, tray-icon, logo, or key-visual.
+    SetAsset {
+        outfit_id: String,
+        slot: String,
+        asset_id: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
     /// Set the Outfit selected by default for future invitation workflows.
     SetDefault {
         outfit_id: String,
@@ -289,7 +311,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .checked_mul(60 * 60 * 1_000)
                 .ok_or("deployment window is too large")?;
             let config = controller_config(state_dir)?;
-            let result = LocalApiClient::new(config)
+            let client = LocalApiClient::new(config);
+            let result = client
                 .invite_issue(InviteIssueRequest {
                     site_name,
                     outfit_id: outfit,
@@ -309,6 +332,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             {
                 std::fs::create_dir_all(parent)?;
             }
+            write_invite_outfit_assets(&client, &result.site_file, &output).await?;
             result.site_file.write(&output)?;
             println!("{}", output.display());
         }
@@ -419,6 +443,86 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn write_invite_outfit_assets(
+    client: &LocalApiClient,
+    site_file: &SignedSiteClew,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(profile) = &site_file.payload.outfit_profile else {
+        return Ok(());
+    };
+    let asset_ids = profile.imported_asset_ids();
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+    let kit_root = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let assets_root = kit_root.join("outfit-assets");
+    std::fs::create_dir_all(&assets_root)?;
+    for asset_id in asset_ids {
+        let asset = client.outfit_asset_get(asset_id.clone()).await?;
+        if asset.info.asset_id != asset_id {
+            return Err("controller returned a different Outfit asset id".into());
+        }
+        let bytes = BASE64_STANDARD.decode(asset.data_base64.as_bytes())?;
+        if usize::try_from(asset.info.byte_len).ok() != Some(bytes.len()) {
+            return Err("controller returned inconsistent Outfit asset length".into());
+        }
+        verify_outfit_asset_bytes(&asset_id, &bytes)?;
+        let extension = match asset.info.format {
+            OutfitAssetFormat::Png => "png",
+            OutfitAssetFormat::Svg => "svg",
+        };
+        write_invite_asset_atomically(&assets_root, &asset_id, extension, &bytes)?;
+    }
+    Ok(())
+}
+
+fn write_invite_asset_atomically(
+    root: &std::path::Path,
+    asset_id: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = root.join(format!("{asset_id}.{extension}"));
+    if target.exists() {
+        let existing = std::fs::read(&target)?;
+        verify_outfit_asset_bytes(asset_id, &existing)?;
+        return Ok(());
+    }
+    let temp = root.join(format!(
+        ".{asset_id}.{extension}.{}.tmp",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    match std::fs::rename(&temp, &target) {
+        Ok(()) => Ok(()),
+        Err(error) if target.exists() => {
+            let _ = std::fs::remove_file(&temp);
+            let existing = std::fs::read(&target)?;
+            verify_outfit_asset_bytes(asset_id, &existing)?;
+            let _ = error;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error.into())
+        }
+    }
+}
+
 async fn run_outfit_command(command: OutfitCommand) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         OutfitCommand::List { state_dir } => {
@@ -477,6 +581,37 @@ async fn run_outfit_command(command: OutfitCommand) -> Result<(), Box<dyn std::e
                     outfit_id,
                     field,
                     value,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        OutfitCommand::Assets { state_dir } => {
+            let assets = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_asset_list()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&assets)?);
+        }
+        OutfitCommand::ImportAsset { path, state_dir } => {
+            let path = path
+                .to_str()
+                .ok_or("asset path must be valid UTF-8")?
+                .to_owned();
+            let asset = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_asset_import(OutfitAssetImportRequest { path })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&asset)?);
+        }
+        OutfitCommand::SetAsset {
+            outfit_id,
+            slot,
+            asset_id,
+            state_dir,
+        } => {
+            let profile = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_set_asset(OutfitSetAssetRequest {
+                    outfit_id,
+                    slot,
+                    asset_id,
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&profile)?);

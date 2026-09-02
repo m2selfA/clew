@@ -6,11 +6,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
 use clew_core::{
     ActivityEvent, ActivityResult, ControllerId, ControllerSiteRecord, DeviceId, DeviceRecord,
     DeviceSummary, InviteId, ReadPolicy, SiteId, StateLayout,
 };
-use clew_host::{HostRoleHint, OutfitPreset, OutfitProfile, SignedSiteClew};
+use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
 use clew_transport::{IrohOuter, ReadErrorCode, ReadReply, ReadRequest};
 use serde::{Deserialize, Serialize};
@@ -22,8 +24,8 @@ use tokio::{
 };
 
 use crate::{
-    ControllerConfig, ControllerControlStore, LocalEndpoint, OutfitLibrary, OutfitLibraryEntry,
-    RemoteHub, export_controller_backup, transport,
+    ControllerConfig, ControllerControlStore, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore,
+    OutfitLibrary, OutfitLibraryEntry, RemoteHub, export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -33,6 +35,7 @@ const LOCAL_API_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_API_RESPONSE_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_ACTIVITY_LIST_LIMIT: u32 = 200;
 const MAX_BACKUP_PATH_BYTES: usize = 4096;
+const MAX_ASSET_IMPORT_PATH_BYTES: usize = 4096;
 const SECRET_BYTES: usize = 32;
 const SECRET_HEX_LEN: usize = SECRET_BYTES * 2;
 const SECRET_LOAD_RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -141,6 +144,29 @@ pub struct OutfitSetFieldRequest {
     pub value: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitAssetImportRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitSetAssetRequest {
+    pub outfit_id: String,
+    pub slot: String,
+    pub asset_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitAssetList {
+    pub assets: Vec<OutfitAssetInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitAssetDataResponse {
+    pub info: OutfitAssetInfo,
+    pub data_base64: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalApiErrorCode {
@@ -236,6 +262,7 @@ pub(crate) struct LocalApiState {
     pub controller_outer: Option<IrohOuter>,
     pub control: Arc<Mutex<ControllerControlStore>>,
     pub outfits: Arc<Mutex<OutfitLibrary>>,
+    pub outfit_assets: Arc<Mutex<OutfitAssetStore>>,
     pub remote: RemoteHub,
     pub shutdown_tx: watch::Sender<bool>,
 }
@@ -278,6 +305,12 @@ enum LocalMethod {
         outfit_id: String,
     },
     OutfitSetField(OutfitSetFieldRequest),
+    OutfitAssetList,
+    OutfitAssetImport(OutfitAssetImportRequest),
+    OutfitAssetGet {
+        asset_id: String,
+    },
+    OutfitSetAsset(OutfitSetAssetRequest),
     BackupExport(BackupExportRequest),
     RecoveryStatus,
     RecoveryConfirm,
@@ -296,6 +329,9 @@ enum LocalResponse {
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
+    OutfitAssetList(OutfitAssetList),
+    OutfitAssetInfo(OutfitAssetInfo),
+    OutfitAssetData(OutfitAssetDataResponse),
     RecoveryStatus(RecoveryStatus),
     Ack,
     Error(LocalApiErrorBody),
@@ -486,6 +522,44 @@ async fn dispatch(
             })
             .map(LocalResponse::OutfitProfile)
             .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitAssetList => {
+            let response = with_outfit_assets(state, |store| store.list())
+                .map(|assets| LocalResponse::OutfitAssetList(OutfitAssetList { assets }))
+                .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitAssetImport(request) => {
+            let response = outfit_asset_import_response(state, request);
+            (response, false)
+        }
+        LocalMethod::OutfitAssetGet { asset_id } => {
+            let response = with_outfit_assets(state, |store| store.read(&asset_id))
+                .map(|asset| {
+                    LocalResponse::OutfitAssetData(OutfitAssetDataResponse {
+                        info: asset.info,
+                        data_base64: BASE64_STANDARD.encode(asset.bytes),
+                    })
+                })
+                .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitSetAsset(request) => {
+            let response = match with_outfit_assets(state, |store| store.read(&request.asset_id)) {
+                Ok(_) => with_outfits(state, |store| {
+                    store.set_asset(
+                        &request.outfit_id,
+                        &request.slot,
+                        OutfitAssetRef::Imported {
+                            asset_id: request.asset_id,
+                        },
+                    )
+                })
+                .map(LocalResponse::OutfitProfile)
+                .unwrap_or_else(LocalResponse::Error),
+                Err(error) => LocalResponse::Error(error),
+            };
             (response, false)
         }
         LocalMethod::BackupExport(request) => (backup_export_response(state, request).await, false),
@@ -788,6 +862,36 @@ fn with_control<R>(
     })
 }
 
+fn outfit_asset_import_response(
+    state: &LocalApiState,
+    request: OutfitAssetImportRequest,
+) -> LocalResponse {
+    let path = request.path.trim();
+    if path.is_empty() || path.len() > MAX_ASSET_IMPORT_PATH_BYTES {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            "asset import path is empty or too long",
+        );
+    }
+    with_outfit_assets(state, |store| store.import_path(Path::new(path)))
+        .map(LocalResponse::OutfitAssetInfo)
+        .unwrap_or_else(LocalResponse::Error)
+}
+
+fn with_outfit_assets<R>(
+    state: &LocalApiState,
+    operation: impl FnOnce(&OutfitAssetStore) -> Result<R, crate::OutfitAssetError>,
+) -> Result<R, LocalApiErrorBody> {
+    let store = state.outfit_assets.lock().map_err(|_| LocalApiErrorBody {
+        code: LocalApiErrorCode::Internal,
+        message: "outfit asset store is unavailable".into(),
+    })?;
+    operation(&store).map_err(|error| LocalApiErrorBody {
+        code: LocalApiErrorCode::InvalidRequest,
+        message: error.to_string(),
+    })
+}
+
 fn with_outfits<R>(
     state: &LocalApiState,
     operation: impl FnOnce(&mut OutfitLibrary) -> Result<R, crate::OutfitStoreError>,
@@ -983,6 +1087,53 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn outfit_asset_list(&self) -> Result<OutfitAssetList, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitAssetList).await? {
+            LocalResponse::OutfitAssetList(result) => Ok(result),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_asset_import(
+        &self,
+        request: OutfitAssetImportRequest,
+    ) -> Result<OutfitAssetInfo, LocalApiClientError> {
+        match self
+            .request(LocalMethod::OutfitAssetImport(request))
+            .await?
+        {
+            LocalResponse::OutfitAssetInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_asset_get(
+        &self,
+        asset_id: String,
+    ) -> Result<OutfitAssetDataResponse, LocalApiClientError> {
+        match self
+            .request(LocalMethod::OutfitAssetGet { asset_id })
+            .await?
+        {
+            LocalResponse::OutfitAssetData(data) => Ok(data),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_set_asset(
+        &self,
+        request: OutfitSetAssetRequest,
+    ) -> Result<OutfitProfile, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitSetAsset(request)).await? {
+            LocalResponse::OutfitProfile(profile) => Ok(profile),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn backup_export(
         &self,
         request: BackupExportRequest,
@@ -1171,7 +1322,12 @@ mod tests {
             control: Arc::new(Mutex::new(
                 ControllerControlStore::load_or_create(layout.clone(), controller_id).unwrap(),
             )),
-            outfits: Arc::new(Mutex::new(OutfitLibrary::load_or_create(layout).unwrap())),
+            outfits: Arc::new(Mutex::new(
+                OutfitLibrary::load_or_create(layout.clone()).unwrap(),
+            )),
+            outfit_assets: Arc::new(Mutex::new(
+                OutfitAssetStore::load_or_create(layout).unwrap(),
+            )),
             remote: RemoteHub::default(),
             shutdown_tx: watch::channel(false).0,
         }
@@ -1197,6 +1353,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn maximum_asset_data_response_stays_within_local_api_frame_bound() {
+        let bytes = vec![0_u8; crate::MAX_OUTFIT_ASSET_BYTES];
+        let response = LocalResponse::OutfitAssetData(OutfitAssetDataResponse {
+            info: OutfitAssetInfo {
+                asset_id: format!("sha256-{}", "a".repeat(64)),
+                format: crate::OutfitAssetFormat::Png,
+                byte_len: u32::try_from(bytes.len()).unwrap(),
+                width: 2048,
+                height: 2048,
+            },
+            data_base64: BASE64_STANDARD.encode(bytes),
+        });
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= MAX_LOCAL_API_FRAME_SIZE);
     }
 
     #[tokio::test]

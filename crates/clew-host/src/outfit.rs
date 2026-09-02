@@ -1,10 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const OUTFIT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_OUTFIT_ENCODED_BYTES: usize = 256 * 1024;
+pub const MAX_OUTFIT_ASSET_BYTES: usize = 512 * 1024;
+const OUTFIT_BUILD_CACHE_DOMAIN: &[u8] = b"clew/outfit-build-cache/v1\0";
 const MAX_ID_BYTES: usize = 64;
 const MAX_NAME_BYTES: usize = 96;
 const MAX_TEMPLATE_BYTES: usize = 160;
@@ -271,6 +274,24 @@ impl OutfitProfile {
         Ok(encoded)
     }
 
+    pub fn build_cache_key(&self) -> Result<String, OutfitError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > MAX_OUTFIT_ENCODED_BYTES {
+            return Err(OutfitError::EncodedTooLarge(encoded.len()));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(OUTFIT_BUILD_CACHE_DOMAIN);
+        hasher.update(encoded);
+        let digest = hasher.finalize();
+        let mut key = String::from("outfit-v1-");
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(key, "{byte:02x}");
+        }
+        Ok(key)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, OutfitError> {
         if bytes.len() > MAX_OUTFIT_ENCODED_BYTES {
             return Err(OutfitError::EncodedTooLarge(bytes.len()));
@@ -521,18 +542,73 @@ fn validate_color(value: &str) -> Result<(), OutfitError> {
     Ok(())
 }
 
+impl OutfitProfile {
+    #[must_use]
+    pub fn imported_asset_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        for asset in [
+            Some(&self.visuals.app_icon),
+            self.visuals.tray_icon_base.as_ref(),
+            self.visuals.logo.as_ref(),
+            self.visuals.key_visual.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let OutfitAssetRef::Imported { asset_id } = asset {
+                ids.insert(asset_id.clone());
+            }
+        }
+        ids.into_iter().collect()
+    }
+}
+
+#[must_use]
+pub fn outfit_asset_id_for_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut value = String::with_capacity(71);
+    value.push_str("sha256-");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+pub fn verify_outfit_asset_bytes(asset_id: &str, bytes: &[u8]) -> Result<(), OutfitError> {
+    if bytes.is_empty() || bytes.len() > MAX_OUTFIT_ASSET_BYTES {
+        return Err(OutfitError::InvalidAssetBytes(bytes.len()));
+    }
+    if outfit_asset_id_for_bytes(bytes) != asset_id {
+        return Err(OutfitError::AssetHashMismatch(asset_id.into()));
+    }
+    Ok(())
+}
+
 fn validate_asset(asset: &OutfitAssetRef) -> Result<(), OutfitError> {
-    let value = match asset {
-        OutfitAssetRef::BuiltIn { key } => key,
-        OutfitAssetRef::Imported { asset_id } => asset_id,
-    };
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(OutfitError::InvalidAssetRef(value.clone()));
+    match asset {
+        OutfitAssetRef::BuiltIn { key } => {
+            if key.is_empty()
+                || key.len() > 128
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(OutfitError::InvalidAssetRef(key.clone()));
+            }
+        }
+        OutfitAssetRef::Imported { asset_id } => {
+            let Some(hex) = asset_id.strip_prefix("sha256-") else {
+                return Err(OutfitError::InvalidAssetRef(asset_id.clone()));
+            };
+            if hex.len() != 64
+                || !hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(OutfitError::InvalidAssetRef(asset_id.clone()));
+            }
+        }
     }
     Ok(())
 }
@@ -557,6 +633,10 @@ pub enum OutfitError {
     InvalidResourceKey(String),
     #[error("invalid outfit asset reference {0:?}")]
     InvalidAssetRef(String),
+    #[error("outfit asset payload is empty or too large: {0} bytes")]
+    InvalidAssetBytes(usize),
+    #[error("outfit asset bytes do not match signed content id {0:?}")]
+    AssetHashMismatch(String),
     #[error("outfit has too many locales: {0}")]
     TooManyLocales(usize),
     #[error("outfit locale {locale:?} has too many string resources: {count}")]
@@ -599,6 +679,24 @@ mod tests {
             profile.resolve_resource("fr-CA", KEY_EXIT_AND_DISCONNECT),
             "Exit and disconnect"
         );
+    }
+
+    #[test]
+    fn build_cache_key_is_stable_and_changes_with_profile_content() {
+        let profile = OutfitProfile::preset(OutfitPreset::ResearchLab);
+        assert_eq!(
+            profile.build_cache_key().unwrap(),
+            profile.clone().build_cache_key().unwrap()
+        );
+        let mut changed = profile.clone();
+        changed.visuals.primary_color = "#123456".into();
+        assert_ne!(
+            profile.build_cache_key().unwrap(),
+            changed.build_cache_key().unwrap()
+        );
+        let key = profile.build_cache_key().unwrap();
+        assert!(key.starts_with("outfit-v1-"));
+        assert_eq!(key.len(), 74);
     }
 
     #[test]

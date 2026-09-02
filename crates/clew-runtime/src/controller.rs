@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     ControllerConfig, ControllerControlStore, LocalApiClient, LocalApiClientError,
-    MAX_REMOTE_CONNECTIONS, OutfitLibrary, RemoteHub, handle_remote_connection,
+    MAX_REMOTE_CONNECTIONS, OutfitAssetStore, OutfitLibrary, RemoteHub, handle_remote_connection,
     local_api::{
         ControllerStatus, LocalApiSecret, LocalApiState, MAX_LOCAL_API_CONNECTIONS,
         serve_connection,
@@ -163,6 +163,9 @@ pub async fn start_controller(
         controller_id,
     )?));
     let outfits = Arc::new(Mutex::new(OutfitLibrary::load_or_create(layout.clone())?));
+    let outfit_assets = Arc::new(Mutex::new(OutfitAssetStore::load_or_create(
+        layout.clone(),
+    )?));
     let remote = IrohOuter::bind_with_secret(controller_identity.iroh_endpoint_secret()).await?;
     let remote_endpoint_id = remote.addr().id.to_string();
     let remote_hub = RemoteHub::default();
@@ -191,6 +194,7 @@ pub async fn start_controller(
         controller_outer: Some(remote.clone()),
         control,
         outfits,
+        outfit_assets,
         remote: remote_hub,
         shutdown_tx,
     });
@@ -218,6 +222,8 @@ pub enum ControllerError {
     ControlStore(#[from] crate::ControlStoreError),
     #[error(transparent)]
     OutfitStore(#[from] crate::OutfitStoreError),
+    #[error(transparent)]
+    OutfitAsset(#[from] crate::OutfitAssetError),
     #[error(transparent)]
     RemoteTransport(#[from] clew_transport::IrohOuterError),
     #[error("remote accept loop stopped unexpectedly")]

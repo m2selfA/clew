@@ -8,7 +8,7 @@ use std::{
 use clew_core::{
     MAX_STATE_DOCUMENT_SIZE, StateCodecError, StateLayout, decode_state_json, encode_state_json,
 };
-use clew_host::{OutfitError, OutfitPreset, OutfitProfile};
+use clew_host::{OutfitAssetRef, OutfitError, OutfitPreset, OutfitProfile};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -286,6 +286,46 @@ impl OutfitLibrary {
         })
     }
 
+    pub fn set_asset(
+        &mut self,
+        outfit_id: &str,
+        slot: &str,
+        asset: OutfitAssetRef,
+    ) -> Result<OutfitProfile, OutfitStoreError> {
+        if preset_by_id(outfit_id).is_some() {
+            return Err(OutfitStoreError::BuiltInIsReadOnly(outfit_id.into()));
+        }
+        let outfit_id = outfit_id.to_owned();
+        let slot = slot.to_owned();
+        self.transaction(move |snapshot| {
+            let profile = snapshot
+                .custom
+                .get_mut(&outfit_id)
+                .ok_or_else(|| OutfitStoreError::UnknownOutfit(outfit_id.clone()))?;
+            let changed = match slot.as_str() {
+                "app-icon" => replace_asset_if_changed(&mut profile.visuals.app_icon, asset),
+                "tray-icon" => replace_optional_asset_if_changed(
+                    &mut profile.visuals.tray_icon_base,
+                    Some(asset),
+                ),
+                "logo" => replace_optional_asset_if_changed(&mut profile.visuals.logo, Some(asset)),
+                "key-visual" => {
+                    replace_optional_asset_if_changed(&mut profile.visuals.key_visual, Some(asset))
+                }
+                _ => return Err(OutfitStoreError::UnsupportedAssetSlot(slot.clone())),
+            };
+            if changed {
+                profile.revision = profile
+                    .revision
+                    .checked_add(1)
+                    .ok_or(OutfitStoreError::RevisionOverflow)?;
+            }
+            profile.validate()?;
+            snapshot.recent_outfit_id = Some(profile.outfit_id.clone());
+            Ok(profile.clone())
+        })
+    }
+
     fn entry_for(&self, profile: &OutfitProfile, built_in: bool) -> OutfitLibraryEntry {
         OutfitLibraryEntry {
             outfit_id: profile.outfit_id.clone(),
@@ -337,6 +377,25 @@ fn preset_by_id(id: &str) -> Option<OutfitPreset> {
 }
 
 fn replace_if_changed(target: &mut String, value: String) -> bool {
+    if target == &value {
+        return false;
+    }
+    *target = value;
+    true
+}
+
+fn replace_asset_if_changed(target: &mut OutfitAssetRef, value: OutfitAssetRef) -> bool {
+    if target == &value {
+        return false;
+    }
+    *target = value;
+    true
+}
+
+fn replace_optional_asset_if_changed(
+    target: &mut Option<OutfitAssetRef>,
+    value: Option<OutfitAssetRef>,
+) -> bool {
     if target == &value {
         return false;
     }
@@ -438,6 +497,8 @@ pub enum OutfitStoreError {
     UnknownOutfit(String),
     #[error("built-in outfit {0:?} is read-only; clone it before editing")]
     BuiltInIsReadOnly(String),
+    #[error("unsupported outfit asset slot {0:?}")]
+    UnsupportedAssetSlot(String),
     #[error("unsupported outfit field {0:?}")]
     UnsupportedField(String),
 }
@@ -495,6 +556,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edited.revision, 2);
+    }
+
+    #[test]
+    fn imported_asset_reference_updates_custom_revision_only_when_changed() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path());
+        let mut store = OutfitLibrary::load_or_create(layout).unwrap();
+        store
+            .create_from_preset("lab".into(), "Lab".into(), OutfitPreset::ResearchLab)
+            .unwrap();
+        let asset = OutfitAssetRef::Imported {
+            asset_id: format!("sha256-{}", "a".repeat(64)),
+        };
+        let updated = store.set_asset("lab", "app-icon", asset.clone()).unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.visuals.app_icon, asset);
+        let unchanged = store
+            .set_asset("lab", "app-icon", updated.visuals.app_icon.clone())
+            .unwrap();
+        assert_eq!(unchanged.revision, 2);
+        assert!(matches!(
+            store.set_asset(
+                "clew-original",
+                "app-icon",
+                OutfitAssetRef::BuiltIn { key: "x".into() }
+            ),
+            Err(OutfitStoreError::BuiltInIsReadOnly(_))
+        ));
     }
 
     #[test]

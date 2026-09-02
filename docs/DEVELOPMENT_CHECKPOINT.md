@@ -445,7 +445,7 @@ Known / release blockers：
 
 ## 7. V1.25 — Distribution Studio Foundation
 
-**Status：IN PROGRESS（V1.25a foundation/custom Site Kit vertical slice DONE；V1.25b Studio GUI/assets 待继续）**
+**Status：IN PROGRESS（V1.25a DONE；V1.25b-1 bounded asset distribution DONE；V1.25b-2 Studio GUI/live preview 待继续）**
 
 **Date：2026-09-02**
 
@@ -475,13 +475,35 @@ V1.25a validation：
 - `cargo test --workspace --all-targets`：PASS，**102 tests passed / 0 failed**；另有 Windows interactive Host GUI 与 public n0 relay 两项默认 ignored，均有既往独立 smoke 证据；
 - custom Site Kit smoke 的 Controller/Host 进程与 `%TEMP%\\clew-v125-custom-site-smoke` 临时 state 已确认清理。
 
-V1.25b 继续：
+V1.25b-1 bounded asset distribution 已落地：
 
-- PNG/SVG import + bounded asset store / app+tray asset projection；
+- Controller-owned content-addressed asset store：PNG/SVG import，单 asset 512 KiB、最多 128 个、总计 16 MiB；PNG 在 full decode 前先检查 dimensions（≤2048），SVG 使用 usvg/resvg parser、尺寸 ≤4096，并拒绝 DOCTYPE/ENTITY/script/foreignObject 与外部 href；asset id 固定为 canonical `sha256-<64 lowercase hex>`；
+- Local API/CLI 新增 `outfit assets`、`outfit import-asset`、`outfit set-asset`；资产 bytes 不写 Outfit JSON，profile 仅引用 content hash；built-in Outfit 仍 read-only，custom set-asset 仅实际变化时 revision +1；
+- `clew invite --outfit` 会先通过 Local API 拉取该 profile 实际引用的 imported assets，base64 解码后再次验证 content hash，并原子写入 sibling `outfit-assets/<asset_id>.<png|svg>`；assets 全成功后才写 `site.clew`，避免生成缺资产的已签名 sidecar；
+- Host 在处理 signed Site Kit 时先验证 sibling asset 的 signed content hash/size，再使用 create-new temp + atomic rename 写入自身 state cache；并发双击争用时只接受已出现且 hash 正确的目标；tamper/missing/双格式 ambiguity 均在 enrollment 前 fail closed；
+- membership 已持久 OutfitProfile，因此分发包移走后 custom brand 仍可定位 Host state cache；`OutfitProfile::build_cache_key()` 使用 domain-separated SHA-256 哈希 validated canonical profile，imported content id 已进入该 key，不依赖原始导入路径。
+
+V1.25b-1 acceptance evidence：
+
+- [x] 真实 CLI asset：168-byte SVG import 为 `sha256-26e592d...cf2c52`，`set-asset asset-lab logo` 使 revision 1→2，Controller restart 后 profile/reference 保留；
+- [x] 真实 asset Site Kit：`invite --outfit asset-lab` 生成一个 sibling SVG；文件名 content id 与实际 SHA-256 完全相同，`site.clew` 最后落盘；
+- [x] generic Host 使用该 kit 完成 enrollment/InnerSession，DeviceId `8425cded-...` online/executable，state 中缓存唯一 `v1/outfit-assets/<same sha>.svg`，bounded Read 返回 `CLEW-V125-ASSET-DISTRIBUTION-PROOF`；
+- [x] 停止 Host 后删除整个 kit（site.clew + sibling assets），只保留 Host state 重启：仍恢复同一 DeviceId、online/executable，第二次 Read 成功；
+- [x] focused security：正确 asset cache PASS；tampered bytes → `AssetHashMismatch`；missing asset → `MissingOutfitAsset`，均在 claim 前拒绝。
+
+V1.25b-1 validation：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**109 tests passed / 0 failed**；另 2 项默认 ignored（interactive Windows Host GUI / public relay）；
+- Runtime focused **24/24 PASS**，Host focused **26/26 PASS**；asset smoke Controller/Host 进程与 `%TEMP%\\clew-v125-asset-smoke` 已确认清理。
+
+V1.25b-2 继续：
+
 - Controller GUI Outfit library/editor；
 - live preview：主窗口 / helper / tray / Site Kit；
-- build/cache contract 与 asset revision hashing；
-- 用一套带 imported asset 的真实 Outfit 再跑 Site Kit acceptance。
+- imported PNG/SVG thumbnail/app+tray/logo/key-visual projection；
+- 用 GUI 创建/编辑一套带 imported visual asset 的真实 Outfit，再跑 Site Kit acceptance。
 
 最终 V1.25 Acceptance：从 preset 创建一套自定义 Outfit（含可选 imported visual assets）用于真实 Site Kit；朋友侧连接动作数与 Clew Original 完全相同。
 
@@ -630,13 +652,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.25 — Distribution Studio Foundation（IN PROGRESS；V1.25a DONE）**
+**Current block：V1.25 — Distribution Studio Foundation（IN PROGRESS；V1.25a + V1.25b-1 DONE）**
 
-**Next block：V1.25b — Studio GUI + bounded imported assets + live preview**
+**Next block：V1.25b-2 — Studio GUI/editor + imported-asset live preview**
 
-V1.25a 已完成 Outfit schema/presets、Controller-owned OutfitLibrary、Local API/CLI、signed custom Outfit Site Kit、runtime flavor pin、membership branded recovery 与真实 custom Site Kit Read acceptance。下一步继续 Studio GUI、PNG/SVG bounded asset store、preview/build-cache contract；不提前进入 V1.5。
+V1.25a 已完成 Outfit schema/library/custom Site Kit；V1.25b-1 已完成 bounded PNG/SVG asset store、Local API/CLI、content-addressed Site Kit distribution、Host verified state cache 与 build/cache key，并通过删除整包后的同 DeviceId/Read 恢复。下一步只推进 Studio GUI/editor/live preview，不提前进入 V1.5。
 
 ### Change log
+
+- **2026-09-02** — V1.25b-1 asset distribution DONE：新增 Controller-owned bounded PNG/SVG content-addressed store、asset Local API/CLI、asset revision binding、deterministic build/cache key、`invite` sibling asset export 与 Host signed-hash state cache；真实 asset-lab Site Kit enrollment/Read + 删除整个 kit 后同 DeviceId 无 sidecar restart/再 Read PASS。workspace 109/0，下一块 V1.25b-2 Studio GUI/editor/live preview。
 
 - **2026-09-02** — V1.25a foundation DONE：新增 bounded OutfitProfile/四 preset、Controller-owned 双槽 OutfitLibrary、`clew outfit` Local API/CLI、`clew invite --outfit`、signed OutfitProfile→ClientFlavor→Host runtime→membership recovery vertical slice；真实 `huang-lab` Site Kit enrollment/Read 与无 sidecar 同 DeviceId 重启/再 Read PASS。workspace 102/0，下一块 V1.25b Studio GUI/assets/preview。
 - **2026-09-02** — V1 desktop copy 改为 English/ASCII：修复 macOS `eframe/default_fonts` 下 CJK 方框；`c56ee98 fix: use English desktop copy for v1` 已在 `macos-3dv0:scratchpad` exact native check/build/workspace 93/0/1 与 Controller/Host GUI/tray second-launch wake 上复验。

@@ -1,4 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
 
 use clew_core::{DeviceId, SiteId, StateLayout};
 use clew_identity::{
@@ -9,7 +13,8 @@ use thiserror::Error;
 
 use crate::{
     ClientFlavor, HostInstanceKey, HostMembership, HostMembershipError, HostMembershipMarker,
-    HostMembershipStore, OutfitRuntimeView, SignedSiteClew, SiteClewError, observed_hostname,
+    HostMembershipStore, MAX_OUTFIT_ASSET_BYTES, OutfitError, OutfitProfile, OutfitRuntimeView,
+    SignedSiteClew, SiteClewError, observed_hostname, verify_outfit_asset_bytes,
 };
 
 #[derive(Clone, Debug)]
@@ -161,13 +166,18 @@ pub struct MissingInviteView {
 pub fn resolve_host_launch(context: HostLaunchContext) -> Result<HostLaunchState, HostLaunchError> {
     if let Some(explicit) = &context.explicit_site {
         let site_file = SignedSiteClew::read(explicit)?;
-        return resolve_site_file(&context, site_file, HostSiteSource::Explicit);
+        return resolve_site_file(&context, site_file, HostSiteSource::Explicit, explicit);
     }
 
     let sibling = site_clew_sibling(&context.executable_path)?;
     if sibling.is_file() {
         let site_file = SignedSiteClew::read(&sibling)?;
-        return resolve_site_file(&context, site_file, HostSiteSource::ExecutableSibling);
+        return resolve_site_file(
+            &context,
+            site_file,
+            HostSiteSource::ExecutableSibling,
+            &sibling,
+        );
     }
 
     let memberships = HostMembershipStore::new(context.state_layout.clone())
@@ -192,8 +202,12 @@ fn resolve_site_file(
     context: &HostLaunchContext,
     site_file: SignedSiteClew,
     source: HostSiteSource,
+    site_path: &Path,
 ) -> Result<HostLaunchState, HostLaunchError> {
     let effective_flavor = site_file.effective_flavor_for_runtime(&context.client_flavor)?;
+    if let Some(profile) = &site_file.payload.outfit_profile {
+        sync_outfit_assets_from_site(&context.state_layout, site_path, profile)?;
+    }
     let controller = site_file.verify()?;
     let site_id = site_file.payload.bootstrap.payload.site_id;
     let site_name = site_file.payload.bootstrap.payload.site_name.clone();
@@ -221,6 +235,139 @@ fn resolve_site_file(
         hostname: observed_hostname(),
         source,
     })
+}
+
+pub fn cached_outfit_asset_path(
+    layout: &StateLayout,
+    asset_id: &str,
+) -> Result<PathBuf, HostLaunchError> {
+    let root = layout.outfit_assets_root();
+    let mut found = None;
+    for extension in ["png", "svg"] {
+        let candidate = root.join(format!("{asset_id}.{extension}"));
+        if candidate.is_file() {
+            if found.is_some() {
+                return Err(HostLaunchError::AmbiguousOutfitAsset(asset_id.into()));
+            }
+            found = Some(candidate);
+        }
+    }
+    found.ok_or_else(|| HostLaunchError::MissingOutfitAsset(asset_id.into()))
+}
+
+fn sync_outfit_assets_from_site(
+    layout: &StateLayout,
+    site_path: &Path,
+    profile: &OutfitProfile,
+) -> Result<(), HostLaunchError> {
+    let asset_ids = profile.imported_asset_ids();
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+    let kit_root = site_path
+        .parent()
+        .ok_or(HostLaunchError::InvalidExecutablePath)?;
+    let source_root = kit_root.join("outfit-assets");
+    let target_root = layout.outfit_assets_root();
+    fs::create_dir_all(&target_root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target_root, fs::Permissions::from_mode(0o700))?;
+    }
+    for asset_id in asset_ids {
+        sync_one_outfit_asset(&source_root, &target_root, &asset_id)?;
+    }
+    Ok(())
+}
+
+fn sync_one_outfit_asset(
+    source_root: &Path,
+    target_root: &Path,
+    asset_id: &str,
+) -> Result<(), HostLaunchError> {
+    let mut source = None;
+    for extension in ["png", "svg"] {
+        let candidate = source_root.join(format!("{asset_id}.{extension}"));
+        if candidate.is_file() {
+            if source.is_some() {
+                return Err(HostLaunchError::AmbiguousOutfitAsset(asset_id.into()));
+            }
+            source = Some((extension, candidate));
+        }
+    }
+    let (extension, source) =
+        source.ok_or_else(|| HostLaunchError::MissingOutfitAsset(asset_id.into()))?;
+    let bytes = read_bounded_outfit_asset(&source)?;
+    verify_outfit_asset_bytes(asset_id, &bytes)?;
+
+    let target = target_root.join(format!("{asset_id}.{extension}"));
+    if target.exists() {
+        let existing = read_bounded_outfit_asset(&target)?;
+        verify_outfit_asset_bytes(asset_id, &existing)?;
+        return Ok(());
+    }
+
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).map_err(|error| {
+        std::io::Error::other(format!("secure random generation failed: {error}"))
+    })?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temp = target_root.join(format!(".asset-{}-{suffix}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    match fs::rename(&temp, &target) {
+        Ok(()) => {}
+        Err(error) if target.exists() => {
+            let _ = fs::remove_file(&temp);
+            let existing = read_bounded_outfit_asset(&target)?;
+            verify_outfit_asset_bytes(asset_id, &existing)?;
+            let _ = error;
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn read_bounded_outfit_asset(path: &Path) -> Result<Vec<u8>, HostLaunchError> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_OUTFIT_ASSET_BYTES as u64
+    {
+        return Err(HostLaunchError::InvalidOutfitAsset(
+            path.display().to_string(),
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take((MAX_OUTFIT_ASSET_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_OUTFIT_ASSET_BYTES {
+        return Err(HostLaunchError::InvalidOutfitAsset(
+            path.display().to_string(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn site_clew_sibling(executable_path: &Path) -> Result<PathBuf, HostLaunchError> {
@@ -284,6 +431,14 @@ pub enum HostLaunchError {
     Membership(#[from] HostMembershipError),
     #[error(transparent)]
     IdentityStore(#[from] DeviceIdentityStoreError),
+    #[error(transparent)]
+    Outfit(#[from] OutfitError),
+    #[error("required Outfit asset is missing: {0}")]
+    MissingOutfitAsset(String),
+    #[error("multiple stored Outfit asset formats exist for {0}")]
+    AmbiguousOutfitAsset(String),
+    #[error("Outfit asset is invalid or exceeds its hard bound: {0}")]
+    InvalidOutfitAsset(String),
     #[error("host executable path has no parent")]
     InvalidExecutablePath,
     #[error("host launch I/O failed: {0}")]
@@ -299,7 +454,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{HostMembershipStore, HostRoleHint};
+    use crate::{
+        HostMembershipStore, HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile,
+        outfit_asset_id_for_bytes,
+    };
 
     fn site_file(
         controller: &ControllerIdentity,
@@ -425,6 +583,72 @@ mod tests {
             }
         ));
         assert_eq!(result.device_id(), Some(receipt.device_id));
+    }
+
+    #[test]
+    fn signed_outfit_assets_are_hash_verified_and_cached_before_enrollment() {
+        let temp = tempdir().unwrap();
+        let kit = temp.path().join("kit");
+        let asset_dir = kit.join("outfit-assets");
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        let state = StateLayout::new(temp.path().join("state"));
+        let controller = ControllerIdentity::from_secret([93_u8; 32]);
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="12"><rect width="16" height="12"/></svg>"#;
+        let asset_id = outfit_asset_id_for_bytes(bytes);
+        let mut profile = OutfitProfile::preset(OutfitPreset::ResearchLab);
+        profile.outfit_id = "asset-lab".into();
+        profile.display_name = "Asset Lab".into();
+        profile.revision = 2;
+        profile.visuals.logo = Some(OutfitAssetRef::Imported {
+            asset_id: asset_id.clone(),
+        });
+        profile.validate().unwrap();
+        let flavor = ClientFlavor::from_outfit_current(&profile).unwrap();
+        let (mut site, _) = site_file(&controller, site_id, invite_id, "Asset Lab", flavor.clone());
+        site.payload.outfit_profile = Some(profile);
+        site.signature = controller.sign_site_config(&site.payload).unwrap();
+        let site_path = kit.join("site.clew");
+        site.write(&site_path).unwrap();
+        std::fs::write(asset_dir.join(format!("{asset_id}.svg")), bytes).unwrap();
+
+        let result = resolve_host_launch(HostLaunchContext {
+            explicit_site: Some(site_path.clone()),
+            executable_path: kit.join("Clew.exe"),
+            state_layout: state.clone(),
+            client_flavor: ClientFlavor::clew_original_current(),
+            archive_temp_detected: false,
+        })
+        .unwrap();
+        assert!(matches!(result, HostLaunchState::AwaitingEnrollment { .. }));
+        let cached = cached_outfit_asset_path(&state, &asset_id).unwrap();
+        assert_eq!(std::fs::read(cached).unwrap(), bytes);
+
+        std::fs::remove_dir_all(state.outfit_assets_root()).unwrap();
+        std::fs::write(asset_dir.join(format!("{asset_id}.svg")), b"tampered").unwrap();
+        assert!(matches!(
+            resolve_host_launch(HostLaunchContext {
+                explicit_site: Some(site_path.clone()),
+                executable_path: kit.join("Clew.exe"),
+                state_layout: state.clone(),
+                client_flavor: ClientFlavor::clew_original_current(),
+                archive_temp_detected: false,
+            }),
+            Err(HostLaunchError::Outfit(OutfitError::AssetHashMismatch(_)))
+        ));
+
+        std::fs::remove_file(asset_dir.join(format!("{asset_id}.svg"))).unwrap();
+        assert!(matches!(
+            resolve_host_launch(HostLaunchContext {
+                explicit_site: Some(site_path),
+                executable_path: kit.join("Clew.exe"),
+                state_layout: state,
+                client_flavor: ClientFlavor::clew_original_current(),
+                archive_temp_detected: false,
+            }),
+            Err(HostLaunchError::MissingOutfitAsset(_))
+        ));
     }
 
     #[test]

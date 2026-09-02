@@ -7,6 +7,7 @@ mod controller;
 mod local_api;
 mod lock;
 mod outfit;
+mod outfit_asset;
 mod remote;
 mod transport;
 
@@ -17,11 +18,17 @@ pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_
 pub use local_api::{
     ActivityList, BackupExportRequest, ControllerStatus, DeviceList, InviteIssueRequest,
     InviteIssueResult, LOCAL_API_VERSION, LocalApiClient, LocalApiClientError, LocalApiErrorCode,
-    MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitCloneRequest, OutfitCreateRequest,
-    OutfitList, OutfitSetFieldRequest, RecoveryStatus, RemoteReadRequest, RemoteReadResult,
+    MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
+    OutfitAssetImportRequest, OutfitAssetList, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
+    OutfitSetAssetRequest, OutfitSetFieldRequest, RecoveryStatus, RemoteReadRequest,
+    RemoteReadResult,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot, OutfitStoreError,
+};
+pub use outfit_asset::{
+    MAX_OUTFIT_ASSET_BYTES, MAX_OUTFIT_ASSET_TOTAL_BYTES, MAX_OUTFIT_ASSETS, OutfitAssetData,
+    OutfitAssetError, OutfitAssetFormat, OutfitAssetInfo, OutfitAssetStore,
 };
 pub use remote::{
     MAX_REMOTE_CONNECTIONS, RemoteConnectionError, RemoteHub, RemoteHubError,

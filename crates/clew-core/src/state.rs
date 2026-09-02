@@ -122,6 +122,11 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn outfit_assets_root(&self) -> PathBuf {
+        self.version_root().join("outfit-assets")
+    }
+
+    #[must_use]
     pub fn membership_dir(&self, controller_id: ControllerId, site_id: SiteId) -> PathBuf {
         self.version_root()
             .join("memberships")
