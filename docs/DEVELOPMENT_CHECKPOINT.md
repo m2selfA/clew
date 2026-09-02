@@ -445,7 +445,7 @@ Known / release blockers：
 
 ## 7. V1.25 — Distribution Studio Foundation
 
-**Status：IN PROGRESS（V1.25a DONE；V1.25b-1 DONE；V1.25b-2 implementation complete；macOS Studio/Host visual gate pending）**
+**Status：DONE（V1.25a / V1.25b-1 / V1.25b-2 全部封板；Windows + macOS desktop acceptance 已闭合）**
 
 **Date：2026-09-02**
 
@@ -519,9 +519,14 @@ V1.25b-2 implementation validation：
 - `cargo check --workspace --all-targets`：PASS，0 warnings；
 - `cargo test --workspace --all-targets`：PASS，**114 tests passed / 0 failed**；另 2 项默认 ignored（interactive Windows Host GUI / public relay）；
 - Runtime focused 28/28、root/Studio/CLI focused 5 passed + 1 Windows interactive default ignored；Windows branded Studio/Host smoke 进程与 `%TEMP%\\clew-v125-studio-smoke` 已确认清理；
-- **remaining gate：**同一 implementation commit 还需在 `macos-3dv0:scratchpad` 做 native workspace check/test + Aqua Studio GUI + imported-tray Host GUI smoke。该 gate 通过前不把 V1.25 标 DONE，也不进入 V1.5。
+V1.25b-2 macOS acceptance evidence：
 
-最终 V1.25 Acceptance：从 preset 创建一套自定义 Outfit（含可选 imported visual assets）用于真实 Site Kit；朋友侧连接动作数与 Clew Original 完全相同。
+- [x] 将 exact implementation commit `073acc0` 的 tracked source archive（SHA-256 `cad676b9ca6d62309d25766b70b0815cb2822fa60f89abb5601c8599a30cc514`）放入 `macos-3dv0:/Users/inter/Documents/Scratch/scratchpad/clew-v125-073acc0`；native `cargo fmt -- --check`、workspace check 均 PASS，workspace tests **115 passed / 0 failed / 1 ignored**（仅 public n0 relay）；
+- [x] macOS Aqua Controller Studio 使用 persisted `studio-mac` custom default/recent profile（同一 imported SVG 绑定 app/tray/logo/key-visual、primary `#C25435`、revision 6）持续运行 12s，GUI stderr 0；
+- [x] macOS desktop Host 使用该真实 Site Kit 完成 enrollment，imported window/tray visual 初始化后 event loop 持续运行 12s，stderr 0；second launch wake PASS；Controller 显示 DeviceId `6632fa52-82e8-4c8f-80cb-566d6f3303e5` online/executable，bounded Read 返回 `CLEW-V125-MACOS-STUDIO-PROOF`；Host cache 唯一 SVG 的 SHA-256 与 signed content id `sha256-ce5ed88b...18a49a` 完全一致；
+- [x] 停止 Host、删除整个 Site Kit 后，只保留 membership + Host state asset cache 无 sidecar 重启：同一 DeviceId、branded Aqua event loop、online/executable 与第二次 Read 全 PASS；macOS smoke 进程/运行态已清理，scratchpad 仅保留 exact source 测试目录。
+
+最终 V1.25 Acceptance：**PASS**。从 preset 创建一套自定义 Outfit（含可选 imported visual assets）用于真实 Site Kit；朋友侧连接动作数与 Clew Original 完全相同。
 
 ## 8. V1.5 — Zero-config Site Connector
 
@@ -668,14 +673,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.25 — Distribution Studio Foundation（IN PROGRESS；V1.25b-2 implementation complete）**
+**Current block：V1.25 — Distribution Studio Foundation（DONE）**
 
-**Next gate：macOS native Studio + imported-visual Host acceptance；PASS 后封板 V1.25，再进入 V1.5 discovery spike**
+**Next block：V1.5 — Zero-config Site Connector discovery spike**
 
-V1.25a/b-1/b-2 代码面已完成 Outfit schema/library、bounded asset distribution、Controller Studio editor/live preview，以及 Host imported app/tray/logo/key-visual runtime projection；Windows real Studio/Host/no-sidecar Read acceptance 已闭合。当前唯一剩余项是 exact implementation commit 的 macOS native/Aqua gate；该 gate 通过前不提前进入 V1.5。
+V1.25a/b-1/b-2 已完成 Outfit schema/library、bounded asset distribution、Controller Studio editor/live preview，以及 Host imported app/tray/logo/key-visual runtime projection；Windows 与 macOS real Studio/Host/no-sidecar Read acceptance 均闭合。V1.25 release gate 已关闭，下一步按第 8 节先做 current iroh/LAN discovery + opaque tunnel implementation spike，再决定 V1.5 具体承载方式。
 
 ### Change log
 
+- **2026-09-02** — V1.25 DONE：exact `073acc0` source 在 `macos-3dv0:scratchpad` 完成 native fmt/check/workspace **115/0/1**，Aqua Controller Studio + imported app/tray/logo/key-visual Host 真运行、second-launch wake、Read、asset hash、删除整个 Site Kit 后同 DeviceId branded restart/再 Read 全 PASS。Windows + macOS desktop gate 至此闭合，下一块进入 V1.5 discovery spike。
 - **2026-09-02** — V1.25b-2 implementation complete / macOS gate pending：Controller GUI 新增 Local-API-only Outfit Studio、单 revision batch edit、bounded PNG/SVG thumbnail/live preview；Host runtime 真正消费 imported window/tray/logo/key-visual + primary accent。Windows `studio-smoke` Studio GUI、network branded Host、second-launch wake、Read、删除整包后的同 DeviceId branded restart/再 Read 全 PASS；workspace 114/0。下一步只做 exact commit macOS native/Aqua gate。
 - **2026-09-02** — V1.25b-1 asset distribution DONE：新增 Controller-owned bounded PNG/SVG content-addressed store、asset Local API/CLI、asset revision binding、deterministic build/cache key、`invite` sibling asset export 与 Host signed-hash state cache；真实 asset-lab Site Kit enrollment/Read + 删除整个 kit 后同 DeviceId 无 sidecar restart/再 Read PASS。workspace 109/0，下一块 V1.25b-2 Studio GUI/editor/live preview。
 
