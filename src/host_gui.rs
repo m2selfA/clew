@@ -27,6 +27,7 @@ pub fn run(
     layout: &StateLayout,
     state: HostLaunchState,
     wake_rx: mpsc::UnboundedReceiver<()>,
+    state_rx: mpsc::UnboundedReceiver<HostLaunchState>,
 ) -> Result<HostGuiAction, Box<dyn std::error::Error>> {
     let action = Arc::new(Mutex::new(None));
     let action_for_app = Arc::clone(&action);
@@ -57,6 +58,7 @@ pub fn run(
                 outfit,
                 visuals,
                 wake_rx,
+                state_rx,
                 action_for_app,
             )?))
         }),
@@ -189,6 +191,7 @@ struct HostApp {
     state: HostLaunchState,
     outfit: OutfitRuntimeView,
     wake_rx: mpsc::UnboundedReceiver<()>,
+    state_rx: mpsc::UnboundedReceiver<HostLaunchState>,
     tray: Tray,
     app_icon: Option<egui::TextureHandle>,
     logo: Option<egui::TextureHandle>,
@@ -204,6 +207,7 @@ impl HostApp {
         outfit: OutfitRuntimeView,
         visuals: HostVisualAssets,
         wake_rx: mpsc::UnboundedReceiver<()>,
+        state_rx: mpsc::UnboundedReceiver<HostLaunchState>,
         action: Arc<Mutex<Option<HostGuiAction>>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let tooltip = state
@@ -242,6 +246,7 @@ impl HostApp {
             state,
             outfit,
             wake_rx,
+            state_rx,
             tray,
             app_icon,
             logo,
@@ -279,6 +284,14 @@ impl HostApp {
         }
     }
 
+    fn poll_state_updates(&mut self, ctx: &egui::Context) {
+        while let Ok(state) = self.state_rx.try_recv() {
+            self.outfit = state.outfit_runtime_view();
+            self.state = state;
+            ctx.request_repaint();
+        }
+    }
+
     fn poll_dropped_site(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         if let Some(path) = dropped
@@ -305,6 +318,7 @@ impl Drop for HostApp {
 impl eframe::App for HostApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_state_updates(&ctx);
         self.poll_wake_and_tray(&ctx);
         self.poll_dropped_site(&ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.exit_requested {

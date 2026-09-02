@@ -30,7 +30,7 @@ pub use outfit::{
 pub use read::HostReadService;
 pub use remote::{
     HostRemoteError, complete_networked_activation, serve_networked_membership_once,
-    serve_networked_membership_until,
+    serve_networked_membership_until, wait_for_networked_activation_until,
 };
 pub use runtime::{
     HostLaunchContext, HostLaunchError, HostLaunchState, HostSiteSource, MissingInviteView,

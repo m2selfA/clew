@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand};
 use clew_core::{DeviceId, InviteId};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchState, OutfitPreset, SignedSiteClew,
-    acquire_host_instance, complete_networked_activation, resolve_host_launch,
-    serve_networked_membership_until, verify_outfit_asset_bytes,
+    acquire_host_instance, resolve_host_launch, serve_networked_membership_until,
+    verify_outfit_asset_bytes, wait_for_networked_activation_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
@@ -663,6 +663,40 @@ async fn run_host(
     return run_host_desktop(layout, context, state).await;
 }
 
+async fn wait_for_host_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+async fn run_host_network_lifecycle(
+    layout: clew_core::StateLayout,
+    state: HostLaunchState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    state_tx: Option<tokio::sync::mpsc::UnboundedSender<HostLaunchState>>,
+) -> Result<(), clew_host::HostRemoteError> {
+    let Some(state) = wait_for_networked_activation_until(&layout, state, shutdown.clone()).await?
+    else {
+        return Ok(());
+    };
+    if let Some(state_tx) = &state_tx {
+        let _ = state_tx.send(state.clone());
+    }
+    if let HostLaunchState::Active { membership, .. } = state
+        && membership.marker.controller_endpoint.is_some()
+    {
+        return serve_networked_membership_until(&membership, wait_for_host_shutdown(shutdown))
+            .await;
+    }
+    wait_for_host_shutdown(shutdown).await;
+    Ok(())
+}
+
 async fn run_host_foreground(
     layout: &clew_core::StateLayout,
     state: HostLaunchState,
@@ -675,7 +709,6 @@ async fn run_host_foreground(
         }
         HostInstanceStart::Primary(instance) => instance,
     };
-    let state = complete_networked_activation(layout, state).await?;
     print_host_state(&state);
     if matches!(
         state,
@@ -684,36 +717,42 @@ async fn run_host_foreground(
         return Ok(());
     }
 
-    let remote = if let HostLaunchState::Active { membership, .. } = &state
-        && membership.marker.controller_endpoint.is_some()
-        && membership.marker.read_policy.is_some()
-    {
-        let membership = membership.clone();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            serve_networked_membership_until(&membership, async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
-        });
-        Some((shutdown_tx, task))
-    } else {
-        None
-    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server =
+        tokio::spawn(instance.serve_until(wait_for_host_shutdown(shutdown_rx.clone()), None));
+    let ctrl_shutdown = shutdown_tx.clone();
+    let ctrl_c = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = ctrl_shutdown.send(true);
+    });
 
-    let serve_result = instance
-        .serve_until(
-            async {
-                let _ = tokio::signal::ctrl_c().await;
-            },
-            None,
-        )
-        .await;
-    if let Some((shutdown_tx, task)) = remote {
-        let _ = shutdown_tx.send(());
-        task.await??;
+    let result = async {
+        let Some(state) =
+            wait_for_networked_activation_until(layout, state, shutdown_rx.clone()).await?
+        else {
+            return Ok::<(), clew_host::HostRemoteError>(());
+        };
+        print_host_state(&state);
+        if let HostLaunchState::Active { membership, .. } = state
+            && membership.marker.controller_endpoint.is_some()
+        {
+            serve_networked_membership_until(
+                &membership,
+                wait_for_host_shutdown(shutdown_rx.clone()),
+            )
+            .await?;
+        } else {
+            wait_for_host_shutdown(shutdown_rx.clone()).await;
+        }
+        Ok(())
     }
-    serve_result?;
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    ctrl_c.abort();
+    let _ = ctrl_c.await;
+    server.await??;
+    result?;
     Ok(())
 }
 
@@ -732,37 +771,43 @@ async fn run_host_desktop(
             }
             HostInstanceStart::Primary(instance) => instance,
         };
-        state = complete_networked_activation(&layout, state).await?;
         let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (instance_shutdown_tx, instance_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(instance.serve_until(
             async move {
-                let _ = shutdown_rx.await;
+                let _ = instance_shutdown_rx.await;
             },
             Some(wake_tx),
         ));
-        let remote = if let HostLaunchState::Active { membership, .. } = &state
-            && membership.marker.controller_endpoint.is_some()
-            && membership.marker.read_policy.is_some()
-        {
-            let membership = membership.clone();
-            let (remote_shutdown_tx, remote_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let task = tokio::spawn(async move {
-                serve_networked_membership_until(&membership, async move {
-                    let _ = remote_shutdown_rx.await;
-                })
+
+        let (network_shutdown_tx, network_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (state_tx, state_rx) = tokio::sync::mpsc::unbounded_channel();
+        let network = if matches!(
+            state,
+            HostLaunchState::Active { .. } | HostLaunchState::AwaitingEnrollment { .. }
+        ) {
+            let layout = layout.clone();
+            let network_state = state.clone();
+            Some(tokio::spawn(async move {
+                run_host_network_lifecycle(
+                    layout,
+                    network_state,
+                    network_shutdown_rx,
+                    Some(state_tx),
+                )
                 .await
-            });
-            Some((remote_shutdown_tx, task))
+            }))
         } else {
+            drop(state_tx);
             None
         };
-        let action = host_gui::run(&layout, state, wake_rx)?;
-        let _ = shutdown_tx.send(());
+
+        let action = host_gui::run(&layout, state, wake_rx, state_rx)?;
+        let _ = network_shutdown_tx.send(true);
+        let _ = instance_shutdown_tx.send(());
         server.await??;
-        if let Some((remote_shutdown_tx, task)) = remote {
-            let _ = remote_shutdown_tx.send(());
-            task.await??;
+        if let Some(network) = network {
+            network.await??;
         }
         match action {
             host_gui::HostGuiAction::Exit => return Ok(()),

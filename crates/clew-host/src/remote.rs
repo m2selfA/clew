@@ -14,7 +14,7 @@ use clew_transport::{
 };
 use iroh::EndpointAddr;
 use thiserror::Error;
-use tokio::{task::JoinSet, time::Instant};
+use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{HostLaunchState, HostMembership, HostMembershipStore, HostReadService};
 
@@ -27,6 +27,14 @@ pub async fn complete_networked_activation(
     layout: &StateLayout,
     state: HostLaunchState,
 ) -> Result<HostLaunchState, HostRemoteError> {
+    complete_networked_activation_with_window(layout, state, INITIAL_BOOTSTRAP_PATH_WINDOW).await
+}
+
+async fn complete_networked_activation_with_window(
+    layout: &StateLayout,
+    state: HostLaunchState,
+    path_window: Duration,
+) -> Result<HostLaunchState, HostRemoteError> {
     match state {
         HostLaunchState::AwaitingEnrollment {
             site_file,
@@ -34,6 +42,15 @@ pub async fn complete_networked_activation(
             hostname,
             source,
         } => {
+            let controller = site_file.payload.bootstrap.payload.controller;
+            let site_id = site_file.payload.bootstrap.payload.site_id;
+            if let Some(membership) =
+                HostMembershipStore::new(layout.clone()).load(controller.controller_id, site_id)?
+            {
+                resume_pending_controller_activation_with_window(layout, &membership, path_window)
+                    .await?;
+                return Ok(HostLaunchState::Active { membership, source });
+            }
             let endpoint = site_file.payload.controller_endpoint.clone();
             let read_policy = site_file.payload.read_policy.clone();
             let (endpoint, read_policy) = match (endpoint, read_policy) {
@@ -49,14 +66,13 @@ pub async fn complete_networked_activation(
                 _ => return Err(HostRemoteError::MissingNetworkConfig),
             };
             let outer = IrohOuter::bind().await?;
-            let controller = site_file.payload.bootstrap.payload.controller;
-            let site_id = site_file.payload.bootstrap.payload.site_id;
             let mut channel = connect_bootstrap_channel(
                 &outer,
                 endpoint.clone(),
                 controller,
                 site_id,
                 site_file.payload.controller_bootstrap_noise_public_key,
+                path_window,
             )
             .await?;
             channel
@@ -120,16 +136,18 @@ pub async fn complete_networked_activation(
             Ok(HostLaunchState::Active { membership, source })
         }
         HostLaunchState::Active { membership, source } => {
-            resume_pending_controller_activation(layout, &membership).await?;
+            resume_pending_controller_activation_with_window(layout, &membership, path_window)
+                .await?;
             Ok(HostLaunchState::Active { membership, source })
         }
         other => Ok(other),
     }
 }
 
-async fn resume_pending_controller_activation(
+async fn resume_pending_controller_activation_with_window(
     layout: &StateLayout,
     membership: &HostMembership,
+    path_window: Duration,
 ) -> Result<(), HostRemoteError> {
     let identity_store = DeviceIdentityStore::new(layout.clone());
     let Some(activation) = identity_store.load_pending_controller_activation(
@@ -156,6 +174,7 @@ async fn resume_pending_controller_activation(
         membership.marker.controller,
         membership.marker.site_id,
         membership.marker.controller_bootstrap_noise_public_key,
+        path_window,
     )
     .await?;
     channel
@@ -181,6 +200,62 @@ async fn resume_pending_controller_activation(
         membership.marker.device_id,
     )?;
     Ok(())
+}
+
+pub async fn wait_for_networked_activation_until(
+    layout: &StateLayout,
+    state: HostLaunchState,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Option<HostLaunchState>, HostRemoteError> {
+    wait_for_networked_activation_until_with_timing(
+        layout,
+        state,
+        shutdown,
+        INITIAL_BOOTSTRAP_PATH_WINDOW,
+        Duration::from_secs(1),
+    )
+    .await
+}
+
+async fn wait_for_networked_activation_until_with_timing(
+    layout: &StateLayout,
+    mut state: HostLaunchState,
+    mut shutdown: watch::Receiver<bool>,
+    path_window: Duration,
+    retry_delay: Duration,
+) -> Result<Option<HostLaunchState>, HostRemoteError> {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+        let attempt = complete_networked_activation_with_window(layout, state.clone(), path_window);
+        tokio::pin!(attempt);
+        let result = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            result = &mut attempt => result,
+        };
+        match result {
+            Ok(next @ HostLaunchState::Active { .. }) => return Ok(Some(next)),
+            Ok(next @ HostLaunchState::MissingInvite { .. })
+            | Ok(next @ HostLaunchState::AmbiguousMembership { .. }) => return Ok(Some(next)),
+            Ok(next @ HostLaunchState::AwaitingEnrollment { .. }) => state = next,
+            Err(error) if error.is_retryable_activation() => {}
+            Err(error) => return Err(error),
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(None);
+                }
+            }
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+    }
 }
 
 pub async fn serve_networked_membership_until<F>(
@@ -314,12 +389,13 @@ async fn connect_bootstrap_channel(
     controller: ControllerPublicIdentity,
     site_id: SiteId,
     controller_bootstrap_noise_public_key: Option<[u8; 32]>,
+    path_window: Duration,
 ) -> Result<HostBootstrapChannel, HostRemoteError> {
     let direct = outer.connect_bootstrap(controller_endpoint);
     tokio::pin!(direct);
 
     let Some(bootstrap_key) = controller_bootstrap_noise_public_key else {
-        return tokio::time::timeout(INITIAL_BOOTSTRAP_PATH_WINDOW, &mut direct)
+        return tokio::time::timeout(path_window, &mut direct)
             .await
             .map_err(|_| HostRemoteError::BootstrapPathUnavailable)?
             .map(HostBootstrapChannel::Direct)
@@ -329,7 +405,7 @@ async fn connect_bootstrap_channel(
     let discovery =
         MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
     let mut events = discovery.subscribe().await;
-    let deadline = tokio::time::sleep(INITIAL_BOOTSTRAP_PATH_WINDOW);
+    let deadline = tokio::time::sleep(path_window);
     tokio::pin!(deadline);
     let mut direct_done = false;
 
@@ -709,6 +785,22 @@ pub enum HostRemoteError {
     Model(#[from] clew_core::ControlModelError),
 }
 
+impl HostRemoteError {
+    #[must_use]
+    pub fn is_retryable_activation(&self) -> bool {
+        matches!(
+            self,
+            Self::BootstrapPathUnavailable
+                | Self::Outer(_)
+                | Self::ConnectorControl(_)
+                | Self::ConnectorDiscovery(_)
+                | Self::ConnectorLease(_)
+                | Self::SealedBootstrap(_)
+                | Self::Bootstrap(_)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +811,77 @@ mod tests {
     use clew_transport::{BootstrapRequest, BootstrapResponse, noise_static_public};
     use iroh::{EndpointAddr, SecretKey};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn activation_retry_is_immediately_cancellable() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path().join("cancel-state"));
+        let controller = ControllerIdentity::from_secret([101_u8; 32]);
+        let controller_public = controller.public_identity();
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let now = unix_ms().unwrap();
+        let mut registry = EnrollmentRegistry::new(
+            controller.controller_id(),
+            PermissionGrant::EXECUTE_READ_CONNECTOR,
+        );
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Cancel Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+                    not_before_unix_ms: now.saturating_sub(1_000),
+                    expires_unix_ms: now + 60_000,
+                    deployment_window_ms: 60_000,
+                    max_claims: 1,
+                },
+            )
+            .unwrap();
+        let bootstrap_secret = [102_u8; 32];
+        let site_file = crate::SignedSiteClew::issue_networked_outfit_sealed(
+            &controller,
+            crate::OutfitProfile::preset(crate::OutfitPreset::ClewOriginal),
+            bootstrap,
+            crate::HostRoleHint::ExecutePreferred,
+            EndpointAddr::new(SecretKey::from_bytes(&[103_u8; 32]).public()),
+            ReadPolicy::new(
+                vec![temp.path().to_string_lossy().into_owned()],
+                4_096,
+                2_000,
+            )
+            .unwrap(),
+            noise_static_public(bootstrap_secret).unwrap(),
+        )
+        .unwrap();
+        let pending = DeviceIdentityStore::new(layout.clone())
+            .prepare_pending(controller_public, site_id, invite_id)
+            .unwrap();
+        let state = HostLaunchState::AwaitingEnrollment {
+            site_file,
+            pending,
+            hostname: "CANCEL-TARGET".into(),
+            source: crate::HostSiteSource::Explicit,
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let wait = wait_for_networked_activation_until_with_timing(
+            &layout,
+            state,
+            shutdown_rx,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(wait);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut wait)
+            .await
+            .expect("activation retry ignored shutdown")
+            .unwrap();
+        assert!(result.is_none());
+    }
 
     #[tokio::test]
     async fn sealed_bootstrap_and_active_read_use_real_mdns_connector_when_direct_is_unreachable() {
@@ -882,6 +1045,7 @@ mod tests {
             let helper_outer = helper_outer.clone();
             let controller_addr = controller_addr.clone();
             async move {
+                tokio::time::sleep(Duration::from_millis(650)).await;
                 let _advertisement = MdnsConnectorDiscovery::attach(
                     &helper_outer,
                     controller_public.controller_id,
@@ -932,13 +1096,26 @@ mod tests {
             hostname: "NO-PUBLIC-TARGET".into(),
             source: crate::HostSiteSource::Explicit,
         };
+        let (_activation_shutdown_tx, activation_shutdown_rx) = tokio::sync::watch::channel(false);
+        let activation_started = Instant::now();
         let activated = tokio::time::timeout(
             Duration::from_secs(12),
-            complete_networked_activation(&layout, initial),
+            wait_for_networked_activation_until_with_timing(
+                &layout,
+                initial,
+                activation_shutdown_rx,
+                Duration::from_millis(150),
+                Duration::from_millis(25),
+            ),
         )
         .await
         .expect("Connector bootstrap activation timed out")
-        .unwrap();
+        .unwrap()
+        .expect("activation retry loop stopped unexpectedly");
+        assert!(
+            activation_started.elapsed() >= Duration::from_millis(500),
+            "Target unexpectedly activated before the delayed Helper was online"
+        );
         let HostLaunchState::Active { membership, .. } = activated else {
             panic!("Target did not become active");
         };

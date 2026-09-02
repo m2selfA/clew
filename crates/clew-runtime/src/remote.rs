@@ -795,6 +795,135 @@ impl RemoteConnectionError {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn authenticated_connector_member_receives_endpoint_bound_controller_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = clew_core::StateLayout::new(temp.path());
+        let stored = clew_identity::ControllerIdentityStore::new(layout.clone())
+            .load_or_create()
+            .unwrap();
+        let controller = stored.identity().clone();
+        let connector_identity = clew_identity::DeviceIdentity::from_secret([121_u8; 32]);
+        let site_id = SiteId::new();
+        let invite_id = clew_core::InviteId::new();
+        let now = unix_ms().unwrap();
+
+        let mut control_store =
+            ControllerControlStore::load_or_create(layout, controller.controller_id()).unwrap();
+        let connector_device_id = control_store
+            .transaction(|snapshot| {
+                let pass = snapshot.registry.issue_bootstrap(
+                    &controller,
+                    clew_identity::SiteBootstrapSpec {
+                        site_id,
+                        invite_id,
+                        site_name: "Lease Lab".into(),
+                        grant: clew_identity::PermissionGrant::CONNECTOR_ONLY,
+                        not_before_unix_ms: now.saturating_sub(1_000),
+                        expires_unix_ms: now + 60_000,
+                        deployment_window_ms: 60_000,
+                        max_claims: 1,
+                    },
+                )?;
+                snapshot
+                    .catalog
+                    .upsert_site(clew_core::ControllerSiteRecord {
+                        site_id,
+                        site_name: "Lease Lab".into(),
+                        read_policy: clew_core::ReadPolicy::new(
+                            vec![temp.path().to_string_lossy().into_owned()],
+                            4_096,
+                            2_000,
+                        )?,
+                        revoked: false,
+                    })?;
+                let receipt =
+                    snapshot
+                        .registry
+                        .claim(&pass, connector_identity.public_identity(), now)?;
+                let enrollment = snapshot.registry.finalize_host_persist(
+                    invite_id,
+                    receipt.device_id,
+                    receipt.persist_ack_token(),
+                )?;
+                snapshot.catalog.register_device(DeviceRecord {
+                    device_id: receipt.device_id,
+                    site_id,
+                    display_name: "HELPER-01".into(),
+                    hostname_observed: "HELPER-01".into(),
+                    capabilities: enrollment.effective_grant.member,
+                    enrolled_via_invite_id: invite_id,
+                    name_origin: DeviceNameOrigin::Automatic {
+                        base_hostname: "HELPER-01".into(),
+                        tagged: false,
+                        tag_generation: 0,
+                    },
+                })?;
+                Ok(receipt.device_id)
+            })
+            .unwrap();
+
+        let control = Arc::new(Mutex::new(control_store));
+        let hub = RemoteHub::default();
+        let controller_outer =
+            clew_transport::IrohOuter::bind_direct_only_with_secret(stored.iroh_endpoint_secret())
+                .await
+                .unwrap();
+        let controller_addr = controller_outer.addr();
+        let connector_outer = clew_transport::IrohOuter::bind_direct_only().await.unwrap();
+        let connector_endpoint_id = connector_outer.addr().id;
+
+        let server = tokio::spawn({
+            let controller_outer = controller_outer.clone();
+            let stored = stored.clone();
+            let control = Arc::clone(&control);
+            let hub = hub.clone();
+            async move {
+                let (protocol, stream) = controller_outer.accept_classified().await.unwrap();
+                handle_remote_connection(protocol, stream, stored, control, hub).await
+            }
+        });
+
+        let mut stream = connector_outer.connect(controller_addr).await.unwrap();
+        let mut inner = InnerSession::connect(
+            &mut stream,
+            clew_transport::DeviceSessionIdentity {
+                identity: connector_identity,
+                pinned_controller: controller.public_identity(),
+                device_id: connector_device_id,
+                site_id,
+            },
+        )
+        .await
+        .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), inner.recv(&mut stream))
+            .await
+            .expect("Controller did not issue a Connector lease")
+            .unwrap();
+        let lease = SignedConnectorLease::from_message(&message).unwrap();
+        assert_eq!(
+            lease
+                .verify_for_candidate(
+                    &controller.public_identity(),
+                    site_id,
+                    connector_endpoint_id,
+                    unix_ms().unwrap(),
+                )
+                .unwrap(),
+            connector_device_id
+        );
+
+        hub.disconnect(connector_device_id);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("Controller member handler did not stop")
+            .unwrap()
+            .unwrap();
+        drop(stream);
+        connector_outer.close().await;
+        controller_outer.close().await;
+    }
+
     #[test]
     fn closed_invite_control_error_becomes_safe_bootstrap_denial() {
         let error = RemoteConnectionError::Control(ControlStoreError::Enrollment(
