@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a–d DONE；V1.5e Controller GUI invite + same-Site-Kit helper-only entry IMPLEMENTED / Windows ACCEPTED；exact-commit macOS gate next，随后做 V1.5 final multi-machine acceptance）**
+**Status：IN PROGRESS（V1.5a–e DONE on Windows + macOS；只剩 V1.5 final multi-machine acceptance）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -692,7 +692,7 @@ Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-target
 
 ### V1.5e — Real Controller GUI invite + same-Site-Kit helper-only entry
 
-**Status：IMPLEMENTED + WINDOWS ACCEPTED（2026-09-03；macOS exact-commit acceptance pending）**
+**Status：DONE（2026-09-03）**
 
 实际落地：
 
@@ -707,7 +707,11 @@ Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-target
 
 Windows/cap00 validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**；`host --help` helper entry **1/1 PASS**；same-Site-Kit helper-only real enrollment **1/1 PASS**；真实 invite output smoke PASS；Windows Host GUI/tray **1/1 PASS**；Controller GUI/auto-Controller smoke PASS。
 
-下一步：先把本块 exact commit 送到 `macos-3dv0` 做 native workspace、helper-only no-public focused、CLI entry 与 Aqua Controller/Host gate；通过后再做 V1.5 final multi-machine acceptance。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
+macOS exact-commit acceptance：implementation commit `84b99c7` 的 tracked archive SHA-256 为 `9aa11f25cac6f509778ce3bbb1691c1ec4dad4acc80b87e7e36ed2cbb1f8bd09`，落在 `macos-3dv0:/Users/inter/Documents/Scratch/scratchpad/clew-v15e-84b99c7`；native `cargo fmt -- --check` 与 workspace check PASS，workspace tests **144 passed / 0 failed / 5 ignored**；same-Site-Kit helper-only sealed enrollment **1/1 PASS（4.69s）**，CLI entry **1/1 PASS（1.85s）**。
+
+Aqua product gate：exact binary 的 Controller GUI 持续 >15 秒 stderr 为空并自动拉起 `ready=true` Controller；该 Controller 又在 **442 ms** 内真实签出 macOS 当前 ClientFlavor 的 `site.clew`。同一普通 `execute_preferred` sidecar 以 `host --connector-only` 启动后，Host Aqua GUI 持续 >15 秒 stderr 为空，Controller `devices` 明确返回 `online=true / executable=false / connector=true`；second launch **112 ms** 返回 `already running; requested the existing window to show`。Host/Controller job 与 smoke state/kit 均已清理。
+
+下一步只做 V1.5 final multi-machine acceptance。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
 
 计划：
 
