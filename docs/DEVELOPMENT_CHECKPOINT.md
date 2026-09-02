@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c active no-public InnerSession/Read + order-independent retry next）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry next）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -576,9 +576,32 @@ V1.5b acceptance / validation evidence：
 
 V1.5b known / next：
 
-- 已 enrollment 的**无公网 Target**当前 active business session 仍需补 direct+Connector path selection；`serve_networked_membership_until` 还会先等待自身 outer relay-online，并直接拨 signed Controller endpoint。V1.5c 必须让 existing DeviceKey 的 InnerSession/Read 也通过 verified Connector，同时保持 helper 无业务 key；
-- desktop 首次 activation 目前仍发生在 GUI 展示前，单次 direct/helper discovery window 为 20 秒。`Target 先开、Helper 晚开` 的真正顺序无关体验不能靠无限阻塞 GUI；V1.5c 要把 AwaitingEnrollment 重试搬到 GUI/runtime 存续期间的 background state machine；
+- desktop 首次 activation 目前仍发生在 GUI 展示前，单次 direct/helper discovery window 为 20 秒。`Target 先开、Helper 晚开` 的真正顺序无关体验不能靠无限阻塞 GUI；V1.5c-2 要把 AwaitingEnrollment 重试搬到 GUI/runtime 存续期间的 background state machine；
 - multiple-helper health/failover、mDNS 失败时 `附近连接.clew` fallback、suspend/resume re-advertise 仍未闭合；helper-only protocol/role ceiling 已有，但最终分发包里的 friend-facing helper-only role hint 入口仍需后续 UX 接线。
+
+### V1.5c-1 — Active no-public InnerSession + Read through Connector
+
+**Status：DONE（2026-09-02）**
+
+实际落地：
+
+- 已 enrollment member 不再先等待自身 iroh relay-online。`serve_networked_membership_until/once` bind endpoint 后直接进入 path race：signed Controller endpoint direct dial 与 same-Site mDNS candidate 并行；20 秒窗口内 verified Helper 可在 direct 不可达时获胜，长期 `until` loop 会按原 1 秒节奏继续重试；
+- active Helper candidate 与 bootstrap 使用同一信任顺序：Target 连接 `clew/connector/1` → 发送 bounded `ConnectorOpen{purpose=InnerSession}` → 读取 `ConnectorReady` → 验证 Controller signature、Site、**实际 candidate EndpointId** 与 expiry；只有通过后才在同一 stream 上运行原 V1.3 `DeviceSessionIdentity` Noise XX。Helper 继续只搬 InnerSession ciphertext；
+- Controller 对 direct member 和 Connector-carried member 显式区分：只有 direct outer connection 才允许以 `stream.connection().remote_id()` 签发“该设备自身”的 Connector lease。经 Helper 的 Target 不再把 Helper EndpointId 错当自己的 endpoint，也不会在没有独立 Controller uplink 时误广播自身为 Connector；
+- 普通新 Target 默认已有 `EXECUTE+CONNECTOR` capability：direct 时能拿自己的 lease 并自动 promotion；经 Helper 时仍可 Read/执行，但本次 connection 不获得自身 lease。helper-only 同理只有在自己 direct 连 Controller 时才广播；
+- forced Connector integration 扩展为两阶段：signed Controller EndpointId 始终故意不可达。第一阶段仍经 mDNS Helper 完成 sealed enrollment；第二阶段同一 active membership/DeviceKey 再次经 verified Helper 建 InnerSession，Controller 发送真实 bounded Read，Target `HostReadService` 返回精确 `CLEW-V15C-NO-PUBLIC-CONNECTOR-READ`。
+
+V1.5c-1 acceptance / validation evidence：
+
+- [x] forced-unreachable-direct enrollment + active Read real iroh/mDNS integration **1/1 PASS**；没有可用 direct endpoint，首次 bootstrap 与后续 DeviceKey InnerSession/Read 均只能走 Helper；
+- [x] `clew-host --all-targets` **28 passed / 0 failed**；`clew-runtime --all-targets` **28 passed / 0 failed**；
+- [x] `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **128 passed / 0 failed / 2 ignored**（interactive Windows Host GUI / public n0 relay）。
+
+V1.5c-1 known / next：
+
+- `Target 先开、Helper 后开` 仍未达到“谁先开都一样”：desktop 目前会在 GUI 出现前尝试一次 20 秒 activation；V1.5c-2 必须先显示 Host 状态，再在后台持续 direct/helper discovery + enrollment retry，helper 后出现时无需重启 Target；
+- active path 已具备重新进入 discovery race 的基础，但 multiple-helper explicit health ranking、Helper-A 断线→Helper-B 自动切换的真实 acceptance 仍需 V1.5d；
+- `附近连接.clew` fallback 与 suspend/resume re-advertise 仍后续。
 
 计划：
 

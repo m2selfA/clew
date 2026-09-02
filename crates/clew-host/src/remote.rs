@@ -21,6 +21,7 @@ use crate::{HostLaunchState, HostMembership, HostMembershipStore, HostReadServic
 const MAX_CONNECTOR_TUNNELS: usize = 64;
 const CONNECTOR_LEASE_RENEW_MARGIN: Duration = Duration::from_secs(30);
 const INITIAL_BOOTSTRAP_PATH_WINDOW: Duration = Duration::from_secs(20);
+const ACTIVE_MEMBER_PATH_WINDOW: Duration = Duration::from_secs(20);
 
 pub async fn complete_networked_activation(
     layout: &StateLayout,
@@ -196,20 +197,6 @@ where
         result = IrohOuter::bind() => result?,
     };
     loop {
-        let online = tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            result = outer.online_addr() => result,
-        };
-        if online.is_ok() {
-            break;
-        }
-        tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-        }
-    }
-
-    loop {
         let result = tokio::select! {
             _ = &mut shutdown => return Ok(()),
             result = serve_networked_membership_with_outer(
@@ -236,7 +223,7 @@ pub async fn serve_networked_membership_once(
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
     let (endpoint, service) = member_remote_config(membership)?;
-    let outer = bind_online_outer().await?;
+    let outer = IrohOuter::bind().await?;
     serve_networked_membership_with_outer(membership, &outer, endpoint, &service).await
 }
 
@@ -405,10 +392,73 @@ async fn connect_bootstrap_via_candidate(
     Ok(HostBootstrapChannel::Sealed { stream, session })
 }
 
-async fn bind_online_outer() -> Result<IrohOuter, HostRemoteError> {
-    let outer = IrohOuter::bind().await?;
-    outer.online_addr().await?;
-    Ok(outer)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemberOuterPath {
+    Direct,
+    Connector,
+}
+
+async fn connect_member_stream(
+    outer: &IrohOuter,
+    controller_endpoint: EndpointAddr,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+) -> Result<(clew_transport::IrohStream, MemberOuterPath), HostRemoteError> {
+    let direct = outer.connect(controller_endpoint);
+    tokio::pin!(direct);
+    let discovery =
+        MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
+    let mut events = discovery.subscribe().await;
+    let deadline = tokio::time::sleep(ACTIVE_MEMBER_PATH_WINDOW);
+    tokio::pin!(deadline);
+    let mut direct_done = false;
+
+    loop {
+        tokio::select! {
+            result = &mut direct, if !direct_done => {
+                match result {
+                    Ok(stream) => return Ok((stream, MemberOuterPath::Direct)),
+                    Err(_) => direct_done = true,
+                }
+            }
+            event = events.next() => {
+                let Some(event) = event else {
+                    continue;
+                };
+                let ConnectorDiscoveryEvent::Candidate(candidate) = event else {
+                    continue;
+                };
+                if let Ok(stream) = connect_member_via_candidate(
+                    outer,
+                    candidate.addr,
+                    controller,
+                    site_id,
+                ).await {
+                    return Ok((stream, MemberOuterPath::Connector));
+                }
+            }
+            _ = &mut deadline => return Err(HostRemoteError::MemberPathUnavailable),
+        }
+    }
+}
+
+async fn connect_member_via_candidate(
+    outer: &IrohOuter,
+    candidate: EndpointAddr,
+    controller: ControllerPublicIdentity,
+    site_id: SiteId,
+) -> Result<clew_transport::IrohStream, HostRemoteError> {
+    let mut stream = outer.connect_connector(candidate.clone()).await?;
+    let open = ConnectorOpenRequest::new(
+        SiteDiscoveryTag::derive(controller.controller_id, site_id),
+        ConnectorTunnelPurpose::InnerSession,
+    );
+    write_connector_open(&mut stream, &open).await?;
+    let ready = read_connector_ready(&mut stream).await?;
+    ready
+        .lease
+        .verify_for_candidate(&controller, site_id, candidate.id, unix_ms()?)?;
+    Ok(stream)
 }
 
 async fn serve_networked_membership_with_outer(
@@ -417,14 +467,21 @@ async fn serve_networked_membership_with_outer(
     endpoint: EndpointAddr,
     service: &Option<HostReadService>,
 ) -> Result<(), HostRemoteError> {
-    let mut stream = outer.connect(endpoint.clone()).await?;
+    let (mut stream, outer_path) = connect_member_stream(
+        outer,
+        endpoint.clone(),
+        membership.marker.controller,
+        membership.marker.site_id,
+    )
+    .await?;
     let mut inner = InnerSession::connect(
         &mut stream,
         DeviceSessionIdentity::from_active(&membership.identity),
     )
     .await?;
 
-    let connector = membership.device.capabilities.connector;
+    let connector =
+        membership.device.capabilities.connector && outer_path == MemberOuterPath::Direct;
     let mut connector_discovery = None;
     let mut connector_lease = None;
     let renew_at = if connector {
@@ -613,6 +670,8 @@ pub enum HostRemoteError {
     ClockBeforeUnixEpoch,
     #[error("system clock value does not fit in milliseconds")]
     ClockOverflow,
+    #[error("no direct Controller or verified nearby Connector member path became available")]
+    MemberPathUnavailable,
     #[error("no direct Controller or verified nearby Connector bootstrap path became available")]
     BootstrapPathUnavailable,
     #[error("Controller activation response does not match the persisted membership")]
@@ -662,7 +721,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn sealed_bootstrap_enrolls_through_real_mdns_connector_when_direct_is_unreachable() {
+    async fn sealed_bootstrap_and_active_read_use_real_mdns_connector_when_direct_is_unreachable() {
         let temp = tempdir().unwrap();
         let layout = StateLayout::new(temp.path().join("target-state"));
         let controller = ControllerIdentity::from_secret([111_u8; 32]);
@@ -895,6 +954,110 @@ mod tests {
             .await
             .expect("Helper tunnel did not close after activation")
             .unwrap();
+
+        let share = temp.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let proof_path = share.join("proof.txt");
+        const READ_PROOF: &[u8] = b"CLEW-V15C-NO-PUBLIC-CONNECTOR-READ";
+        std::fs::write(&proof_path, READ_PROOF).unwrap();
+
+        let read_now = unix_ms().unwrap();
+        let helper_read_lease = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            helper_device_id,
+            helper_addr.id,
+            read_now.saturating_sub(1_000),
+            read_now + 60_000,
+        )
+        .unwrap();
+        let _read_advertisement = MdnsConnectorDiscovery::attach(
+            &helper_outer,
+            controller_public.controller_id,
+            site_id,
+            true,
+        )
+        .unwrap();
+
+        let controller_read_task = tokio::spawn({
+            let controller_outer = controller_outer.clone();
+            let controller = controller.clone();
+            let expected_device = membership.identity.public_identity();
+            let device_id = membership.marker.device_id;
+            let proof_path = proof_path.to_string_lossy().into_owned();
+            async move {
+                let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                let open = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(open.purpose, ConnectorTunnelPurpose::InnerSession);
+                assert_eq!(
+                    open.validate().unwrap(),
+                    SiteDiscoveryTag::derive(controller.controller_id(), site_id)
+                );
+                let mut inner = InnerSession::accept(
+                    &mut stream,
+                    clew_transport::ControllerSessionIdentity {
+                        identity: controller,
+                        noise_static_secret: [114_u8; 32],
+                        expected_device,
+                        device_id,
+                        site_id,
+                    },
+                )
+                .await
+                .unwrap();
+                inner
+                    .send(
+                        &mut stream,
+                        &ReadRequest::new(proof_path, 0, 4_096)
+                            .unwrap()
+                            .into_message()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let reply = inner.recv(&mut stream).await.unwrap();
+                assert_eq!(
+                    ReadReply::from_message(&reply).unwrap(),
+                    ReadReply::Data(READ_PROOF.to_vec())
+                );
+            }
+        });
+
+        let helper_read_task = tokio::spawn({
+            let helper_outer = helper_outer.clone();
+            let controller_addr = controller_addr.clone();
+            async move {
+                let (protocol, inbound) = helper_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                serve_one_connector_tunnel(
+                    &helper_outer,
+                    inbound,
+                    controller_addr,
+                    controller_public,
+                    site_id,
+                    helper_device_id,
+                    helper_read_lease,
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let target_membership = membership.clone();
+        let target_read_task =
+            tokio::spawn(async move { serve_networked_membership_once(&target_membership).await });
+
+        tokio::time::timeout(Duration::from_secs(12), controller_read_task)
+            .await
+            .expect("Controller did not receive the Connector Read result")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), helper_read_task)
+            .await
+            .expect("Helper Read tunnel did not close")
+            .unwrap();
+        target_read_task.abort();
+        let _ = target_read_task.await;
+
         helper_outer.close().await;
         controller_outer.close().await;
     }

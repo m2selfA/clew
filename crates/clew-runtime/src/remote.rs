@@ -150,7 +150,7 @@ pub async fn handle_remote_connection(
     match protocol {
         IrohProtocol::Bootstrap => handle_bootstrap(&mut stream, &identity, control).await,
         IrohProtocol::InnerSession => {
-            handle_member(&mut stream, &identity, control, hub, None).await
+            handle_member(&mut stream, &identity, control, hub, None, true).await
         }
         IrohProtocol::Connector => handle_connector(&mut stream, &identity, control, hub).await,
     }
@@ -206,7 +206,7 @@ async fn handle_connector(
             handle_sealed_bootstrap(stream, identity, control, site_id).await
         }
         ConnectorTunnelPurpose::InnerSession => {
-            handle_member(stream, identity, control, hub, Some(site_tag)).await
+            handle_member(stream, identity, control, hub, Some(site_tag), false).await
         }
     }
 }
@@ -505,6 +505,7 @@ async fn handle_member(
     control: Arc<Mutex<ControllerControlStore>>,
     hub: RemoteHub,
     expected_site_tag: Option<SiteDiscoveryTag>,
+    issue_connector_lease: bool,
 ) -> Result<(), RemoteConnectionError> {
     let controller_id = identity.public_identity().controller_id;
     let authority = ControllerSessionAuthority::from_stored(identity);
@@ -543,7 +544,7 @@ async fn handle_member(
     .await?;
     let device_id = inner.device_id();
     let site_id = inner.site_id();
-    if connector_capability_enabled(&control, device_id, site_id)? {
+    if issue_connector_lease && connector_capability_enabled(&control, device_id, site_id)? {
         let issued_unix_ms = unix_ms()?;
         let expires_unix_ms = issued_unix_ms
             .checked_add(CONNECTOR_LEASE_TTL_MS)
