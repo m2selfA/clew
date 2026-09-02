@@ -28,6 +28,8 @@ pub fn run(
 ) -> Result<HostGuiAction, Box<dyn std::error::Error>> {
     let action = Arc::new(Mutex::new(None));
     let action_for_app = Arc::clone(&action);
+    let outfit = state.outfit_runtime_view();
+    let window_title = outfit.resources.window_title.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 430.0])
@@ -35,9 +37,17 @@ pub fn run(
         ..Default::default()
     };
     eframe::run_native(
-        "Clew",
+        &window_title,
         options,
-        Box::new(move |cc| Ok(Box::new(HostApp::new(cc, state, wake_rx, action_for_app)?))),
+        Box::new(move |cc| {
+            Ok(Box::new(HostApp::new(
+                cc,
+                state,
+                outfit,
+                wake_rx,
+                action_for_app,
+            )?))
+        }),
     )?;
     Ok(action
         .lock()
@@ -58,10 +68,12 @@ impl Tray {
     fn new(
         ctx: &egui::Context,
         tooltip: String,
+        show_label: &str,
+        exit_label: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let menu = Menu::new();
-        let show = MenuItem::new("Show Clew", true, None);
-        let exit = MenuItem::new("Exit and disconnect", true, None);
+        let show = MenuItem::new(show_label, true, None);
+        let exit = MenuItem::new(exit_label, true, None);
         menu.append(&show)?;
         menu.append(&exit)?;
         let tray = TrayIconBuilder::new()
@@ -94,6 +106,7 @@ impl Tray {
 
 struct HostApp {
     state: HostLaunchState,
+    outfit: OutfitRuntimeView,
     wake_rx: mpsc::UnboundedReceiver<()>,
     tray: Tray,
     action: Arc<Mutex<Option<HostGuiAction>>>,
@@ -104,17 +117,25 @@ impl HostApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
         state: HostLaunchState,
+        outfit: OutfitRuntimeView,
         wake_rx: mpsc::UnboundedReceiver<()>,
         action: Arc<Mutex<Option<HostGuiAction>>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let tooltip = state
             .site_name()
-            .map(|name| format!("Clew · {name}"))
-            .unwrap_or_else(|| "Clew".into());
+            .map(|name| format!("{} · {name}", outfit.resources.app_name))
+            .unwrap_or_else(|| outfit.resources.app_name.clone());
+        let tray = Tray::new(
+            &cc.egui_ctx,
+            tooltip,
+            &outfit.resources.tray_show,
+            &outfit.resources.tray_exit,
+        )?;
         Ok(Self {
             state,
+            outfit,
             wake_rx,
-            tray: Tray::new(&cc.egui_ctx, tooltip)?,
+            tray,
             action,
             exit_requested: false,
         })
@@ -181,15 +202,15 @@ impl eframe::App for HostApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
-        let outfit = OutfitRuntimeView::clew_original();
-        ui.heading(outfit.resources.app_name);
+        let outfit = self.outfit.clone();
+        ui.heading(&outfit.resources.app_name);
         ui.add_space(8.0);
         match &self.state {
             HostLaunchState::Active { membership, .. } => {
                 ui.heading(&membership.marker.site_name);
                 ui.label(format!(
                     "{} · {}",
-                    membership.device.display_name, outfit.resources.ready
+                    membership.device.display_name, &outfit.resources.ready
                 ));
                 ui.add_space(10.0);
                 ui.label(format!("DeviceId: {}", membership.marker.device_id));
@@ -201,7 +222,7 @@ impl eframe::App for HostApp {
                 ..
             } => {
                 ui.heading(&site_file.payload.bootstrap.payload.site_name);
-                ui.label(outfit.resources.awaiting_enrollment);
+                ui.label(&outfit.resources.awaiting_enrollment);
                 ui.add_space(10.0);
                 ui.label(format!("Device name: {hostname}"));
                 ui.label(
@@ -249,10 +270,10 @@ impl eframe::App for HostApp {
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
             ui.horizontal(|ui| {
-                if ui.button(outfit.resources.exit_and_disconnect).clicked() {
+                if ui.button(&outfit.resources.exit_and_disconnect).clicked() {
                     self.request_action(&ctx, HostGuiAction::Exit);
                 }
-                if ui.button(outfit.resources.hide_to_tray).clicked() {
+                if ui.button(&outfit.resources.hide_to_tray).clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
             });

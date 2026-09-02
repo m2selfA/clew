@@ -78,6 +78,21 @@ impl HostLaunchState {
     }
 
     #[must_use]
+    pub fn outfit_runtime_view(&self) -> OutfitRuntimeView {
+        let profile = match self {
+            Self::Active { membership, .. } => membership.marker.outfit_profile.as_ref(),
+            Self::AwaitingEnrollment { site_file, .. } => site_file.payload.outfit_profile.as_ref(),
+            Self::AmbiguousMembership { .. } | Self::MissingInvite { .. } => None,
+        };
+        match profile {
+            Some(profile) => {
+                OutfitRuntimeView::from_profile(profile, &profile.strings.locale_default)
+            }
+            None => OutfitRuntimeView::clew_original(),
+        }
+    }
+
+    #[must_use]
     pub fn site_name(&self) -> Option<&str> {
         match self {
             Self::Active { membership, .. } => Some(&membership.marker.site_name),
@@ -155,9 +170,8 @@ pub fn resolve_host_launch(context: HostLaunchContext) -> Result<HostLaunchState
         return resolve_site_file(&context, site_file, HostSiteSource::ExecutableSibling);
     }
 
-    let flavor_id = context.client_flavor.id()?;
-    let memberships =
-        HostMembershipStore::new(context.state_layout.clone()).recover_for_flavor(flavor_id)?;
+    let memberships = HostMembershipStore::new(context.state_layout.clone())
+        .recover_for_runtime(&context.client_flavor)?;
     match memberships.as_slice() {
         [only] => Ok(HostLaunchState::Active {
             membership: only.clone(),
@@ -179,14 +193,14 @@ fn resolve_site_file(
     site_file: SignedSiteClew,
     source: HostSiteSource,
 ) -> Result<HostLaunchState, HostLaunchError> {
-    site_file.verify_for_flavor(&context.client_flavor)?;
+    let effective_flavor = site_file.effective_flavor_for_runtime(&context.client_flavor)?;
     let controller = site_file.verify()?;
     let site_id = site_file.payload.bootstrap.payload.site_id;
     let site_name = site_file.payload.bootstrap.payload.site_name.clone();
-    let flavor_id = context.client_flavor.id()?;
     let memberships = HostMembershipStore::new(context.state_layout.clone());
     if let Some(membership) = memberships.recover_active_from_site(
-        flavor_id,
+        effective_flavor,
+        site_file.payload.outfit_profile.clone(),
         controller,
         site_id,
         &site_name,

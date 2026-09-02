@@ -10,7 +10,7 @@ use clew_core::{
     ActivityEvent, ActivityResult, ControllerId, ControllerSiteRecord, DeviceId, DeviceRecord,
     DeviceSummary, InviteId, ReadPolicy, SiteId, StateLayout,
 };
-use clew_host::{ClientFlavor, HostRoleHint, SignedSiteClew};
+use clew_host::{HostRoleHint, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
 use clew_transport::{IrohOuter, ReadErrorCode, ReadReply, ReadRequest};
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,8 @@ use tokio::{
 };
 
 use crate::{
-    ControllerConfig, ControllerControlStore, LocalEndpoint, RemoteHub, export_controller_backup,
-    transport,
+    ControllerConfig, ControllerControlStore, LocalEndpoint, OutfitLibrary, OutfitLibraryEntry,
+    RemoteHub, export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -59,6 +59,8 @@ pub struct DeviceList {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteIssueRequest {
     pub site_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outfit_id: Option<String>,
     pub roots: Vec<String>,
     pub max_claims: u32,
     pub valid_for_ms: u64,
@@ -109,6 +111,34 @@ impl std::fmt::Debug for BackupExportRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryStatus {
     pub review: Option<RecoveryReview>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitList {
+    pub entries: Vec<OutfitLibraryEntry>,
+    pub default_outfit_id: String,
+    pub recent_outfit_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitCreateRequest {
+    pub outfit_id: String,
+    pub display_name: String,
+    pub preset: OutfitPreset,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitCloneRequest {
+    pub source_id: String,
+    pub outfit_id: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitSetFieldRequest {
+    pub outfit_id: String,
+    pub field: String,
+    pub value: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -205,6 +235,7 @@ pub(crate) struct LocalApiState {
     pub controller_identity: StoredControllerIdentity,
     pub controller_outer: Option<IrohOuter>,
     pub control: Arc<Mutex<ControllerControlStore>>,
+    pub outfits: Arc<Mutex<OutfitLibrary>>,
     pub remote: RemoteHub,
     pub shutdown_tx: watch::Sender<bool>,
 }
@@ -237,6 +268,16 @@ enum LocalMethod {
         limit: u32,
     },
     ActivityClear,
+    OutfitList,
+    OutfitShow {
+        outfit_id: String,
+    },
+    OutfitCreate(OutfitCreateRequest),
+    OutfitClone(OutfitCloneRequest),
+    OutfitSetDefault {
+        outfit_id: String,
+    },
+    OutfitSetField(OutfitSetFieldRequest),
     BackupExport(BackupExportRequest),
     RecoveryStatus,
     RecoveryConfirm,
@@ -253,6 +294,8 @@ enum LocalResponse {
     ReadResult(RemoteReadResult),
     ReadError(clew_transport::ReadErrorBody),
     ActivityList(ActivityList),
+    OutfitList(OutfitList),
+    OutfitProfile(OutfitProfile),
     RecoveryStatus(RecoveryStatus),
     Ack,
     Error(LocalApiErrorBody),
@@ -397,6 +440,54 @@ async fn dispatch(
                 .unwrap_or_else(LocalResponse::Error);
             (response, false)
         }
+        LocalMethod::OutfitList => {
+            let response = with_outfits(state, |store| {
+                Ok(OutfitList {
+                    entries: store.list(),
+                    default_outfit_id: store.snapshot().default_outfit_id.clone(),
+                    recent_outfit_id: store.snapshot().recent_outfit_id.clone(),
+                })
+            })
+            .map(LocalResponse::OutfitList)
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitShow { outfit_id } => {
+            let response = with_outfits(state, |store| store.get(&outfit_id))
+                .map(LocalResponse::OutfitProfile)
+                .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitCreate(request) => {
+            let response = with_outfits(state, |store| {
+                store.create_from_preset(request.outfit_id, request.display_name, request.preset)
+            })
+            .map(LocalResponse::OutfitProfile)
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitClone(request) => {
+            let response = with_outfits(state, |store| {
+                store.clone_outfit(&request.source_id, request.outfit_id, request.display_name)
+            })
+            .map(LocalResponse::OutfitProfile)
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitSetDefault { outfit_id } => {
+            let response = with_outfits(state, |store| store.set_default(&outfit_id))
+                .map(|()| LocalResponse::Ack)
+                .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::OutfitSetField(request) => {
+            let response = with_outfits(state, |store| {
+                store.set_field(&request.outfit_id, &request.field, request.value)
+            })
+            .map(LocalResponse::OutfitProfile)
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
         LocalMethod::BackupExport(request) => (backup_export_response(state, request).await, false),
         LocalMethod::RecoveryStatus => {
             let response = with_control(state, |store| {
@@ -518,9 +609,21 @@ async fn issue_invite_response(
             );
         }
     };
-    let site_file = match SignedSiteClew::issue_networked(
+    let outfit_profile = match with_outfits(state, |store| {
+        let outfit_id = request
+            .outfit_id
+            .clone()
+            .unwrap_or_else(|| store.snapshot().default_outfit_id.clone());
+        let profile = store.get(&outfit_id)?;
+        store.mark_recent(&outfit_id)?;
+        Ok(profile)
+    }) {
+        Ok(profile) => profile,
+        Err(error) => return LocalResponse::Error(error),
+    };
+    let site_file = match SignedSiteClew::issue_networked_outfit(
         state.controller_identity.identity(),
-        ClientFlavor::clew_original_current(),
+        outfit_profile,
         pass.clone(),
         HostRoleHint::ExecutePreferred,
         controller_endpoint,
@@ -685,6 +788,20 @@ fn with_control<R>(
     })
 }
 
+fn with_outfits<R>(
+    state: &LocalApiState,
+    operation: impl FnOnce(&mut OutfitLibrary) -> Result<R, crate::OutfitStoreError>,
+) -> Result<R, LocalApiErrorBody> {
+    let mut store = state.outfits.lock().map_err(|_| LocalApiErrorBody {
+        code: LocalApiErrorCode::Internal,
+        message: "outfit library is unavailable".into(),
+    })?;
+    operation(&mut store).map_err(|error| LocalApiErrorBody {
+        code: LocalApiErrorCode::InvalidRequest,
+        message: error.to_string(),
+    })
+}
+
 fn current_unix_ms() -> Result<u64, LocalResponse> {
     unix_ms_value().map_err(|_| {
         local_error(
@@ -807,6 +924,63 @@ impl LocalApiClient {
 
     pub async fn activity_clear(&self) -> Result<(), LocalApiClientError> {
         self.expect_ack(LocalMethod::ActivityClear).await
+    }
+
+    pub async fn outfit_list(&self) -> Result<OutfitList, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitList).await? {
+            LocalResponse::OutfitList(result) => Ok(result),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_show(
+        &self,
+        outfit_id: String,
+    ) -> Result<OutfitProfile, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitShow { outfit_id }).await? {
+            LocalResponse::OutfitProfile(profile) => Ok(profile),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_create(
+        &self,
+        request: OutfitCreateRequest,
+    ) -> Result<OutfitProfile, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitCreate(request)).await? {
+            LocalResponse::OutfitProfile(profile) => Ok(profile),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_clone(
+        &self,
+        request: OutfitCloneRequest,
+    ) -> Result<OutfitProfile, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitClone(request)).await? {
+            LocalResponse::OutfitProfile(profile) => Ok(profile),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn outfit_set_default(&self, outfit_id: String) -> Result<(), LocalApiClientError> {
+        self.expect_ack(LocalMethod::OutfitSetDefault { outfit_id })
+            .await
+    }
+
+    pub async fn outfit_set_field(
+        &self,
+        request: OutfitSetFieldRequest,
+    ) -> Result<OutfitProfile, LocalApiClientError> {
+        match self.request(LocalMethod::OutfitSetField(request)).await? {
+            LocalResponse::OutfitProfile(profile) => Ok(profile),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
     }
 
     pub async fn backup_export(
@@ -995,8 +1169,9 @@ mod tests {
             controller_identity,
             controller_outer: None,
             control: Arc::new(Mutex::new(
-                ControllerControlStore::load_or_create(layout, controller_id).unwrap(),
+                ControllerControlStore::load_or_create(layout.clone(), controller_id).unwrap(),
             )),
+            outfits: Arc::new(Mutex::new(OutfitLibrary::load_or_create(layout).unwrap())),
             remote: RemoteHub::default(),
             shutdown_tx: watch::channel(false).0,
         }

@@ -59,7 +59,8 @@ pub async fn complete_networked_activation(
                 }
             };
             let membership = HostMembershipStore::new(layout.clone()).activate_networked(
-                site_file.payload.client_flavor_id,
+                site_file.payload.client_flavor.clone(),
+                site_file.payload.outfit_profile.clone(),
                 &site_file.payload.bootstrap.payload.site_name,
                 &pending,
                 &receipt,

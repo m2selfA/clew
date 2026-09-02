@@ -445,20 +445,45 @@ Known / release blockers：
 
 ## 7. V1.25 — Distribution Studio Foundation
 
-**Status：TODO**
+**Status：IN PROGRESS（V1.25a foundation/custom Site Kit vertical slice DONE；V1.25b Studio GUI/assets 待继续）**
 
-计划：
+**Date：2026-09-02**
 
-- `OutfitProfile` schema/revision；
-- Clew Original / Research Lab / Friendly Minimal / Institution Clean presets；
-- app name/icon/logo/color/string resources；
-- PNG/SVG import + app/tray assets；
+V1.25a 已落地：
+
+- 新增 bounded/versioned `OutfitProfile`（schema v1、revision、256 KiB encoded hard bound）及 Clew Original / Research Lab / Friendly Minimal / Institution Clean 四套 built-in preset；identity/visual/string/distribution-copy 都有字段/长度/颜色/locale/resource-key validation，权限与执行策略不进入 Outfit schema；
+- V1 desktop 固定运行文案默认切换为 English/ASCII，避免 macOS `eframe/default_fonts` 缺 CJK glyph 时显示方框；显式 `zh-CN` resource map 保留为 Outfit locale 资产，但非本地化 identity metadata（app/window/profile display name）默认 ASCII；
+- Controller-owned `OutfitLibrary` 使用双槽 generation 持久化 custom profile/default/recent，built-in read-only；支持 create-from-preset、clone、set field、set default，损坏 newest slot 可回退，已有但不可读 state fail closed；
+- Local API + `clew outfit list/show/new/clone/set/set-default` 已接通，GUI/CLI 仍不直接拥有第二份 Outfit state；
+- `site.clew` 可选携带**受 Controller 签名保护的 OutfitProfile**；profile id/revision 必须与 `ClientFlavor` 匹配。Host 只允许签名 Outfit 替换 flavor 的 outfit id/revision，runtime version/platform/arch pin 仍必须与当前 binary 完全一致；
+- membership marker 持久化完整 `ClientFlavor + OutfitProfile`，因此首次 enrollment 后即使移走 `site.clew`，generic Clew runtime 仍可恢复同一个 branded profile/DeviceKey；旧 V1 marker 通过 `serde(default)` 保持兼容；
+- Host desktop window title/app name/status/button/tray labels 改为从 signed/persisted `OutfitRuntimeView` 解析，不再在 Host GUI 内固定 Clew Original；
+- `clew mint` 保持兼容并增加 `clew invite` alias；`--outfit <id>` 选择显式 Outfit，不指定时使用 Controller OutfitLibrary default，实际签发会标记 recent。
+
+V1.25a acceptance evidence：
+
+- [x] Local API/CLI：隔离 Controller state 中四 built-in 正常列出；从 Research Lab 创建 `huang-lab`，修改 primary color 后 revision 1→2，设为 default/recent；Controller 重启后 revision/default/recent 全部保留；
+- [x] 真实 custom Site Kit：`clew invite "Custom Outfit Smoke" --outfit huang-lab ...` 生成 signed `site.clew`，安全 projection 显示 flavor/profile 均为 `huang-lab` revision 1、window title `Research Connect`、locale `en-US`；
+- [x] generic Windows Host 使用该 custom Site Kit 完成 enrollment/InnerSession，Controller 显示同一设备 `online=true / executable=true`，bounded Read 精确返回 `CLEW-V125-CUSTOM-OUTFIT-PROOF`；
+- [x] 停止 Host 后不再提供 sidecar，只用同一 host-state 重启 generic binary：仍恢复同一 DeviceId、online/executable，并再次 Read 成功；朋友侧仍是打开同一 Site Kit/Host，不增加 route/code/IP/额外 enrollment 动作；
+- [x] security regressions：signed Outfit 不能改变 runtime/platform/arch；tampered profile 验签失败；custom profile membership 无 sidecar 恢复与 wrong-runtime rejection 均有测试。
+
+V1.25a validation：
+
+- `cargo fmt -- --check`：PASS；
+- `cargo check --workspace --all-targets`：PASS，0 warnings；
+- `cargo test --workspace --all-targets`：PASS，**102 tests passed / 0 failed**；另有 Windows interactive Host GUI 与 public n0 relay 两项默认 ignored，均有既往独立 smoke 证据；
+- custom Site Kit smoke 的 Controller/Host 进程与 `%TEMP%\\clew-v125-custom-site-smoke` 临时 state 已确认清理。
+
+V1.25b 继续：
+
+- PNG/SVG import + bounded asset store / app+tray asset projection；
+- Controller GUI Outfit library/editor；
 - live preview：主窗口 / helper / tray / Site Kit；
-- `ClientFlavor` build/cache contract；
-- `clew outfit` CLI + GUI library；
-- `clew invite --outfit`。
+- build/cache contract 与 asset revision hashing；
+- 用一套带 imported asset 的真实 Outfit 再跑 Site Kit acceptance。
 
-Acceptance：从 preset 创建一套自定义 Outfit，用于真实 Site Kit；朋友侧连接动作数与 Clew Original 完全相同。
+最终 V1.25 Acceptance：从 preset 创建一套自定义 Outfit（含可选 imported visual assets）用于真实 Site Kit；朋友侧连接动作数与 Clew Original 完全相同。
 
 ## 8. V1.5 — Zero-config Site Connector
 
@@ -605,13 +630,16 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.4 — Bounded Read + V1 Control Plane（DONE；V1 release gate closed）**
+**Current block：V1.25 — Distribution Studio Foundation（IN PROGRESS；V1.25a DONE）**
 
-**Next block：V1.25 — Distribution Studio Foundation**
+**Next block：V1.25b — Studio GUI + bounded imported assets + live preview**
 
-V1.4 已完成 Controller-owned control state、真实 network enrollment、长期 InnerSession、bounded Read、Activity、rename/invite-close/revoke、backup/restore/Recovery Review、GUI/CLI Local API surface，并完成 Windows 双机/GUI、Linux foreground/live revoke 与 macOS Aqua/tray 真机 acceptance。V1 现在可对外试用，开发顺序正式解锁 V1.25。
+V1.25a 已完成 Outfit schema/presets、Controller-owned OutfitLibrary、Local API/CLI、signed custom Outfit Site Kit、runtime flavor pin、membership branded recovery 与真实 custom Site Kit Read acceptance。下一步继续 Studio GUI、PNG/SVG bounded asset store、preview/build-cache contract；不提前进入 V1.5。
 
 ### Change log
+
+- **2026-09-02** — V1.25a foundation DONE：新增 bounded OutfitProfile/四 preset、Controller-owned 双槽 OutfitLibrary、`clew outfit` Local API/CLI、`clew invite --outfit`、signed OutfitProfile→ClientFlavor→Host runtime→membership recovery vertical slice；真实 `huang-lab` Site Kit enrollment/Read 与无 sidecar 同 DeviceId 重启/再 Read PASS。workspace 102/0，下一块 V1.25b Studio GUI/assets/preview。
+- **2026-09-02** — V1 desktop copy 改为 English/ASCII：修复 macOS `eframe/default_fonts` 下 CJK 方框；`c56ee98 fix: use English desktop copy for v1` 已在 `macos-3dv0:scratchpad` exact native check/build/workspace 93/0/1 与 Controller/Host GUI/tray second-launch wake 上复验。
 
 - **2026-09-02** — V1.4 DONE / V1 release gate closed：在 `macos-3dv0:scratchpad` 完成 macOS 15.7.9 x86_64 原生 build/test 与 Aqua Controller/Host tray smoke。首轮测试发现并修复 macOS Unix socket `SUN_LEN` 深路径缺陷；修复后 macOS workspace 93/0/1、Host enrollment/online/second-launch wake/Read 全通过。Windows、Linux、macOS 三平台 V1 acceptance 至此闭合，下一块解锁 V1.25。
 

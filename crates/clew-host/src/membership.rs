@@ -16,13 +16,17 @@ use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ClientFlavorId, normalize_hostname};
+use crate::{ClientFlavor, ClientFlavorId, OutfitProfile, normalize_hostname};
 
 const MAX_MEMBERSHIP_SCAN_ENTRIES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostMembershipMarker {
     pub client_flavor_id: ClientFlavorId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_flavor: Option<ClientFlavor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outfit_profile: Option<OutfitProfile>,
     pub controller: ControllerPublicIdentity,
     pub site_id: SiteId,
     pub site_name: String,
@@ -62,6 +66,8 @@ impl HostMembershipStore {
     ) -> Result<HostMembership, HostMembershipError> {
         self.activate_with_network(
             client_flavor_id,
+            None,
+            None,
             site_name,
             pending,
             receipt,
@@ -73,7 +79,8 @@ impl HostMembershipStore {
 
     pub fn activate_networked(
         &self,
-        client_flavor_id: ClientFlavorId,
+        client_flavor: ClientFlavor,
+        outfit_profile: Option<OutfitProfile>,
         site_name: &str,
         pending: &PendingDeviceIdentity,
         receipt: &EnrollmentReceipt,
@@ -82,8 +89,12 @@ impl HostMembershipStore {
         read_policy: ReadPolicy,
     ) -> Result<HostMembership, HostMembershipError> {
         read_policy.validate()?;
+        validate_flavor_profile(&client_flavor, outfit_profile.as_ref())?;
+        let client_flavor_id = client_flavor.id()?;
         self.activate_with_network(
             client_flavor_id,
+            Some(client_flavor),
+            outfit_profile,
             site_name,
             pending,
             receipt,
@@ -96,6 +107,8 @@ impl HostMembershipStore {
     fn activate_with_network(
         &self,
         client_flavor_id: ClientFlavorId,
+        client_flavor: Option<ClientFlavor>,
+        outfit_profile: Option<OutfitProfile>,
         site_name: &str,
         pending: &PendingDeviceIdentity,
         receipt: &EnrollmentReceipt,
@@ -141,6 +154,8 @@ impl HostMembershipStore {
         };
         let marker = HostMembershipMarker {
             client_flavor_id,
+            client_flavor,
+            outfit_profile,
             controller: pending.controller(),
             site_id: receipt.site_id,
             site_name,
@@ -203,7 +218,8 @@ impl HostMembershipStore {
 
     pub fn recover_active_from_site(
         &self,
-        client_flavor_id: ClientFlavorId,
+        client_flavor: ClientFlavor,
+        outfit_profile: Option<OutfitProfile>,
         controller: ControllerPublicIdentity,
         site_id: SiteId,
         site_name: &str,
@@ -211,6 +227,8 @@ impl HostMembershipStore {
         read_policy: Option<ReadPolicy>,
     ) -> Result<Option<HostMembership>, HostMembershipError> {
         controller.validate()?;
+        validate_flavor_profile(&client_flavor, outfit_profile.as_ref())?;
+        let client_flavor_id = client_flavor.id()?;
         let identity_store = DeviceIdentityStore::new(self.layout.clone());
         let Some(identity) = identity_store.load_active(controller.controller_id, site_id)? else {
             return Ok(None);
@@ -231,6 +249,8 @@ impl HostMembershipStore {
         }
         let marker = HostMembershipMarker {
             client_flavor_id,
+            client_flavor: Some(client_flavor),
+            outfit_profile,
             controller,
             site_id,
             site_name: validate_site_name(site_name)?,
@@ -255,6 +275,20 @@ impl HostMembershipStore {
     pub fn recover_for_flavor(
         &self,
         client_flavor_id: ClientFlavorId,
+    ) -> Result<Vec<HostMembership>, HostMembershipError> {
+        self.recover_matching(|marker| Ok(marker.client_flavor_id == client_flavor_id))
+    }
+
+    pub fn recover_for_runtime(
+        &self,
+        runtime: &ClientFlavor,
+    ) -> Result<Vec<HostMembership>, HostMembershipError> {
+        self.recover_matching(|marker| marker_matches_runtime(marker, runtime))
+    }
+
+    fn recover_matching(
+        &self,
+        mut matches: impl FnMut(&HostMembershipMarker) -> Result<bool, HostMembershipError>,
     ) -> Result<Vec<HostMembership>, HostMembershipError> {
         let root = self.layout.version_root().join("memberships");
         let controllers = match fs::read_dir(&root) {
@@ -291,7 +325,7 @@ impl HostMembershipStore {
                 else {
                     continue;
                 };
-                if marker.client_flavor_id != client_flavor_id {
+                if !matches(&marker)? {
                     continue;
                 }
                 let membership = self
@@ -322,6 +356,35 @@ impl HostMembershipStore {
     }
 }
 
+fn validate_flavor_profile(
+    flavor: &ClientFlavor,
+    profile: Option<&OutfitProfile>,
+) -> Result<(), HostMembershipError> {
+    if let Some(profile) = profile {
+        profile.validate()?;
+        if profile.outfit_id != flavor.outfit_id || profile.revision != flavor.outfit_revision {
+            return Err(HostMembershipError::MarkerMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn marker_matches_runtime(
+    marker: &HostMembershipMarker,
+    runtime: &ClientFlavor,
+) -> Result<bool, HostMembershipError> {
+    let Some(stored_flavor) = &marker.client_flavor else {
+        return Ok(marker.client_flavor_id == runtime.id()?);
+    };
+    let mut expected = runtime.clone();
+    if let Some(profile) = &marker.outfit_profile {
+        validate_flavor_profile(stored_flavor, Some(profile))?;
+        expected.outfit_id = profile.outfit_id.clone();
+        expected.outfit_revision = profile.revision;
+    }
+    Ok(stored_flavor == &expected && marker.client_flavor_id == expected.id()?)
+}
+
 fn validate_marker_scope(
     marker: &HostMembershipMarker,
     controller_id: ControllerId,
@@ -329,6 +392,14 @@ fn validate_marker_scope(
 ) -> Result<(), HostMembershipError> {
     marker.controller.validate()?;
     if marker.controller.controller_id != controller_id || marker.site_id != site_id {
+        return Err(HostMembershipError::MarkerMismatch);
+    }
+    if let Some(flavor) = &marker.client_flavor {
+        validate_flavor_profile(flavor, marker.outfit_profile.as_ref())?;
+        if flavor.id()? != marker.client_flavor_id {
+            return Err(HostMembershipError::MarkerMismatch);
+        }
+    } else if marker.outfit_profile.is_some() {
         return Err(HostMembershipError::MarkerMismatch);
     }
     validate_site_name(&marker.site_name)?;
@@ -420,6 +491,10 @@ pub enum HostMembershipError {
     Identity(#[from] clew_identity::IdentityError),
     #[error(transparent)]
     IdentityStore(#[from] DeviceIdentityStoreError),
+    #[error(transparent)]
+    Outfit(#[from] crate::OutfitError),
+    #[error(transparent)]
+    SiteClew(#[from] crate::SiteClewError),
     #[error("enrollment receipt does not match pending host identity")]
     ReceiptMismatch,
     #[error("host membership marker does not match identity/device state")]
@@ -447,7 +522,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::ClientFlavor;
+    use crate::{ClientFlavor, OutfitPreset, OutfitProfile};
 
     #[test]
     fn active_membership_reuses_device_id_and_is_recoverable_without_sidecar() {
@@ -505,5 +580,77 @@ mod tests {
         let recovered = store.recover_for_flavor(flavor_id).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].marker.device_id, receipt.device_id);
+    }
+
+    #[test]
+    fn custom_outfit_membership_recovers_for_generic_runtime_without_sidecar() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path());
+        let controller = ControllerIdentity::from_secret([82_u8; 32]);
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let identity_store = DeviceIdentityStore::new(layout.clone());
+        let pending = identity_store
+            .prepare_pending(controller.public_identity(), site_id, invite_id)
+            .unwrap();
+        let mut registry =
+            EnrollmentRegistry::new(controller.controller_id(), PermissionGrant::EXECUTE_READ);
+        let pass = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Outfit Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ,
+                    not_before_unix_ms: 1,
+                    expires_unix_ms: 100,
+                    deployment_window_ms: 50,
+                    max_claims: 1,
+                },
+            )
+            .unwrap();
+        let receipt = registry
+            .claim(&pass, pending.public_identity(), 10)
+            .unwrap();
+        let mut profile = OutfitProfile::preset(OutfitPreset::ResearchLab);
+        profile.outfit_id = "huang-lab".into();
+        profile.display_name = "Huang Lab".into();
+        profile.revision = 3;
+        profile.validate().unwrap();
+        let flavor = ClientFlavor::from_outfit_current(&profile).unwrap();
+        let store = HostMembershipStore::new(layout.clone());
+        let active = store
+            .activate_with_network(
+                flavor.id().unwrap(),
+                Some(flavor.clone()),
+                Some(profile.clone()),
+                "Outfit Lab",
+                &pending,
+                &receipt,
+                "GPU-02",
+                None,
+                None,
+            )
+            .unwrap();
+        registry
+            .finalize_host_persist(invite_id, receipt.device_id, receipt.persist_ack_token())
+            .unwrap();
+
+        assert_eq!(active.marker.outfit_profile.as_ref(), Some(&profile));
+        let runtime = ClientFlavor::clew_original_current();
+        let recovered = store.recover_for_runtime(&runtime).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].marker.client_flavor.as_ref(), Some(&flavor));
+        assert_eq!(recovered[0].marker.outfit_profile.as_ref(), Some(&profile));
+
+        let mut wrong_runtime = runtime;
+        wrong_runtime.arch.push_str("-other");
+        assert!(
+            store
+                .recover_for_runtime(&wrong_runtime)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

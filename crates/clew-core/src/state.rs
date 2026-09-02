@@ -112,6 +112,16 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn outfit_library_slot_a_path(&self) -> PathBuf {
+        self.version_root().join("outfit-library.a.json")
+    }
+
+    #[must_use]
+    pub fn outfit_library_slot_b_path(&self) -> PathBuf {
+        self.version_root().join("outfit-library.b.json")
+    }
+
+    #[must_use]
     pub fn membership_dir(&self, controller_id: ControllerId, site_id: SiteId) -> PathBuf {
         self.version_root()
             .join("memberships")

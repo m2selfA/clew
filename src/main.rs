@@ -8,14 +8,15 @@ mod host_gui;
 use clap::{Parser, Subcommand};
 use clew_core::{DeviceId, InviteId};
 use clew_host::{
-    HostInstanceStart, HostLaunchContext, HostLaunchState, acquire_host_instance,
+    HostInstanceStart, HostLaunchContext, HostLaunchState, OutfitPreset, acquire_host_instance,
     complete_networked_activation, resolve_host_launch, serve_networked_membership_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
-    RemoteReadRequest, restore_controller_backup, start_controller,
+    OutfitCloneRequest, OutfitCreateRequest, OutfitSetFieldRequest, RemoteReadRequest,
+    restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -52,9 +53,12 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
+    #[command(alias = "invite")]
     /// Create a signed networked site.clew invitation for this Controller platform.
     Mint {
         site_name: String,
+        #[arg(long, value_name = "OUTFIT_ID")]
+        outfit: Option<String>,
         #[arg(long = "root", value_name = "DIR", required = true)]
         roots: Vec<PathBuf>,
         #[arg(long, value_name = "FILE", default_value = "site.clew")]
@@ -71,6 +75,11 @@ enum Command {
         read_timeout_ms: u32,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
+    },
+    /// Manage reusable Distribution Studio Outfit profiles through the Controller Local API.
+    Outfit {
+        #[command(subcommand)]
+        command: OutfitCommand,
     },
     /// Close one bootstrap invite to future claims while keeping enrolled devices.
     InviteClose {
@@ -157,6 +166,54 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum OutfitCommand {
+    /// List built-in and custom Outfit profiles.
+    List {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Create a custom Outfit from a built-in preset.
+    New {
+        display_name: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "clew-original")]
+        preset: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Clone any existing Outfit into an editable custom profile.
+    Clone {
+        source_id: String,
+        display_name: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show one complete Outfit profile as JSON.
+    Show {
+        outfit_id: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Update one supported field and create a new Outfit revision when it changes.
+    Set {
+        outfit_id: String,
+        field: String,
+        value: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Set the Outfit selected by default for future invitation workflows.
+    SetDefault {
+        outfit_id: String,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
@@ -215,6 +272,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Mint {
             site_name,
+            outfit,
             roots,
             output,
             max_claims,
@@ -234,6 +292,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let result = LocalApiClient::new(config)
                 .invite_issue(InviteIssueRequest {
                     site_name,
+                    outfit_id: outfit,
                     roots: roots
                         .into_iter()
                         .map(|path| path.to_string_lossy().into_owned())
@@ -253,6 +312,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             result.site_file.write(&output)?;
             println!("{}", output.display());
         }
+        Command::Outfit { command } => run_outfit_command(command).await?,
         Command::InviteClose {
             invite_id,
             state_dir,
@@ -357,6 +417,93 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+async fn run_outfit_command(command: OutfitCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        OutfitCommand::List { state_dir } => {
+            let result = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_list()
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        OutfitCommand::New {
+            display_name,
+            id,
+            preset,
+            state_dir,
+        } => {
+            let profile = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_create(OutfitCreateRequest {
+                    outfit_id: id,
+                    display_name,
+                    preset: parse_outfit_preset(&preset)?,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        OutfitCommand::Clone {
+            source_id,
+            display_name,
+            id,
+            state_dir,
+        } => {
+            let profile = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_clone(OutfitCloneRequest {
+                    source_id,
+                    outfit_id: id,
+                    display_name,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        OutfitCommand::Show {
+            outfit_id,
+            state_dir,
+        } => {
+            let profile = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_show(outfit_id)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        OutfitCommand::Set {
+            outfit_id,
+            field,
+            value,
+            state_dir,
+        } => {
+            let profile = LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_set_field(OutfitSetFieldRequest {
+                    outfit_id,
+                    field,
+                    value,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        OutfitCommand::SetDefault {
+            outfit_id,
+            state_dir,
+        } => {
+            LocalApiClient::new(controller_config(state_dir)?)
+                .outfit_set_default(outfit_id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_outfit_preset(value: &str) -> Result<OutfitPreset, Box<dyn std::error::Error>> {
+    match value {
+        "clew-original" => Ok(OutfitPreset::ClewOriginal),
+        "research-lab" => Ok(OutfitPreset::ResearchLab),
+        "friendly-minimal" => Ok(OutfitPreset::FriendlyMinimal),
+        "institution-clean" => Ok(OutfitPreset::InstitutionClean),
+        _ => Err(format!(
+            "unknown Outfit preset {value:?}; expected clew-original, research-lab, friendly-minimal, or institution-clean"
+        )
+        .into()),
+    }
 }
 
 async fn run_host(

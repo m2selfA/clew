@@ -3,6 +3,7 @@
 mod instance;
 mod membership;
 mod naming;
+mod outfit;
 mod read;
 mod remote;
 mod runtime;
@@ -16,6 +17,11 @@ pub use membership::{
 };
 pub use naming::{
     HostNamingError, apply_hostname_collision_policy, normalize_hostname, observed_hostname,
+};
+pub use outfit::{
+    MAX_OUTFIT_ENCODED_BYTES, OUTFIT_SCHEMA_VERSION, OutfitAssetRef, OutfitDistributionCopy,
+    OutfitError, OutfitIdentity, OutfitPreset, OutfitProfile, OutfitStrings, OutfitVisuals,
+    SurfaceStyle,
 };
 pub use read::HostReadService;
 pub use remote::{

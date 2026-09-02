@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::OutfitRuntimeView;
+use crate::{OutfitPreset, OutfitProfile};
 
 const SITE_CLEW_VERSION: u32 = 1;
 const CLIENT_FLAVOR_DOMAIN: &[u8] = b"clew/client-flavor/v1\0";
@@ -89,14 +89,19 @@ pub struct ClientFlavor {
 impl ClientFlavor {
     #[must_use]
     pub fn clew_original_current() -> Self {
-        let outfit = OutfitRuntimeView::clew_original();
-        Self {
+        Self::from_outfit_current(&OutfitProfile::preset(OutfitPreset::ClewOriginal))
+            .expect("built-in Clew Original outfit must remain valid")
+    }
+
+    pub fn from_outfit_current(outfit: &OutfitProfile) -> Result<Self, SiteClewError> {
+        outfit.validate().map_err(SiteClewError::Outfit)?;
+        Ok(Self {
             runtime_version: env!("CARGO_PKG_VERSION").into(),
             platform: TargetPlatform::current(),
             arch: std::env::consts::ARCH.into(),
-            outfit_id: outfit.outfit_id.into(),
+            outfit_id: outfit.outfit_id.clone(),
             outfit_revision: outfit.revision,
-        }
+        })
     }
 
     pub fn id(&self) -> Result<ClientFlavorId, SiteClewError> {
@@ -120,6 +125,8 @@ pub struct SiteClewPayload {
     pub version: u32,
     pub client_flavor: ClientFlavor,
     pub client_flavor_id: ClientFlavorId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outfit_profile: Option<OutfitProfile>,
     pub bootstrap: SignedSiteBootstrapPass,
     pub role_hint: HostRoleHint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +158,15 @@ impl SignedSiteClew {
         bootstrap: SignedSiteBootstrapPass,
         role_hint: HostRoleHint,
     ) -> Result<Self, SiteClewError> {
-        Self::issue_with_network(controller, client_flavor, bootstrap, role_hint, None, None)
+        Self::issue_with_network(
+            controller,
+            client_flavor,
+            None,
+            bootstrap,
+            role_hint,
+            None,
+            None,
+        )
     }
 
     pub fn issue_networked(
@@ -166,6 +181,29 @@ impl SignedSiteClew {
         Self::issue_with_network(
             controller,
             client_flavor,
+            None,
+            bootstrap,
+            role_hint,
+            Some(controller_endpoint),
+            Some(read_policy),
+        )
+    }
+
+    pub fn issue_networked_outfit(
+        controller: &ControllerIdentity,
+        outfit_profile: OutfitProfile,
+        bootstrap: SignedSiteBootstrapPass,
+        role_hint: HostRoleHint,
+        controller_endpoint: EndpointAddr,
+        read_policy: ReadPolicy,
+    ) -> Result<Self, SiteClewError> {
+        outfit_profile.validate()?;
+        read_policy.validate()?;
+        let client_flavor = ClientFlavor::from_outfit_current(&outfit_profile)?;
+        Self::issue_with_network(
+            controller,
+            client_flavor,
+            Some(outfit_profile),
             bootstrap,
             role_hint,
             Some(controller_endpoint),
@@ -176,6 +214,7 @@ impl SignedSiteClew {
     fn issue_with_network(
         controller: &ControllerIdentity,
         client_flavor: ClientFlavor,
+        outfit_profile: Option<OutfitProfile>,
         bootstrap: SignedSiteBootstrapPass,
         role_hint: HostRoleHint,
         controller_endpoint: Option<EndpointAddr>,
@@ -188,11 +227,20 @@ impl SignedSiteClew {
         if let Some(policy) = &read_policy {
             policy.validate()?;
         }
+        if let Some(profile) = &outfit_profile {
+            profile.validate()?;
+            if profile.outfit_id != client_flavor.outfit_id
+                || profile.revision != client_flavor.outfit_revision
+            {
+                return Err(SiteClewError::OutfitFlavorMismatch);
+            }
+        }
         let client_flavor_id = client_flavor.id()?;
         let payload = SiteClewPayload {
             version: SITE_CLEW_VERSION,
             client_flavor,
             client_flavor_id,
+            outfit_profile,
             bootstrap,
             role_hint,
             controller_endpoint,
@@ -209,6 +257,14 @@ impl SignedSiteClew {
         if self.payload.client_flavor.id()? != self.payload.client_flavor_id {
             return Err(SiteClewError::FlavorFingerprintMismatch);
         }
+        if let Some(profile) = &self.payload.outfit_profile {
+            profile.validate()?;
+            if profile.outfit_id != self.payload.client_flavor.outfit_id
+                || profile.revision != self.payload.client_flavor.outfit_revision
+            {
+                return Err(SiteClewError::OutfitFlavorMismatch);
+            }
+        }
         if let Some(policy) = &self.payload.read_policy {
             policy.validate()?;
         }
@@ -220,14 +276,26 @@ impl SignedSiteClew {
         Ok(controller)
     }
 
-    pub fn verify_for_flavor(&self, expected: &ClientFlavor) -> Result<(), SiteClewError> {
+    pub fn verify_for_flavor(&self, runtime: &ClientFlavor) -> Result<(), SiteClewError> {
+        self.effective_flavor_for_runtime(runtime).map(|_| ())
+    }
+
+    pub fn effective_flavor_for_runtime(
+        &self,
+        runtime: &ClientFlavor,
+    ) -> Result<ClientFlavor, SiteClewError> {
         self.verify()?;
-        if &self.payload.client_flavor != expected
+        let mut expected = runtime.clone();
+        if let Some(profile) = &self.payload.outfit_profile {
+            expected.outfit_id = profile.outfit_id.clone();
+            expected.outfit_revision = profile.revision;
+        }
+        if self.payload.client_flavor != expected
             || self.payload.client_flavor_id != expected.id()?
         {
             return Err(SiteClewError::WrongClientFlavor);
         }
-        Ok(())
+        Ok(expected)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, SiteClewError> {
@@ -339,6 +407,8 @@ pub enum SiteClewError {
     #[error(transparent)]
     Identity(#[from] IdentityError),
     #[error(transparent)]
+    Outfit(#[from] crate::OutfitError),
+    #[error(transparent)]
     Enrollment(#[from] clew_identity::EnrollmentError),
     #[error("site.clew JSON failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -354,6 +424,8 @@ pub enum SiteClewError {
     ControllerMismatch,
     #[error("site.clew ClientFlavor fingerprint does not match its descriptor")]
     FlavorFingerprintMismatch,
+    #[error("site.clew OutfitProfile does not match its ClientFlavor")]
+    OutfitFlavorMismatch,
     #[error("site.clew was generated for a different ClientFlavor")]
     WrongClientFlavor,
     #[error("site.clew is {actual} bytes; maximum is {max}")]
@@ -408,6 +480,63 @@ mod tests {
             tampered.verify(),
             Err(SiteClewError::Identity(IdentityError::InvalidSignature))
         ));
+    }
+
+    #[test]
+    fn signed_outfit_adopts_only_outfit_dimension_of_current_runtime() {
+        let controller = ControllerIdentity::from_secret([72_u8; 32]);
+        let mut registry =
+            EnrollmentRegistry::new(controller.controller_id(), PermissionGrant::EXECUTE_READ);
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id: SiteId::new(),
+                    invite_id: InviteId::new(),
+                    site_name: "Outfit Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ,
+                    not_before_unix_ms: 1,
+                    expires_unix_ms: 10_000,
+                    deployment_window_ms: 1_000,
+                    max_claims: 4,
+                },
+            )
+            .unwrap();
+        let mut profile = OutfitProfile::preset(OutfitPreset::ResearchLab);
+        profile.outfit_id = "huang-lab".into();
+        profile.display_name = "Huang Lab".into();
+        profile.revision = 7;
+        profile.validate().unwrap();
+        let flavor = ClientFlavor::from_outfit_current(&profile).unwrap();
+        let file = SignedSiteClew::issue_with_network(
+            &controller,
+            flavor.clone(),
+            Some(profile.clone()),
+            bootstrap,
+            HostRoleHint::ExecutePreferred,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let runtime = ClientFlavor::clew_original_current();
+        assert_eq!(file.effective_flavor_for_runtime(&runtime).unwrap(), flavor);
+        let mut wrong_runtime = runtime;
+        wrong_runtime.runtime_version.push_str("-other");
+        assert!(matches!(
+            file.effective_flavor_for_runtime(&wrong_runtime),
+            Err(SiteClewError::WrongClientFlavor)
+        ));
+
+        let mut tampered = file;
+        tampered
+            .payload
+            .outfit_profile
+            .as_mut()
+            .unwrap()
+            .visuals
+            .primary_color = "#123456".into();
+        assert!(tampered.verify().is_err());
     }
 
     #[test]
