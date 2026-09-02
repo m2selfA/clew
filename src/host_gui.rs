@@ -60,8 +60,8 @@ impl Tray {
         tooltip: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let menu = Menu::new();
-        let show = MenuItem::new("显示 Clew", true, None);
-        let exit = MenuItem::new("退出并断开", true, None);
+        let show = MenuItem::new("Show Clew", true, None);
+        let exit = MenuItem::new("Exit and disconnect", true, None);
         menu.append(&show)?;
         menu.append(&exit)?;
         let tray = TrayIconBuilder::new()
@@ -193,7 +193,7 @@ impl eframe::App for HostApp {
                 ));
                 ui.add_space(10.0);
                 ui.label(format!("DeviceId: {}", membership.marker.device_id));
-                ui.label("本机身份已恢复；关闭窗口只会隐藏到托盘。");
+                ui.label("Local identity restored. Closing this window only hides it to the tray.");
             }
             HostLaunchState::AwaitingEnrollment {
                 site_file,
@@ -203,9 +203,9 @@ impl eframe::App for HostApp {
                 ui.heading(&site_file.payload.bootstrap.payload.site_name);
                 ui.label(outfit.resources.awaiting_enrollment);
                 ui.add_space(10.0);
-                ui.label(format!("设备名：{hostname}"));
+                ui.label(format!("Device name: {hostname}"));
                 ui.label(
-                    "DeviceKey 已保存在当前操作系统用户的 Clew state 中，不在 Site Kit 目录。",
+                    "The DeviceKey is stored in this operating-system user's Clew state, not in the Site Kit directory.",
                 );
             }
             HostLaunchState::MissingInvite { view, .. } => {
@@ -223,11 +223,11 @@ impl eframe::App for HostApp {
                 {
                     self.request_action(&ctx, HostGuiAction::OpenSite(path));
                 }
-                ui.label("也可以把 site.clew 直接拖到这个窗口。");
+                ui.label("You can also drop site.clew directly onto this window.");
             }
             HostLaunchState::AmbiguousMembership { candidates, .. } => {
-                ui.heading("找到多个本机 Clew 成员身份");
-                ui.label("请选择这次要打开的 Site。Clew 不会猜第一个。");
+                ui.heading("Multiple local Clew memberships found");
+                ui.label("Choose the Site to open. Clew will not guess the first match.");
                 ui.add_space(8.0);
                 for candidate in candidates {
                     if ui

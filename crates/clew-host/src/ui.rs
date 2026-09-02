@@ -28,14 +28,14 @@ impl OutfitRuntimeView {
             resources: UiResources {
                 app_name: "Clew",
                 window_title: "Clew",
-                ready: "这台电脑已准备好。",
-                awaiting_enrollment: "邀请已验证，正在等待连接 Controller。",
-                missing_invite_title: "还缺一个邀请文件。",
-                missing_invite_body: "请把 site.clew 和这个程序放在同一个文件夹，或把 site.clew 拖到这里。",
-                extract_first: "请先全部解压这个压缩包，再打开程序。",
-                choose_invite: "选择邀请文件",
-                hide_to_tray: "隐藏到托盘",
-                exit_and_disconnect: "退出并断开",
+                ready: "This computer is ready.",
+                awaiting_enrollment: "Invitation verified. Connecting to the controller.",
+                missing_invite_title: "An invitation file is still needed.",
+                missing_invite_body: "Keep site.clew next to this app, or drop site.clew here.",
+                extract_first: "Extract the complete archive before opening the app.",
+                choose_invite: "Choose invitation file",
+                hide_to_tray: "Hide to tray",
+                exit_and_disconnect: "Exit and disconnect",
             },
         }
     }
@@ -56,6 +56,6 @@ mod tests {
         let view = OutfitRuntimeView::clew_original();
         assert_eq!(view.outfit_id, "clew-original");
         assert!(view.resources.missing_invite_body.contains("site.clew"));
-        assert!(view.resources.extract_first.contains("全部解压"));
+        assert!(view.resources.extract_first.contains("Extract the complete archive"));
     }
 }

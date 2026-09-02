@@ -428,6 +428,10 @@ mod tests {
             panic!("expected missing invite")
         };
         assert!(view.body.contains("site.clew"));
-        assert!(view.extract_first.unwrap().contains("全部解压"));
+        assert!(
+            view.extract_first
+                .unwrap()
+                .contains("Extract the complete archive")
+        );
     }
 }

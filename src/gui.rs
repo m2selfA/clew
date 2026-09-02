@@ -208,15 +208,15 @@ struct Tray {
 impl Tray {
     fn new(ctx: &egui::Context) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let menu = Menu::new();
-        let show = MenuItem::new("显示 Clew", true, None);
-        let exit = MenuItem::new("退出 Clew", true, None);
+        let show = MenuItem::new("Show Clew", true, None);
+        let exit = MenuItem::new("Exit Clew", true, None);
         menu.append(&show)?;
         menu.append(&exit)?;
 
         let icon = clew_icon()?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Clew · Controller 已就绪")
+            .with_tooltip("Clew · Controller ready")
             .with_icon(icon)
             .build()?;
 
@@ -245,11 +245,11 @@ impl Tray {
 
 fn activity_result_label(result: ActivityResult) -> &'static str {
     match result {
-        ActivityResult::Succeeded => "成功",
-        ActivityResult::Denied => "已拒绝",
-        ActivityResult::Failed => "失败",
-        ActivityResult::TimedOut => "超时",
-        ActivityResult::Cancelled => "已取消",
+        ActivityResult::Succeeded => "Succeeded",
+        ActivityResult::Denied => "Denied",
+        ActivityResult::Failed => "Failed",
+        ActivityResult::TimedOut => "Timed out",
+        ActivityResult::Cancelled => "Cancelled",
     }
 }
 
@@ -334,13 +334,14 @@ impl ControllerApp {
                 }
                 BackendEvent::BackupExportComplete(path) => {
                     self.backup_export_in_flight = false;
-                    self.notice = Some(format!("加密备份已导出：{path}"));
+                    self.notice = Some(format!("Encrypted backup exported: {path}"));
                     self.error = None;
                 }
                 BackendEvent::RecoveryConfirmed(status) => {
                     self.recovery = status;
                     self.recovery_confirm_armed = false;
-                    self.notice = Some("Recovery Review 已确认；允许已恢复设备重新连接。".into());
+                    self.notice =
+                        Some("Recovery Review confirmed; restored devices may reconnect.".into());
                     self.error = None;
                     self.backend.refresh();
                     self.refresh_in_flight = true;
@@ -348,7 +349,7 @@ impl ControllerApp {
                 }
                 BackendEvent::ActivityCleared => {
                     self.activity.events.clear();
-                    self.notice = Some("本机 Activity 历史已清空。".into());
+                    self.notice = Some("Local Activity history cleared.".into());
                     self.error = None;
                 }
                 BackendEvent::Error(error) => {
@@ -403,19 +404,15 @@ impl eframe::App for ControllerApp {
         ui.heading("Clew");
         ui.add_space(8.0);
         if let Some(error) = &self.error {
-            ui.label(format!("Controller 状态：未就绪 · {error}"));
+            ui.label(format!("Controller status: unavailable · {error}"));
         } else if let Some(status) = &self.status {
             ui.label(format!(
-                "Controller 状态：{} · PID {}",
-                if status.ready {
-                    "已就绪"
-                } else {
-                    "未就绪"
-                },
+                "Controller status: {} · PID {}",
+                if status.ready { "Ready" } else { "Not ready" },
                 status.pid
             ));
         } else {
-            ui.label("Controller 状态：正在连接…");
+            ui.label("Controller status: Connecting...");
         }
 
         if let Some(notice) = &self.notice {
@@ -429,20 +426,20 @@ impl eframe::App for ControllerApp {
             ui.group(|ui| {
                 ui.heading("Recovery Review");
                 ui.label(
-                    "此 Controller 从加密备份恢复。旧 DeviceKey 当前被暂停，确认后才允许重新连接。",
+                    "This Controller was restored from an encrypted backup. Existing DeviceKeys remain paused until you confirm recovery.",
                 );
-                ui.label(format!("ControllerId：{}", review.restored_controller_id));
+                ui.label(format!("ControllerId: {}", review.restored_controller_id));
                 if self.recovery_confirm_armed {
                     ui.horizontal(|ui| {
-                        if ui.button("确认并恢复远程访问").clicked() {
+                        if ui.button("Confirm and resume remote access").clicked() {
                             self.backend.recovery_confirm();
                             self.recovery_confirm_armed = false;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button("Cancel").clicked() {
                             self.recovery_confirm_armed = false;
                         }
                     });
-                } else if ui.button("检查后继续…").clicked() {
+                } else if ui.button("Review and continue...").clicked() {
                     self.recovery_confirm_armed = true;
                 }
             });
@@ -452,23 +449,29 @@ impl eframe::App for ControllerApp {
         if self.devices.devices.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(56.0);
-                ui.heading("还没有合作者");
-                ui.label("把生成的 Site Kit 发给对方，对方双击即可。");
+                ui.heading("No collaborators yet");
+                ui.label(
+                    "Send the generated Site Kit to a collaborator; they can open it directly.",
+                );
                 ui.add_space(12.0);
-                ui.add_enabled(false, egui::Button::new("邀请合作者（V1）"));
+                ui.add_enabled(false, egui::Button::new("Invite collaborator (V1)"));
             });
         } else {
-            ui.heading("设备");
+            ui.heading("Devices");
             for device in &self.devices.devices {
                 ui.group(|ui| {
                     ui.strong(format!("{} / {}", device.site_name, device.display_name));
                     ui.label(format!(
                         "{} · {}",
-                        if device.online { "已连接" } else { "离线" },
-                        if device.executable {
-                            "可执行"
+                        if device.online {
+                            "Connected"
                         } else {
-                            "连接助手"
+                            "Offline"
+                        },
+                        if device.executable {
+                            "Executable"
+                        } else {
+                            "Connector"
                         }
                     ));
                 });
@@ -478,13 +481,13 @@ impl eframe::App for ControllerApp {
         ui.separator();
         ui.collapsing("Activity", |ui| {
             ui.horizontal(|ui| {
-                ui.label("最近 20 条本机活动摘要");
-                if ui.button("清空").clicked() {
+                ui.label("Latest 20 local activity summaries");
+                if ui.button("Clear").clicked() {
                     self.backend.activity_clear();
                 }
             });
             if self.activity.events.is_empty() {
-                ui.label("暂无活动记录。");
+                ui.label("No activity yet.");
             } else {
                 for event in self.activity.events.iter().rev() {
                     ui.group(|ui| {
@@ -493,9 +496,9 @@ impl eframe::App for ControllerApp {
                             event.operation,
                             activity_result_label(event.result)
                         ));
-                        ui.label(format!("DeviceId：{}", event.device_id));
+                        ui.label(format!("DeviceId: {}", event.device_id));
                         if let Some(path) = &event.path_summary {
-                            ui.label(format!("路径：{path}"));
+                            ui.label(format!("Path: {path}"));
                         }
                         ui.label(format!(
                             "{} ms · {} bytes",
@@ -507,17 +510,17 @@ impl eframe::App for ControllerApp {
         });
 
         ui.separator();
-        ui.collapsing("Controller 备份", |ui| {
-            ui.label("导出内容使用 Argon2id + XChaCha20-Poly1305 加密；口令不会写入日志或命令行参数。");
+        ui.collapsing("Controller backup", |ui| {
+            ui.label("Exports are encrypted with Argon2id + XChaCha20-Poly1305. The passphrase is never written to logs or command-line arguments.");
             ui.add(
                 egui::TextEdit::singleline(&mut self.backup_passphrase)
                     .password(true)
-                    .hint_text("备份口令（至少 12 bytes）"),
+                    .hint_text("Backup passphrase (at least 12 bytes)"),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut self.backup_passphrase_confirm)
                     .password(true)
-                    .hint_text("再次输入备份口令"),
+                    .hint_text("Confirm backup passphrase"),
             );
             let passphrase_valid = self.backup_passphrase.len() >= 12
                 && self.backup_passphrase == self.backup_passphrase_confirm;
@@ -525,9 +528,9 @@ impl eframe::App for ControllerApp {
                 .add_enabled(
                     passphrase_valid && !self.backup_export_in_flight,
                     egui::Button::new(if self.backup_export_in_flight {
-                        "正在导出…"
+                        "Exporting..."
                     } else {
-                        "导出加密备份…"
+                        "Export encrypted backup..."
                     }),
                 )
                 .clicked()
@@ -543,18 +546,18 @@ impl eframe::App for ControllerApp {
                     self.backup_passphrase_confirm.clear();
                     self.notice = None;
                 } else {
-                    self.error = Some("备份路径必须是有效 UTF-8。".into());
+                    self.error = Some("The backup path must be valid UTF-8.".into());
                 }
             }
-            ui.label("恢复备份必须在 Controller 停止且目标 state 为空时执行；当前使用 `clew backup-restore` 完成该离线安全步骤。之后可在此窗口完成 Recovery Review。 ");
+            ui.label("Restore requires a stopped Controller and an empty target state. Use `clew backup-restore` for that offline step, then complete Recovery Review here.");
         });
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("退出 Clew").clicked() {
+                if ui.button("Exit Clew").clicked() {
                     self.backend.shutdown();
                 }
-                if ui.button("隐藏到托盘").clicked() {
+                if ui.button("Hide to tray").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
             });
