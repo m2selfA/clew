@@ -1045,7 +1045,7 @@ mod tests {
             let helper_outer = helper_outer.clone();
             let controller_addr = controller_addr.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(650)).await;
+                tokio::time::sleep(Duration::from_millis(8_500)).await;
                 let _advertisement = MdnsConnectorDiscovery::attach(
                     &helper_outer,
                     controller_public.controller_id,
@@ -1099,12 +1099,12 @@ mod tests {
         let (_activation_shutdown_tx, activation_shutdown_rx) = tokio::sync::watch::channel(false);
         let activation_started = Instant::now();
         let activated = tokio::time::timeout(
-            Duration::from_secs(12),
+            Duration::from_secs(35),
             wait_for_networked_activation_until_with_timing(
                 &layout,
                 initial,
                 activation_shutdown_rx,
-                Duration::from_millis(150),
+                Duration::from_secs(8),
                 Duration::from_millis(25),
             ),
         )
@@ -1113,7 +1113,7 @@ mod tests {
         .unwrap()
         .expect("activation retry loop stopped unexpectedly");
         assert!(
-            activation_started.elapsed() >= Duration::from_millis(500),
+            activation_started.elapsed() >= Duration::from_secs(8),
             "Target unexpectedly activated before the delayed Helper was online"
         );
         let HostLaunchState::Active { membership, .. } = activated else {
