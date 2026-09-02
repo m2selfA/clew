@@ -9,6 +9,7 @@ use clew_core::{ControllerId, StableIdError};
 const CONTROLLER_ID_DOMAIN: &[u8] = b"clew/controller-id/v1\0";
 const SITE_CONFIG_SIGNATURE_DOMAIN: &[u8] = b"clew/site-config-signature/v1\0";
 const SESSION_BINDING_SIGNATURE_DOMAIN: &[u8] = b"clew/inner-session-binding/v1\0";
+const CONNECTOR_LEASE_SIGNATURE_DOMAIN: &[u8] = b"clew/connector-lease/v1\0";
 const DEVICE_NOISE_STATIC_INFO: &[u8] = b"clew/device-noise-static/v1";
 
 #[derive(Clone)]
@@ -89,6 +90,13 @@ impl ControllerIdentity {
         self.sign_payload(SESSION_BINDING_SIGNATURE_DOMAIN, payload)
     }
 
+    pub fn sign_connector_lease<T: Serialize>(
+        &self,
+        payload: &T,
+    ) -> Result<Vec<u8>, IdentityError> {
+        self.sign_payload(CONNECTOR_LEASE_SIGNATURE_DOMAIN, payload)
+    }
+
     pub(crate) fn secret_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
     }
@@ -131,6 +139,14 @@ impl ControllerPublicIdentity {
         signature: &[u8],
     ) -> Result<(), IdentityError> {
         self.verify_payload(SESSION_BINDING_SIGNATURE_DOMAIN, payload, signature)
+    }
+
+    pub fn verify_connector_lease<T: Serialize>(
+        &self,
+        payload: &T,
+        signature: &[u8],
+    ) -> Result<(), IdentityError> {
+        self.verify_payload(CONNECTOR_LEASE_SIGNATURE_DOMAIN, payload, signature)
     }
 
     pub(crate) fn verify_payload<T: Serialize>(

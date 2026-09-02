@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub enum IrohProtocol {
     InnerSession,
     Bootstrap,
+    Connector,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +68,10 @@ impl IrohOuter {
         self.endpoint.addr()
     }
 
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     pub async fn online_addr(&self) -> Result<EndpointAddr, IrohOuterError> {
         tokio::time::timeout(Duration::from_secs(20), self.endpoint.online())
             .await
@@ -101,6 +106,14 @@ impl IrohOuter {
         addr: EndpointAddr,
     ) -> Result<IrohStream, IrohOuterError> {
         self.connect_with_protocol(addr, IrohProtocol::Bootstrap)
+            .await
+    }
+
+    pub async fn connect_connector(
+        &self,
+        addr: EndpointAddr,
+    ) -> Result<IrohStream, IrohOuterError> {
+        self.connect_with_protocol(addr, IrohProtocol::Connector)
             .await
     }
 
@@ -165,6 +178,7 @@ impl IrohProtocol {
         match self {
             Self::InnerSession => clew_proto::ALPN,
             Self::Bootstrap => clew_proto::BOOTSTRAP_ALPN,
+            Self::Connector => clew_proto::CONNECTOR_ALPN,
         }
     }
 
@@ -173,6 +187,8 @@ impl IrohProtocol {
             Ok(Self::InnerSession)
         } else if alpn == clew_proto::BOOTSTRAP_ALPN {
             Ok(Self::Bootstrap)
+        } else if alpn == clew_proto::CONNECTOR_ALPN {
+            Ok(Self::Connector)
         } else {
             Err(IrohOuterError::UnsupportedAlpn)
         }
@@ -183,6 +199,7 @@ fn supported_alpns() -> Vec<Vec<u8>> {
     vec![
         clew_proto::ALPN.to_vec(),
         clew_proto::BOOTSTRAP_ALPN.to_vec(),
+        clew_proto::CONNECTOR_ALPN.to_vec(),
     ]
 }
 

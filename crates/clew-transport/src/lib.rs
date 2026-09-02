@@ -1,13 +1,30 @@
 #![forbid(unsafe_code)]
 
+mod connector;
+mod discovery;
 mod inner;
+mod lease;
 mod outer;
 mod protocol;
 
+pub use connector::{
+    CONNECTOR_CONTROL_VERSION, ConnectorControlError, ConnectorOpenRequest, ConnectorReady,
+    ConnectorTunnelPurpose, MAX_CONNECTOR_CONTROL_FRAME_BYTES, OpaqueForwardStats,
+    forward_opaque_bidirectional, read_connector_open, read_connector_ready, write_connector_open,
+    write_connector_ready,
+};
+pub use discovery::{
+    ConnectorCandidate, ConnectorDiscoveryAdvertisement, ConnectorDiscoveryError,
+    ConnectorDiscoveryEvent, ConnectorDiscoveryEvents, MdnsConnectorDiscovery, SiteDiscoveryTag,
+};
 pub use inner::{
     ControllerSessionAuthority, ControllerSessionIdentity, DeviceSessionClaim,
     DeviceSessionIdentity, InnerMessage, InnerRole, InnerSession, InnerSessionError,
     MAX_INNER_PLAINTEXT,
+};
+pub use lease::{
+    CONNECTOR_LEASE_VERSION, ConnectorLease, ConnectorLeaseError, ConnectorLeaseRole,
+    MAX_CONNECTOR_LEASE_ENCODED_BYTES, MAX_CONNECTOR_LEASE_LIFETIME_MS, SignedConnectorLease,
 };
 pub use outer::{IrohOuter, IrohOuterError, IrohProtocol, IrohStream};
 pub use protocol::{

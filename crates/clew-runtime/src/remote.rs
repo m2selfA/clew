@@ -145,6 +145,7 @@ pub async fn handle_remote_connection(
     match protocol {
         IrohProtocol::Bootstrap => handle_bootstrap(&mut stream, &identity, control).await,
         IrohProtocol::InnerSession => handle_member(&mut stream, &identity, control, hub).await,
+        IrohProtocol::Connector => Err(RemoteConnectionError::ConnectorNotEnabled),
     }
 }
 
@@ -457,6 +458,8 @@ pub enum RemoteConnectionError {
     RecoveryReviewRequired,
     #[error("remote connection was denied")]
     Denied,
+    #[error("Connector protocol is not enabled in the Controller runtime yet")]
+    ConnectorNotEnabled,
     #[error("bootstrap hostname is too long")]
     InvalidHostname,
     #[error("bootstrap request sequence is invalid")]
@@ -550,7 +553,11 @@ impl RemoteConnectionError {
                 BootstrapErrorCode::Internal,
                 "Controller clock is unavailable.",
             )),
-            Self::Bootstrap(_) | Self::Inner(_) | Self::Read(_) | Self::Hub(_) => None,
+            Self::Bootstrap(_)
+            | Self::Inner(_)
+            | Self::Read(_)
+            | Self::Hub(_)
+            | Self::ConnectorNotEnabled => None,
         }
     }
 
@@ -566,6 +573,7 @@ impl RemoteConnectionError {
             Self::Control(_) => "controller_state",
             Self::RecoveryReviewRequired => "recovery_review",
             Self::Denied => "denied",
+            Self::ConnectorNotEnabled => "connector_not_enabled",
             Self::InvalidHostname => "invalid_hostname",
             Self::InvalidBootstrapSequence => "bootstrap_sequence",
             Self::StatePoisoned => "state_poisoned",

@@ -8,8 +8,11 @@ clew-core = { path = "../clew-core" }
 clew-identity = { path = "../clew-identity" }
 clew-proto = { path = "../clew-proto" }
 iroh.workspace = true
+iroh-mdns-address-lookup.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 snow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true

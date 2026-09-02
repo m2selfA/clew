@@ -530,9 +530,32 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：TODO**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport spike DONE；V1.5b sealed bootstrap + runtime integration next）**
 
-开始前必须完成一个明确的 iroh/LAN discovery implementation spike，确认当前版本的 local discovery/address-lookup API 和 opaque tunnel 承载方式；不得根据旧版本示例直接编码。
+V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`，通过现有 Endpoint 的 runtime `AddressLookupServices` 动态挂载。Clew 不按旧版 iroh discovery 示例编码。
+
+V1.5a 已落地：
+
+- 新增 `clew/connector/1` 独立 ALPN；现有 Controller runtime 在 V1.5b 接线前对该 ALPN **显式 fail closed**，不会把 Connector 误当普通 member 或开放半成品入口；
+- LAN discovery 使用 `iroh-mdns-address-lookup 0.5.0`、自定义 service `clewv1` 和 `AddrFilter::ip_only()`，只广播 direct IP candidates；`UserData` 仅携带 bounded/versioned `clew1;c;<site-tag>`，严格低于 iroh 245-byte hard bound；
+- `SiteDiscoveryTag` 是 domain-separated SHA-256(`ControllerId`,`SiteId`) 的 16-byte/32-lowercase-hex 非秘密 equality tag；它**只用于候选过滤，不是授权证明**。missing/malformed/wrong-Site/self/未来未知 mDNS event 都忽略；`Expired` 只对先前 same-Site matched EndpointId 生效；
+- 新增 Controller-signed `SignedConnectorLease`，独立签名 domain `clew/connector-lease/v1`，绑定 ControllerId / SiteId / helper DeviceId / helper iroh EndpointId / Connector role / issued+expires；最长 10 分钟、encoded ≤8 KiB；wrong Controller/Site/endpoint、tamper、过期/未生效/过长 lifetime 全 fail closed；
+- Target→Helper 先交换 bounded outer control preface（version/site-tag/purpose，max 16 KiB）；Helper 返回 signed lease，Target 验证 Controller pin + Site + **实际发现的 helper EndpointId** + validity 后才允许开始 InnerSession；oversized control frame 在 payload allocation 前拒绝；
+- Helper 数据面只有 `copy_bidirectional` 级 opaque pump 和双向 aggregate byte counts。真实三端 iroh 测试中，Target↔Controller 直接在该转发 stream 两端跑既有 Noise XX InnerSession/Read；Helper 捕获的全部转发 bytes 中不存在 `read`、秘密 Read path 或 result marker；
+- helper 的 control preface/lease 只暴露非秘密 Site routing hint、purpose、签名 lease、sizes/timing；业务 kind/path/file bytes 仍只存在于 InnerSession ciphertext。
+
+V1.5a acceptance evidence：
+
+- [x] real mDNS：同机 listener + wrong-Site advertiser + same-Site helper；wrong-Site 被过滤，same-Site helper 被发现，并使用 mDNS 返回的 `EndpointAddr` 真正完成 Connector ALPN ping/pong；
+- [x] real opaque tunnel：三套真实 iroh Endpoint（Target/Helper/Controller），Target 先验证 Controller-signed helper lease，再经 Helper opaque pump 建立原有 InnerSession；Controller→Target Read、Target→Controller result、encrypted ack 全闭环；Helper plaintext tap 对 tool kind / secret path / result marker 全阴性；
+- [x] bounds/security：noncanonical Site tag、wrong control version、>16 KiB preface、wrong/tampered/expired lease 均 fail closed；mDNS 只发布 direct IP candidate；
+- [x] transport focused：**21 passed / 0 failed / 1 ignored**（public n0 relay）；workspace `cargo check --workspace --all-targets` PASS，0 warnings；workspace tests **121 passed / 0 failed / 2 ignored**（interactive Windows Host GUI / public n0 relay）。
+
+V1.5a known/deferred：
+
+- Controller 还没有从 active `CONNECTOR` member/control store 签发并投递 lease；当前 runtime Connector ALPN 因此保持 `ConnectorNotEnabled` fail-closed；
+- V1.4 `BootstrapRequest` 仍是 direct outer plaintext；**不得**直接经 helper 转发，否则 bearer/device identity/hostname 会被 helper 看见。V1.5b 必须先实现 Controller-authenticated sealed bootstrap，再允许首次 enrollment 走 Connector；
+- mDNS fallback、multiple-helper health/failover、resume re-advertise、Host helper supervisor 仍属于后续 V1.5 子块。
 
 计划：
 
@@ -673,14 +696,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.25 — Distribution Studio Foundation（DONE）**
+**Current block：V1.5 — Zero-config Site Connector（IN PROGRESS；V1.5a DONE）**
 
-**Next block：V1.5 — Zero-config Site Connector discovery spike**
+**Next block：V1.5b — sealed-to-Controller first enrollment + Controller/Host runtime integration**
 
-V1.25a/b-1/b-2 已完成 Outfit schema/library、bounded asset distribution、Controller Studio editor/live preview，以及 Host imported app/tray/logo/key-visual runtime projection；Windows 与 macOS real Studio/Host/no-sidecar Read acceptance 均闭合。V1.25 release gate 已关闭，下一步按第 8 节先做 current iroh/LAN discovery + opaque tunnel implementation spike，再决定 V1.5 具体承载方式。
+V1.5a 已用当前 `iroh 1.1.0` + `iroh-mdns-address-lookup 0.5.0` 真机/真实 endpoint spike 证明 same-Site LAN candidate discovery、Controller-signed helper lease 与 opaque InnerSession tunnel 可行；Helper 不需要也不得终止业务会话。下一步先把首次 enrollment 的 BootstrapRequest 也做 Target→Controller E2E sealing，再把 Connector ALPN 从 runtime fail-closed 状态接入 Controller/Host；在 sealed bootstrap 完成前禁止 helper 转发现有明文 bootstrap。
 
 ### Change log
 
+- **2026-09-02** — V1.5a discovery/opaque-transport spike DONE：确认 iroh 1.1 的 mDNS 已拆到 `iroh-mdns-address-lookup 0.5.0`；落地 same-Site bounded candidate tag、direct-IP-only mDNS、Controller-signed 10-min ConnectorLease、16 KiB outer preface 与 `clew/connector/1` opaque pump。real mDNS wrong-Site filter + EndpointAddr connect PASS，real Target→Helper→Controller Noise/Read plaintext-negative tap PASS；workspace 121/0/2。Controller Connector runtime 继续 fail closed，下一块 V1.5b sealed bootstrap/runtime integration。
 - **2026-09-02** — V1.25 DONE：exact `073acc0` source 在 `macos-3dv0:scratchpad` 完成 native fmt/check/workspace **115/0/1**，Aqua Controller Studio + imported app/tray/logo/key-visual Host 真运行、second-launch wake、Read、asset hash、删除整个 Site Kit 后同 DeviceId branded restart/再 Read 全 PASS。Windows + macOS desktop gate 至此闭合，下一块进入 V1.5 discovery spike。
 - **2026-09-02** — V1.25b-2 implementation complete / macOS gate pending：Controller GUI 新增 Local-API-only Outfit Studio、单 revision batch edit、bounded PNG/SVG thumbnail/live preview；Host runtime 真正消费 imported window/tray/logo/key-visual + primary accent。Windows `studio-smoke` Studio GUI、network branded Host、second-launch wake、Read、删除整包后的同 DeviceId branded restart/再 Read 全 PASS；workspace 114/0。下一步只做 exact commit macOS native/Aqua gate。
 - **2026-09-02** — V1.25b-1 asset distribution DONE：新增 Controller-owned bounded PNG/SVG content-addressed store、asset Local API/CLI、asset revision binding、deterministic build/cache key、`invite` sibling asset export 与 Host signed-hash state cache；真实 asset-lab Site Kit enrollment/Read + 删除整个 kit 后同 DeviceId 无 sidecar restart/再 Read PASS。workspace 109/0，下一块 V1.25b-2 Studio GUI/editor/live preview。
