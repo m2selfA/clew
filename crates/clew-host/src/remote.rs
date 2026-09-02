@@ -1291,6 +1291,322 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FailoverDiscovery {
+        Mdns,
+        NearbyFile,
+    }
+
+    #[tokio::test]
+    async fn active_session_fails_over_between_nearby_file_helpers() {
+        run_active_helper_failover(FailoverDiscovery::NearbyFile).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires working multicast mDNS on the test network"]
+    async fn active_session_fails_over_between_real_mdns_helpers() {
+        run_active_helper_failover(FailoverDiscovery::Mdns).await;
+    }
+
+    async fn run_active_helper_failover(discovery: FailoverDiscovery) {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path().join("failover-state"));
+        let share = temp.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let proof_a = share.join("a.txt");
+        let proof_b = share.join("b.txt");
+        const PROOF_A: &[u8] = b"CLEW-V15D-HELPER-A";
+        const PROOF_B: &[u8] = b"CLEW-V15D-HELPER-B";
+        std::fs::write(&proof_a, PROOF_A).unwrap();
+        std::fs::write(&proof_b, PROOF_B).unwrap();
+
+        let controller = ControllerIdentity::from_secret([121_u8; 32]);
+        let controller_public = controller.public_identity();
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let now = unix_ms().unwrap();
+        let mut registry = EnrollmentRegistry::new(
+            controller.controller_id(),
+            PermissionGrant::EXECUTE_READ_CONNECTOR,
+        );
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Failover Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+                    not_before_unix_ms: now.saturating_sub(1_000),
+                    expires_unix_ms: now + 120_000,
+                    deployment_window_ms: 120_000,
+                    max_claims: 1,
+                },
+            )
+            .unwrap();
+        let pending = DeviceIdentityStore::new(layout.clone())
+            .prepare_pending(controller_public, site_id, invite_id)
+            .unwrap();
+        let receipt = registry
+            .claim(&bootstrap, pending.public_identity(), now)
+            .unwrap();
+
+        let controller_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let controller_addr = controller_outer.addr();
+        let helper_a_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let helper_b_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let helper_a_addr = helper_a_outer.addr();
+        let helper_b_addr = helper_b_outer.addr();
+        let helper_a_device = DeviceId::new();
+        let helper_b_device = DeviceId::new();
+        let lease_a = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            helper_a_device,
+            helper_a_addr.id,
+            now.saturating_sub(1_000),
+            now + 120_000,
+        )
+        .unwrap();
+        let lease_b = SignedConnectorLease::issue(
+            &controller,
+            site_id,
+            helper_b_device,
+            helper_b_addr.id,
+            now.saturating_sub(1_000),
+            now + 120_000,
+        )
+        .unwrap();
+
+        let bogus_controller = EndpointAddr::new(SecretKey::from_bytes(&[122_u8; 32]).public());
+        let read_policy =
+            ReadPolicy::new(vec![share.to_string_lossy().into_owned()], 4_096, 2_000).unwrap();
+        let membership = HostMembershipStore::new(layout.clone())
+            .activate_networked(
+                crate::ClientFlavor::clew_original_current(),
+                None,
+                "Failover Lab",
+                &pending,
+                &receipt,
+                "FAILOVER-TARGET",
+                bogus_controller,
+                read_policy,
+                None,
+            )
+            .unwrap();
+        registry
+            .finalize_host_persist(invite_id, receipt.device_id, receipt.persist_ack_token())
+            .unwrap();
+        DeviceIdentityStore::new(layout.clone())
+            .confirm_controller_activation(controller.controller_id(), site_id, receipt.device_id)
+            .unwrap();
+        let expected_device = membership.identity.public_identity();
+        let expected_device_id = membership.marker.device_id;
+
+        let nearby_store = NearbyConnectorStore::new(layout.clone());
+        let mut mdns_a = None;
+        match discovery {
+            FailoverDiscovery::Mdns => {
+                mdns_a = Some(
+                    MdnsConnectorDiscovery::attach(
+                        &helper_a_outer,
+                        controller_public.controller_id,
+                        site_id,
+                        true,
+                    )
+                    .unwrap(),
+                );
+            }
+            FailoverDiscovery::NearbyFile => {
+                let file = NearbyConnectorFile::from_helper(helper_a_addr.clone(), lease_a.clone())
+                    .unwrap();
+                nearby_store
+                    .import_file(&file, &controller_public, site_id)
+                    .unwrap();
+            }
+        }
+
+        let helper_a_task = tokio::spawn({
+            let helper_a_outer = helper_a_outer.clone();
+            let controller_addr = controller_addr.clone();
+            async move {
+                let (protocol, inbound) = helper_a_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                serve_one_connector_tunnel(
+                    &helper_a_outer,
+                    inbound,
+                    controller_addr,
+                    controller_public,
+                    site_id,
+                    helper_a_device,
+                    lease_a,
+                )
+                .await
+            }
+        });
+        let helper_b_lease = lease_b.clone();
+        let helper_b_task = tokio::spawn({
+            let helper_b_outer = helper_b_outer.clone();
+            let controller_addr = controller_addr.clone();
+            async move {
+                let (protocol, inbound) = helper_b_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                serve_one_connector_tunnel(
+                    &helper_b_outer,
+                    inbound,
+                    controller_addr,
+                    controller_public,
+                    site_id,
+                    helper_b_device,
+                    helper_b_lease,
+                )
+                .await
+            }
+        });
+
+        let (first_done_tx, first_done_rx) = tokio::sync::oneshot::channel();
+        let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+        let (second_done_tx, second_done_rx) = tokio::sync::oneshot::channel();
+        let controller_task = tokio::spawn({
+            let controller_outer = controller_outer.clone();
+            let controller = controller.clone();
+            let proof_a = proof_a.to_string_lossy().into_owned();
+            let proof_b = proof_b.to_string_lossy().into_owned();
+            async move {
+                let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                assert_eq!(stream.connection().remote_id(), helper_a_addr.id);
+                let open = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(open.purpose, ConnectorTunnelPurpose::InnerSession);
+                let mut inner = InnerSession::accept(
+                    &mut stream,
+                    clew_transport::ControllerSessionIdentity {
+                        identity: controller.clone(),
+                        noise_static_secret: [123_u8; 32],
+                        expected_device,
+                        device_id: expected_device_id,
+                        site_id,
+                    },
+                )
+                .await
+                .unwrap();
+                inner
+                    .send(
+                        &mut stream,
+                        &ReadRequest::new(proof_a, 0, 4_096)
+                            .unwrap()
+                            .into_message()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let first_reply = inner.recv(&mut stream).await.unwrap();
+                assert_eq!(
+                    ReadReply::from_message(&first_reply).unwrap(),
+                    ReadReply::Data(PROOF_A.to_vec())
+                );
+                let _ = first_done_tx.send(());
+                let _ = first_release_rx.await;
+                drop(inner);
+                drop(stream);
+
+                let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::Connector);
+                assert_eq!(stream.connection().remote_id(), helper_b_addr.id);
+                let open = read_connector_open(&mut stream).await.unwrap();
+                assert_eq!(open.purpose, ConnectorTunnelPurpose::InnerSession);
+                let mut inner = InnerSession::accept(
+                    &mut stream,
+                    clew_transport::ControllerSessionIdentity {
+                        identity: controller,
+                        noise_static_secret: [123_u8; 32],
+                        expected_device,
+                        device_id: expected_device_id,
+                        site_id,
+                    },
+                )
+                .await
+                .unwrap();
+                inner
+                    .send(
+                        &mut stream,
+                        &ReadRequest::new(proof_b, 0, 4_096)
+                            .unwrap()
+                            .into_message()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let second_reply = inner.recv(&mut stream).await.unwrap();
+                assert_eq!(
+                    ReadReply::from_message(&second_reply).unwrap(),
+                    ReadReply::Data(PROOF_B.to_vec())
+                );
+                let _ = second_done_tx.send(());
+            }
+        });
+
+        let (target_shutdown_tx, target_shutdown_rx) = tokio::sync::oneshot::channel();
+        let target_task = tokio::spawn({
+            let layout = layout.clone();
+            let membership = membership.clone();
+            async move {
+                serve_networked_membership_until_with_layout(&layout, &membership, async move {
+                    let _ = target_shutdown_rx.await;
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(12), first_done_rx)
+            .await
+            .expect("Helper-A never carried the first active Read")
+            .unwrap();
+        drop(mdns_a.take());
+        helper_a_outer.close().await;
+
+        let mut mdns_b = None;
+        match discovery {
+            FailoverDiscovery::Mdns => {
+                mdns_b = Some(
+                    MdnsConnectorDiscovery::attach(
+                        &helper_b_outer,
+                        controller_public.controller_id,
+                        site_id,
+                        true,
+                    )
+                    .unwrap(),
+                );
+            }
+            FailoverDiscovery::NearbyFile => {
+                let file = NearbyConnectorFile::from_helper(helper_b_addr.clone(), lease_b.clone())
+                    .unwrap();
+                nearby_store
+                    .import_file(&file, &controller_public, site_id)
+                    .unwrap();
+            }
+        }
+        let _ = first_release_tx.send(());
+
+        tokio::time::timeout(Duration::from_secs(15), second_done_rx)
+            .await
+            .expect("Target did not fail over from Helper-A to Helper-B")
+            .unwrap();
+        let _ = target_shutdown_tx.send(());
+        controller_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), target_task)
+            .await
+            .expect("Target failover runtime did not stop after shutdown")
+            .unwrap()
+            .unwrap();
+
+        drop(mdns_b.take());
+        helper_b_outer.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), helper_b_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), helper_a_task).await;
+        controller_outer.close().await;
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum NoPublicDiscovery {
         MdnsDelayed,
         NearbyFile,

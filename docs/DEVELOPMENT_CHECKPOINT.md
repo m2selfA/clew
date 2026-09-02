@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE；V1.5d-1 bounded concurrent helper selection DONE；当前进入 V1.5d-2 Helper-A→Helper-B session failover）**
+**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE；V1.5d-1 bounded concurrent helper selection DONE；V1.5d-2 Helper-A→Helper-B active session failover DONE；当前进入 V1.5d-3 suspend/resume presence refresh）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -658,6 +658,21 @@ Acceptance / validation evidence：
 Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **136 passed / 0 failed / 5 ignored**（interactive Windows GUI、3 个显式 multicast integration、public n0 relay）；real-mDNS stalled-first acceptance 另显式 1/1 PASS。
 
 下一块 V1.5d-2：在已经建立并实际承载 InnerSession/Read 的 Helper-A 断开后，让长期 Host runtime 自动回到 path race，选择 Helper-B 并恢复同一 DeviceKey session；Target 仍只绑定 Site，不持久绑定 HelperId。
+
+### V1.5d-2 — Active Helper-A → Helper-B session failover
+
+**Status：DONE（2026-09-03）**
+
+实际验收：
+
+- 没有新增第二套“session migration”协议。长期 `serve_networked_membership_until_with_layout` 在当前 outer/InnerSession 断开后按既有可取消 retry 语义重新进入 Site path race；V1.5d-1 的并发候选选择让这个重建天然支持多个 Helper；
+- 同一个 active membership/DeviceKey 先经 Helper-A 建立原 V1.3 InnerSession，Controller 从 A 的 outer EndpointId 收到连接并发送真实 bounded Read-A；A 随后真正关闭 endpoint/撤 discovery，Target session 断开后自动重试；Helper-B 再上线后，Controller 第二次从 B 的 outer EndpointId 收到连接并发送 Read-B；
+- Controller 两次均只接受**相同 DeviceId + 相同 DevicePublicIdentity**，Target 没有重新 enrollment、没有新 DeviceKey、没有持久绑定 HelperId；两次业务协议都还是 Target↔Controller InnerSession，Helper 只转发 opaque ciphertext；
+- 默认 no-multicast acceptance 用 per-Site `nearby-connection.clew` route 从 A 原子替换为 B，完整 failover **1/1 PASS（2.41s）**；cap00 real-mDNS acceptance 撤掉 A 广播并关闭 A，再发布 B，完整 failover **1/1 PASS（3.48s）**。
+
+Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **137 passed / 0 failed / 6 ignored**（interactive Windows GUI、4 个显式 multicast integration、public n0 relay）。
+
+下一块 V1.5d-3：刷新独立 LAN presence，使 helper 在系统 resume / 接口变化后用当前 `outer.addr()` 重建 mDNS advertisement 和 export hint；不伪造“睡眠”状态，没有 OS suspend event 时 UI 仍只显示 offline/reconnecting。
 
 计划：
 
