@@ -387,16 +387,30 @@ impl eframe::App for HostApp {
             )));
         }
         ui.add_space(8.0);
+        let connector_only = self.state.is_connector_only();
         match &self.state {
             HostLaunchState::Active { membership, .. } => {
                 ui.heading(&membership.marker.site_name);
+                let ready_text = if connector_only {
+                    &outfit.resources.helper_ready
+                } else {
+                    &outfit.resources.ready
+                };
                 ui.label(format!(
                     "{} · {}",
-                    membership.device.display_name, &outfit.resources.ready
+                    membership.device.display_name, ready_text
                 ));
                 ui.add_space(10.0);
-                ui.label(format!("DeviceId: {}", membership.marker.device_id));
-                ui.label("Local identity restored. Closing this window only hides it to the tray.");
+                if connector_only {
+                    ui.strong("This computer only helps nearby computers connect.");
+                    ui.label("Its files and commands are not exposed to the Controller.");
+                    ui.label("Target-to-Controller content remains end-to-end protected through this helper.");
+                } else {
+                    ui.label(format!("DeviceId: {}", membership.marker.device_id));
+                    ui.label(
+                        "Local identity restored. Closing this window only hides it to the tray.",
+                    );
+                }
                 if membership.device.capabilities.connector
                     && ui.button("Save Nearby Connection File...").clicked()
                 {
@@ -433,6 +447,10 @@ impl eframe::App for HostApp {
             } => {
                 ui.heading(&site_file.payload.bootstrap.payload.site_name);
                 ui.label(&outfit.resources.awaiting_enrollment);
+                if connector_only {
+                    ui.strong("Connecting only as a nearby connection helper.");
+                    ui.label("This computer will not expose its files or commands.");
+                }
                 if let Some(texture) = &self.key_visual {
                     ui.add(egui::Image::new((
                         texture.id(),

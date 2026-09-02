@@ -531,6 +531,7 @@ CryoEM-PC
 ```
 
 邀请对话框**不增加“要不要 Gateway”问题**。所有邀请都生成 site-capable artifact。
+实现约束已经冻结：Controller GUI 的正常邀请始终签 `ExecutePreferred` site-capable `site.clew`；friend-side helper-only 不要求控制者重签第二份邀请，而是同一 runtime 用 `host --connector-only` 启动，同一 signed pass 在 Controller 上再经过 `BootstrapMemberMode::ConnectorOnly` ceiling。该入口只能减少权限，不能把 signed/helper membership 升成 EXECUTE。正式发行包里的“① 使用这台电脑 / ② 只帮助附近电脑连接”双 launcher 由 V6 packaging 按此 argv contract 生成。
 
 Controller 可以在高级选项里设置“预计几台电脑/包含哪些平台”，只影响包内容和部署进度展示，不改变朋友的连接步骤。
 设备行菜单提供 **改名 / 停止这台**。Site/邀请菜单区分 **停止继续加入**（只关 bootstrap）、**作废这份分发包**（关 bootstrap + revoke 由它加入的设备）、**停止整个 Site**。这三个动作不能合并成一个含糊“移除”。

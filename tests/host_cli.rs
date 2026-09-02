@@ -143,6 +143,18 @@ fn wait_for_host_ready(fixture: &Fixture) {
 }
 
 #[test]
+fn host_help_exposes_same_runtime_connector_only_entry() {
+    let output = Command::new(env!("CARGO_BIN_EXE_clew"))
+        .args(["host", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--connector-only"), "{stdout}");
+    assert!(stdout.contains("nearby connection helper"), "{stdout}");
+}
+
+#[test]
 fn second_foreground_host_wakes_existing_and_restart_reuses_device_key() {
     let temp = tempdir().unwrap();
     let fixture = fixture(temp.path());

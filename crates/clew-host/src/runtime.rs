@@ -43,6 +43,13 @@ impl HostLaunchContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HostLaunchMode {
+    #[default]
+    Default,
+    ConnectorOnly,
+}
+
 #[derive(Clone, Debug)]
 pub enum HostLaunchState {
     Active {
@@ -53,6 +60,7 @@ pub enum HostLaunchState {
         site_file: SignedSiteClew,
         pending: PendingDeviceIdentity,
         hostname: String,
+        launch_mode: HostLaunchMode,
         source: HostSiteSource,
     },
     AmbiguousMembership {
@@ -95,6 +103,24 @@ impl HostLaunchState {
                 OutfitRuntimeView::from_profile(profile, &profile.strings.locale_default)
             }
             None => OutfitRuntimeView::clew_original(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_connector_only(&self) -> bool {
+        match self {
+            Self::Active { membership, .. } => {
+                membership.device.capabilities.connector && !membership.device.capabilities.execute
+            }
+            Self::AwaitingEnrollment {
+                site_file,
+                launch_mode,
+                ..
+            } => {
+                *launch_mode == HostLaunchMode::ConnectorOnly
+                    || site_file.payload.role_hint == crate::HostRoleHint::ConnectorOnly
+            }
+            Self::AmbiguousMembership { .. } | Self::MissingInvite { .. } => false,
         }
     }
 
@@ -165,9 +191,22 @@ pub struct MissingInviteView {
 }
 
 pub fn resolve_host_launch(context: HostLaunchContext) -> Result<HostLaunchState, HostLaunchError> {
+    resolve_host_launch_with_mode(context, HostLaunchMode::Default)
+}
+
+pub fn resolve_host_launch_with_mode(
+    context: HostLaunchContext,
+    launch_mode: HostLaunchMode,
+) -> Result<HostLaunchState, HostLaunchError> {
     if let Some(explicit) = &context.explicit_site {
         let site_file = SignedSiteClew::read(explicit)?;
-        return resolve_site_file(&context, site_file, HostSiteSource::Explicit, explicit);
+        return resolve_site_file(
+            &context,
+            site_file,
+            HostSiteSource::Explicit,
+            explicit,
+            launch_mode,
+        );
     }
 
     let sibling = site_clew_sibling(&context.executable_path)?;
@@ -178,6 +217,7 @@ pub fn resolve_host_launch(context: HostLaunchContext) -> Result<HostLaunchState
             site_file,
             HostSiteSource::ExecutableSibling,
             &sibling,
+            launch_mode,
         );
     }
 
@@ -212,6 +252,7 @@ fn resolve_site_file(
     site_file: SignedSiteClew,
     source: HostSiteSource,
     site_path: &Path,
+    launch_mode: HostLaunchMode,
 ) -> Result<HostLaunchState, HostLaunchError> {
     let effective_flavor = site_file.effective_flavor_for_runtime(&context.client_flavor)?;
     if let Some(profile) = &site_file.payload.outfit_profile {
@@ -244,6 +285,7 @@ fn resolve_site_file(
         site_file,
         pending,
         hostname: observed_hostname(),
+        launch_mode,
         source,
     })
 }
@@ -529,6 +571,55 @@ mod tests {
                 .unwrap(),
             registry,
         )
+    }
+
+    #[test]
+    fn connector_only_launch_mode_is_explicit_and_pending_only() {
+        let temp = tempdir().unwrap();
+        let kit = temp.path().join("kit");
+        std::fs::create_dir_all(&kit).unwrap();
+        let state = StateLayout::new(temp.path().join("state"));
+        let flavor = ClientFlavor::clew_original_current();
+        let controller = ControllerIdentity::from_secret([90_u8; 32]);
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let (site, _) = site_file(
+            &controller,
+            site_id,
+            invite_id,
+            "Helper Lab",
+            flavor.clone(),
+        );
+        let sidecar = kit.join("site.clew");
+        site.write(&sidecar).unwrap();
+        let context = HostLaunchContext {
+            explicit_site: Some(sidecar),
+            executable_path: kit.join("Clew.exe"),
+            state_layout: state,
+            client_flavor: flavor,
+            archive_temp_detected: false,
+        };
+
+        let helper =
+            resolve_host_launch_with_mode(context.clone(), HostLaunchMode::ConnectorOnly).unwrap();
+        assert!(helper.is_connector_only());
+        assert!(matches!(
+            helper,
+            HostLaunchState::AwaitingEnrollment {
+                launch_mode: HostLaunchMode::ConnectorOnly,
+                ..
+            }
+        ));
+
+        let normal = resolve_host_launch(context).unwrap();
+        assert!(!normal.is_connector_only());
+        assert!(matches!(
+            normal,
+            HostLaunchState::AwaitingEnrollment {
+                launch_mode: HostLaunchMode::Default,
+                ..
+            }
+        ));
     }
 
     #[test]

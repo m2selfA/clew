@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a discovery/opaque-transport DONE；V1.5b sealed enrollment + authenticated Helper runtime DONE；V1.5c-1 active no-public InnerSession/Read DONE；V1.5c-2 order-independent background retry DONE；V1.5c-3 nearby-file fallback DONE；V1.5d-1 concurrent selection DONE；V1.5d-2 Helper failover DONE；V1.5d-3 resume presence refresh DONE；当前做 V1.5 final gap audit）**
+**Status：IN PROGRESS（V1.5a–d DONE；V1.5e Controller GUI invite + same-Site-Kit helper-only entry IMPLEMENTED / Windows ACCEPTED；exact-commit macOS gate next，随后做 V1.5 final multi-machine acceptance）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -689,6 +689,25 @@ Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-target
 Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **139 passed / 0 failed / 6 ignored**（interactive Windows GUI、4 个显式 multicast integration、public n0 relay）。
 
 下一步：V1.5 final gap audit，确认 helper-only friend-facing 分发入口、最终跨平台/两机证据与文档一致后再决定整体封板；不把 V2/V3 的 agent tools/task-resume 工作提前塞回 V1.5。
+
+### V1.5e — Real Controller GUI invite + same-Site-Kit helper-only entry
+
+**Status：IMPLEMENTED + WINDOWS ACCEPTED（2026-09-03；macOS exact-commit acceptance pending）**
+
+实际落地：
+
+- final gap audit 发现两个真实产品缺口并一并关闭：Controller 主窗的 `Invite collaborator (V1)` 仍是 disabled 占位；helper-only 虽已有 protocol/permission ceiling，但用户没有从同一 Site Kit 进入该模式的产品入口；
+- Controller GUI 现在通过既有 authenticated Local API 真正执行 `invite_issue`，不在 GUI 内复制签名逻辑。邀请表单不问 Gateway/Connector，只收 Site 名和“**合作者电脑上的 absolute read root**”；后者明确不是 Controller 本机 folder picker，避免把本机路径误签成远端 policy；默认 Outfit 与 bounded invite/read 参数沿既有安全面复用；
+- CLI `mint` 与 GUI 共用新 `invite_io`：先从 Controller 取回 Outfit assets，核对 asset id/长度/content hash，原子写到 kit sibling，再落 signed `site.clew`。显式隔离 Controller smoke 真正走 Local API 签出 **7990-byte** `site.clew`，serde role 为 `execute_preferred`，证明 GUI 默认邀请仍是 site-capable artifact而不是预判 Gateway；随后 authenticated shutdown 与 smoke state/output 清理均完成；
+- 新 `HostLaunchMode::{Default, ConnectorOnly}` 只存在于**尚未 enrollment** 的启动 intent；已有 membership 以持久化 capability 为准，第二次从另一个入口打开不能改写既有授权；组合规则是 signed `HostRoleHint::ConnectorOnly` **或**本次 `--connector-only` 任一成立就只发送 `BootstrapMemberMode::ConnectorOnly`，因此入口只能降权、不能升级；
+- 同一 signed `ExecutePreferred` Site Kit 的真实 no-public sealed enrollment 新增 helper-only acceptance：Controller 的 production `claim_with_ceiling` 最终得到 `execute=false/read=false/write=false/shell=false/connector=true`，Active membership 也 `executable=false`，**1/1 PASS（2.84s）**；monotonic downgrade 与 pending-only state 另有 focused regression；
+- `SiteKitContract` 冻结同 runtime / 同 `site.clew` 的双入口 argv：普通入口 `host`，helper 入口 `host --connector-only`，Windows/macOS/Linux 一致。**这里冻结的是 V1.5 产品语义 contract；真正 Windows shortcut/macOS launcher/Linux packaging、codesign/notarization 仍属于 V6，不提前宣称已生成正式双 launcher artifact。**
+- Host GUI/foreground 对 helper-only 使用 Outfit 的 helper-ready string，并固定明确“这台电脑只帮助附近电脑连接；不会开放文件或命令；Target↔Controller 内容仍端到端保护”；普通 EXECUTE+CONNECTOR 自动 promotion 不要求朋友切换模式；
+- Controller GUI disabled invite 占位已移除，真实表单/后台 command 已接通；Windows interactive GUI job 持续 >15 秒 stderr 为空，且 GUI 自动拉起的隔离 Controller `status` 返回 `ready=true` + remote EndpointId。Host interactive GUI/tray regression **1/1 PASS**。
+
+Windows/cap00 validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**；`host --help` helper entry **1/1 PASS**；same-Site-Kit helper-only real enrollment **1/1 PASS**；真实 invite output smoke PASS；Windows Host GUI/tray **1/1 PASS**；Controller GUI/auto-Controller smoke PASS。
+
+下一步：先把本块 exact commit 送到 `macos-3dv0` 做 native workspace、helper-only no-public focused、CLI entry 与 Aqua Controller/Host gate；通过后再做 V1.5 final multi-machine acceptance。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
 
 计划：
 

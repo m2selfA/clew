@@ -4,24 +4,23 @@ use std::{io::Write, path::PathBuf, process::ExitCode};
 mod gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod host_gui;
+mod invite_io;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, Subcommand};
 use clew_core::{DeviceId, InviteId};
 use clew_host::{
-    HostInstanceStart, HostLaunchContext, HostLaunchState, OutfitPreset, SignedSiteClew,
-    acquire_host_instance, resolve_host_launch, serve_networked_membership_until_with_layout,
-    verify_outfit_asset_bytes, wait_for_networked_activation_until,
+    HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
+    acquire_host_instance, resolve_host_launch_with_mode,
+    serve_networked_membership_until_with_layout, wait_for_networked_activation_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
-    OutfitAssetFormat, OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest,
-    OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteReadRequest, restore_controller_backup,
-    start_controller,
+    OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
+    OutfitSetFieldRequest, RemoteReadRequest, restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -47,6 +46,9 @@ enum Command {
         /// Keep status in the terminal instead of opening the desktop Host window.
         #[arg(long)]
         foreground: bool,
+        /// Use this Site Kit only as a nearby connection helper. This can only reduce authority.
+        #[arg(long)]
+        connector_only: bool,
     },
     /// Run the persistent local Controller, or attach to the existing owner.
     Controller {
@@ -255,7 +257,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             site,
             state_dir,
             foreground,
-        } => run_host(site, state_dir, foreground).await?,
+            connector_only,
+        } => {
+            let launch_mode = if connector_only {
+                HostLaunchMode::ConnectorOnly
+            } else {
+                HostLaunchMode::Default
+            };
+            run_host(site, state_dir, foreground, launch_mode).await?
+        }
         Command::Controller { state_dir } => {
             let config = controller_config(state_dir)?;
             match start_controller(config).await? {
@@ -329,13 +339,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     read_timeout_ms,
                 })
                 .await?;
-            if let Some(parent) = output.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            write_invite_outfit_assets(&client, &result.site_file, &output).await?;
-            result.site_file.write(&output)?;
+            invite_io::write_invitation(&client, &result.site_file, &output).await?;
             println!("{}", output.display());
         }
         Command::Outfit { command } => run_outfit_command(command).await?,
@@ -443,86 +447,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-async fn write_invite_outfit_assets(
-    client: &LocalApiClient,
-    site_file: &SignedSiteClew,
-    output: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(profile) = &site_file.payload.outfit_profile else {
-        return Ok(());
-    };
-    let asset_ids = profile.imported_asset_ids();
-    if asset_ids.is_empty() {
-        return Ok(());
-    }
-    let kit_root = output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let assets_root = kit_root.join("outfit-assets");
-    std::fs::create_dir_all(&assets_root)?;
-    for asset_id in asset_ids {
-        let asset = client.outfit_asset_get(asset_id.clone()).await?;
-        if asset.info.asset_id != asset_id {
-            return Err("controller returned a different Outfit asset id".into());
-        }
-        let bytes = BASE64_STANDARD.decode(asset.data_base64.as_bytes())?;
-        if usize::try_from(asset.info.byte_len).ok() != Some(bytes.len()) {
-            return Err("controller returned inconsistent Outfit asset length".into());
-        }
-        verify_outfit_asset_bytes(&asset_id, &bytes)?;
-        let extension = match asset.info.format {
-            OutfitAssetFormat::Png => "png",
-            OutfitAssetFormat::Svg => "svg",
-        };
-        write_invite_asset_atomically(&assets_root, &asset_id, extension, &bytes)?;
-    }
-    Ok(())
-}
-
-fn write_invite_asset_atomically(
-    root: &std::path::Path,
-    asset_id: &str,
-    extension: &str,
-    bytes: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let target = root.join(format!("{asset_id}.{extension}"));
-    if target.exists() {
-        let existing = std::fs::read(&target)?;
-        verify_outfit_asset_bytes(asset_id, &existing)?;
-        return Ok(());
-    }
-    let temp = root.join(format!(
-        ".{asset_id}.{extension}.{}.tmp",
-        std::process::id()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    match std::fs::rename(&temp, &target) {
-        Ok(()) => Ok(()),
-        Err(error) if target.exists() => {
-            let _ = std::fs::remove_file(&temp);
-            let existing = std::fs::read(&target)?;
-            verify_outfit_asset_bytes(asset_id, &existing)?;
-            let _ = error;
-            Ok(())
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(error.into())
-        }
-    }
 }
 
 async fn run_outfit_command(command: OutfitCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -647,10 +571,11 @@ async fn run_host(
     site: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     foreground: bool,
+    launch_mode: HostLaunchMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let layout = controller_config(state_dir)?.state_layout();
     let context = HostLaunchContext::current(site, layout.clone())?;
-    let state = resolve_host_launch(context.clone())?;
+    let state = resolve_host_launch_with_mode(context.clone(), launch_mode)?;
 
     if foreground {
         return run_host_foreground(&layout, state).await;
@@ -660,7 +585,7 @@ async fn run_host(
     return run_host_foreground(&layout, state).await;
 
     #[cfg(any(windows, target_os = "macos"))]
-    return run_host_desktop(layout, context, state).await;
+    return run_host_desktop(layout, context, state, launch_mode).await;
 }
 
 async fn wait_for_host_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -766,6 +691,7 @@ async fn run_host_desktop(
     layout: clew_core::StateLayout,
     mut context: HostLaunchContext,
     mut state: HostLaunchState,
+    launch_mode: HostLaunchMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let key = state.instance_key()?;
@@ -818,7 +744,7 @@ async fn run_host_desktop(
             host_gui::HostGuiAction::Exit => return Ok(()),
             host_gui::HostGuiAction::OpenSite(path) => {
                 context.explicit_site = Some(path);
-                state = resolve_host_launch(context.clone())?;
+                state = resolve_host_launch_with_mode(context.clone(), launch_mode)?;
             }
             host_gui::HostGuiAction::SelectMembership {
                 controller_id,
@@ -839,12 +765,32 @@ async fn run_host_desktop(
 
 fn print_host_state(state: &HostLaunchState) {
     match state {
+        HostLaunchState::Active { membership, .. } if state.is_connector_only() => {
+            println!(
+                "Clew connection helper ready: {} / {}.",
+                membership.marker.site_name, membership.device.display_name
+            );
+            println!(
+                "This computer only helps nearby computers connect; its files and commands are not exposed."
+            );
+        }
         HostLaunchState::Active { membership, .. } => println!(
             "Clew host ready: {} / {} (DeviceId {}).",
             membership.marker.site_name,
             membership.device.display_name,
             membership.marker.device_id
         ),
+        HostLaunchState::AwaitingEnrollment {
+            site_file,
+            hostname,
+            ..
+        } if state.is_connector_only() => {
+            println!(
+                "Clew invitation verified: {} / {}; connecting only as a nearby connection helper.",
+                site_file.payload.bootstrap.payload.site_name, hostname
+            );
+            println!("This computer will not expose its files or commands.");
+        }
         HostLaunchState::AwaitingEnrollment {
             site_file,
             hostname,

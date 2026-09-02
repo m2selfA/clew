@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -9,12 +10,15 @@ use clew_core::ActivityResult;
 use clew_host::OutfitProfile;
 use clew_runtime::{
     ActivityList, BackupExportRequest, ControllerConfig, ControllerStatus, DeviceList,
-    LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
+    InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
     OutfitAssetPreviewResponse, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
     OutfitSetAssetRequest, OutfitUpdateRequest, RecoveryStatus,
 };
 
-use crate::studio::{StudioAction, StudioState};
+use crate::{
+    invite_io,
+    studio::{StudioAction, StudioState},
+};
 use eframe::egui;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -22,6 +26,11 @@ use tray_icon::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const INVITE_MAX_CLAIMS: u32 = 8;
+const INVITE_VALID_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const INVITE_DEPLOYMENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+const INVITE_MAX_RESULT_BYTES: u32 = 49_152;
+const INVITE_READ_TIMEOUT_MS: u32 = 5_000;
 
 pub async fn run(config: ControllerConfig) -> Result<(), Box<dyn std::error::Error>> {
     ensure_controller(&config).await?;
@@ -67,6 +76,10 @@ async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn std:
 
 enum BackendCommand {
     Refresh,
+    InviteIssue {
+        request: InviteIssueRequest,
+        output: PathBuf,
+    },
     OutfitShow(String),
     OutfitCreate(OutfitCreateRequest),
     OutfitClone(OutfitCloneRequest),
@@ -75,7 +88,10 @@ enum BackendCommand {
     OutfitAssetImport(String),
     OutfitSetAsset(OutfitSetAssetRequest),
     OutfitAssetPreview(String),
-    BackupExport { path: String, passphrase: String },
+    BackupExport {
+        path: String,
+        passphrase: String,
+    },
     RecoveryConfirm,
     ActivityClear,
     Shutdown,
@@ -89,6 +105,10 @@ enum BackendEvent {
         recovery: RecoveryStatus,
         outfits: OutfitList,
         outfit_assets: OutfitAssetList,
+    },
+    InviteIssued {
+        path: PathBuf,
+        site_name: String,
     },
     OutfitProfileLoaded(OutfitProfile),
     OutfitProfileSaved {
@@ -162,6 +182,27 @@ impl Backend {
                                 Err(error) => BackendEvent::Error(error.to_string()),
                             }
                         }),
+                        BackendCommand::InviteIssue { request, output } => {
+                            runtime.block_on(async {
+                                let site_name = request.site_name.clone();
+                                match client.invite_issue(request).await {
+                                    Ok(result) => match invite_io::write_invitation(
+                                        &client,
+                                        &result.site_file,
+                                        &output,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => BackendEvent::InviteIssued {
+                                            path: output,
+                                            site_name,
+                                        },
+                                        Err(error) => BackendEvent::Error(error.to_string()),
+                                    },
+                                    Err(error) => BackendEvent::Error(error.to_string()),
+                                }
+                            })
+                        }
                         BackendCommand::OutfitShow(outfit_id) => runtime.block_on(async {
                             match client.outfit_show(outfit_id).await {
                                 Ok(profile) => BackendEvent::OutfitProfileLoaded(profile),
@@ -276,6 +317,12 @@ impl Backend {
 
     fn refresh(&self) {
         let _ = self.tx.send(BackendCommand::Refresh);
+    }
+
+    fn invite_issue(&self, request: InviteIssueRequest, output: PathBuf) {
+        let _ = self
+            .tx
+            .send(BackendCommand::InviteIssue { request, output });
     }
 
     fn outfit_show(&self, outfit_id: String) {
@@ -409,6 +456,10 @@ struct ControllerApp {
     activity: ActivityList,
     recovery: RecoveryStatus,
     studio: StudioState,
+    invite_open: bool,
+    invite_site_name: String,
+    invite_read_root: String,
+    invite_in_flight: bool,
     error: Option<String>,
     notice: Option<String>,
     backup_passphrase: String,
@@ -438,6 +489,10 @@ impl ControllerApp {
             activity: ActivityList { events: Vec::new() },
             recovery: RecoveryStatus { review: None },
             studio: StudioState::new(),
+            invite_open: false,
+            invite_site_name: "Collaborator".into(),
+            invite_read_root: String::new(),
+            invite_in_flight: false,
             error: None,
             notice: None,
             backup_passphrase: String::new(),
@@ -470,6 +525,18 @@ impl ControllerApp {
                     if let Some(action) = self.studio.set_catalogs(outfits, outfit_assets) {
                         self.dispatch_studio_action(action);
                     }
+                }
+                BackendEvent::InviteIssued { path, site_name } => {
+                    self.invite_in_flight = false;
+                    self.invite_open = false;
+                    self.notice = Some(format!(
+                        "Invitation for {site_name} saved to {}. Keep site.clew beside the matching Clew runtime.",
+                        path.display()
+                    ));
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
                 }
                 BackendEvent::OutfitProfileLoaded(profile) => {
                     let actions = self.studio.accept_profile(profile);
@@ -534,6 +601,7 @@ impl ControllerApp {
                     self.error = None;
                 }
                 BackendEvent::Error(error) => {
+                    self.invite_in_flight = false;
                     self.backup_export_in_flight = false;
                     self.studio.accept_error();
                     self.error = Some(error);
@@ -563,6 +631,55 @@ impl ControllerApp {
             self.refresh_in_flight = true;
             self.last_refresh = Instant::now();
         }
+    }
+
+    fn render_invite(&mut self, ui: &mut egui::Ui) {
+        if !self.invite_open {
+            return;
+        }
+        ui.group(|ui| {
+            ui.heading("Invite collaborator");
+            ui.label("Every invitation is Site-capable; there is no Gateway mode to configure here.");
+            ui.horizontal(|ui| {
+                ui.label("Site name");
+                ui.text_edit_singleline(&mut self.invite_site_name);
+            });
+            ui.label("Allowed read folder on the collaborator computer (absolute path)");
+            ui.text_edit_singleline(&mut self.invite_read_root);
+            ui.small("This is a remote Host path, not a folder on the Controller computer.");
+            ui.small("The current default Outfit is used. Files and commands outside the signed policy are not opened.");
+            ui.horizontal(|ui| {
+                let ready = !self.invite_site_name.trim().is_empty()
+                    && !self.invite_read_root.trim().is_empty()
+                    && !self.invite_in_flight;
+                if ui
+                    .add_enabled(ready, egui::Button::new("Create invitation..."))
+                    .clicked()
+                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                {
+                    let request = InviteIssueRequest {
+                        site_name: self.invite_site_name.trim().to_owned(),
+                        outfit_id: None,
+                        roots: vec![self.invite_read_root.trim().to_owned()],
+                        max_claims: INVITE_MAX_CLAIMS,
+                        valid_for_ms: INVITE_VALID_FOR_MS,
+                        deployment_window_ms: INVITE_DEPLOYMENT_WINDOW_MS,
+                        max_result_bytes: INVITE_MAX_RESULT_BYTES,
+                        read_timeout_ms: INVITE_READ_TIMEOUT_MS,
+                    };
+                    self.backend.invite_issue(request, folder.join("site.clew"));
+                    self.invite_in_flight = true;
+                    self.error = None;
+                }
+                if ui.button("Cancel").clicked() && !self.invite_in_flight {
+                    self.invite_open = false;
+                }
+                if self.invite_in_flight {
+                    ui.spinner();
+                    ui.label("Signing invitation...");
+                }
+            });
+        });
     }
 
     fn dispatch_studio_action(&mut self, action: StudioAction) {
@@ -624,6 +741,11 @@ impl eframe::App for ControllerApp {
             ui.label(notice);
         }
 
+        if ui.button("Invite collaborator").clicked() {
+            self.invite_open = true;
+        }
+        self.render_invite(ui);
+
         if let Some(review) = self.recovery.review
             && review.remote_access_paused
         {
@@ -659,7 +781,7 @@ impl eframe::App for ControllerApp {
                     "Send the generated Site Kit to a collaborator; they can open it directly.",
                 );
                 ui.add_space(12.0);
-                ui.add_enabled(false, egui::Button::new("Invite collaborator (V1)"));
+                ui.label("Use Invite collaborator above to create a signed site.clew without opening a terminal.");
             });
         } else {
             ui.heading("Devices");

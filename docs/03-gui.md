@@ -243,6 +243,8 @@ Clew
 
 如果这台电脑是 helper-only，窗口仍然极简：
 
+当前实现把 helper-only 冻结为**同一 runtime / 同一 `site.clew` 的第二启动 intent**：普通入口等价于 `clew host`，帮助附近电脑入口等价于 `clew host --connector-only`。这个 flag 只会把本次 enrollment 权限向下收窄；已有 membership 不会因为换入口被升级或改写。V6 release packaging 再把这两个 argv contract 物理做成 Windows shortcut/macOS launcher/Linux artifact。
+
 ```text
 Clew
 连接已就绪
@@ -266,6 +268,7 @@ Clew
 |---|---|---|
 | Controller 密钥 | 首次开主窗 | 否 |
 | Enrollment / 签名 | 点邀请 | 否 |
+| GUI 邀请落盘 | Controller GUI 调 authenticated Local API `invite_issue`，保存 `site.clew` + 需要的 Outfit assets | 不需要终端；不问 Gateway |
 | Site Kit 文件名 | `{称呼}-Clew-{平台}.zip` / Linux `.tar.gz` | 另存为时可改 |
 | 聊天稿 | 模板填称呼和权限 | 可复制后手改 |
 | 本机转发/代理端口 | 找空闲口 | 可选改 |

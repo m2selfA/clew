@@ -1,7 +1,7 @@
 use crate::outfit::{
     KEY_AWAITING_ENROLLMENT, KEY_CHOOSE_INVITE, KEY_EXIT_AND_DISCONNECT, KEY_EXTRACT_FIRST,
-    KEY_HIDE_TO_TRAY, KEY_MISSING_INVITE_BODY, KEY_MISSING_INVITE_TITLE, KEY_READY, KEY_TRAY_EXIT,
-    KEY_TRAY_SHOW, OutfitPreset, OutfitProfile,
+    KEY_HELPER_READY, KEY_HIDE_TO_TRAY, KEY_MISSING_INVITE_BODY, KEY_MISSING_INVITE_TITLE,
+    KEY_READY, KEY_TRAY_EXIT, KEY_TRAY_SHOW, OutfitPreset, OutfitProfile,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9,6 +9,7 @@ pub struct UiResources {
     pub app_name: String,
     pub window_title: String,
     pub ready: String,
+    pub helper_ready: String,
     pub awaiting_enrollment: String,
     pub missing_invite_title: String,
     pub missing_invite_body: String,
@@ -44,6 +45,7 @@ impl OutfitRuntimeView {
                 app_name: profile.identity.app_display_name.clone(),
                 window_title: profile.identity.window_title.clone(),
                 ready: profile.resolve_resource(locale, KEY_READY),
+                helper_ready: profile.resolve_resource(locale, KEY_HELPER_READY),
                 awaiting_enrollment: profile.resolve_resource(locale, KEY_AWAITING_ENROLLMENT),
                 missing_invite_title: profile.resolve_resource(locale, KEY_MISSING_INVITE_TITLE),
                 missing_invite_body: profile.resolve_resource(locale, KEY_MISSING_INVITE_BODY),
@@ -79,6 +81,7 @@ mod tests {
                 .contains("Extract the complete archive")
         );
         assert!(view.resources.ready.is_ascii());
+        assert!(view.resources.helper_ready.is_ascii());
         assert!(view.resources.awaiting_enrollment.is_ascii());
         assert!(view.resources.missing_invite_title.is_ascii());
         assert!(view.resources.missing_invite_body.is_ascii());

@@ -379,6 +379,10 @@ pub struct SiteKitContract {
     pub runtime_entry: &'static str,
     pub sidecar_name: &'static str,
     pub start_here_name: &'static str,
+    /// Same runtime, normal friend-facing entry.
+    pub use_this_machine_args: &'static [&'static str],
+    /// Same runtime and site.clew, but explicitly narrows enrollment to Connector-only.
+    pub help_nearby_args: &'static [&'static str],
 }
 
 impl SiteKitContract {
@@ -390,18 +394,24 @@ impl SiteKitContract {
                 runtime_entry: "Clew.exe",
                 sidecar_name: "site.clew",
                 start_here_name: "开始这里.html",
+                use_this_machine_args: &["host"],
+                help_nearby_args: &["host", "--connector-only"],
             },
             TargetPlatform::MacOs => Self {
                 platform,
                 runtime_entry: "Clew.app",
                 sidecar_name: "site.clew",
                 start_here_name: "开始这里.html",
+                use_this_machine_args: &["host"],
+                help_nearby_args: &["host", "--connector-only"],
             },
             TargetPlatform::Linux => Self {
                 platform,
                 runtime_entry: "Clew",
                 sidecar_name: "site.clew",
                 start_here_name: "开始这里.html",
+                use_this_machine_args: &["host"],
+                help_nearby_args: &["host", "--connector-only"],
             },
         }
     }
@@ -703,6 +713,10 @@ mod tests {
         assert_eq!(windows.runtime_entry, "Clew.exe");
         assert_eq!(mac.runtime_entry, "Clew.app");
         assert_eq!(linux.runtime_entry, "Clew");
+        assert_eq!(windows.use_this_machine_args, &["host"]);
+        assert_eq!(windows.help_nearby_args, &["host", "--connector-only"]);
+        assert_eq!(mac.help_nearby_args, windows.help_nearby_args);
+        assert_eq!(linux.help_nearby_args, windows.help_nearby_args);
         assert!(windows.archive_name("Alice").ends_with("Windows.zip"));
     }
 }

@@ -50,6 +50,7 @@ async fn complete_networked_activation_with_window(
             site_file,
             pending,
             hostname,
+            launch_mode,
             source,
         } => {
             let controller = site_file.payload.bootstrap.payload.controller;
@@ -70,6 +71,7 @@ async fn complete_networked_activation_with_window(
                         site_file,
                         pending,
                         hostname,
+                        launch_mode,
                         source,
                     });
                 }
@@ -91,12 +93,7 @@ async fn complete_networked_activation_with_window(
                     bootstrap: site_file.payload.bootstrap.clone(),
                     device_identity: pending.public_identity(),
                     hostname: hostname.clone(),
-                    mode: match site_file.payload.role_hint {
-                        crate::HostRoleHint::ExecutePreferred => {
-                            BootstrapMemberMode::ExecutePreferred
-                        }
-                        crate::HostRoleHint::ConnectorOnly => BootstrapMemberMode::ConnectorOnly,
-                    },
+                    mode: bootstrap_member_mode(site_file.payload.role_hint, launch_mode),
                 })
                 .await?;
             let receipt = match channel.recv::<BootstrapResponse>().await? {
@@ -152,6 +149,19 @@ async fn complete_networked_activation_with_window(
             Ok(HostLaunchState::Active { membership, source })
         }
         other => Ok(other),
+    }
+}
+
+fn bootstrap_member_mode(
+    signed_role: crate::HostRoleHint,
+    launch_mode: crate::HostLaunchMode,
+) -> BootstrapMemberMode {
+    if signed_role == crate::HostRoleHint::ConnectorOnly
+        || launch_mode == crate::HostLaunchMode::ConnectorOnly
+    {
+        BootstrapMemberMode::ConnectorOnly
+    } else {
+        BootstrapMemberMode::ExecutePreferred
     }
 }
 
@@ -1118,6 +1128,7 @@ mod tests {
             site_file,
             pending,
             hostname: "CANCEL-TARGET".into(),
+            launch_mode: crate::HostLaunchMode::Default,
             source: crate::HostSiteSource::Explicit,
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1136,6 +1147,38 @@ mod tests {
             .expect("activation retry ignored shutdown")
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn helper_launch_mode_is_a_monotonic_authority_downgrade() {
+        assert_eq!(
+            bootstrap_member_mode(
+                crate::HostRoleHint::ExecutePreferred,
+                crate::HostLaunchMode::Default,
+            ),
+            BootstrapMemberMode::ExecutePreferred
+        );
+        assert_eq!(
+            bootstrap_member_mode(
+                crate::HostRoleHint::ExecutePreferred,
+                crate::HostLaunchMode::ConnectorOnly,
+            ),
+            BootstrapMemberMode::ConnectorOnly
+        );
+        assert_eq!(
+            bootstrap_member_mode(
+                crate::HostRoleHint::ConnectorOnly,
+                crate::HostLaunchMode::Default,
+            ),
+            BootstrapMemberMode::ConnectorOnly
+        );
+        assert_eq!(
+            bootstrap_member_mode(
+                crate::HostRoleHint::ConnectorOnly,
+                crate::HostLaunchMode::ConnectorOnly,
+            ),
+            BootstrapMemberMode::ConnectorOnly
+        );
     }
 
     #[tokio::test]
@@ -1819,6 +1862,7 @@ mod tests {
     enum NoPublicDiscovery {
         MdnsDelayed,
         NearbyFile,
+        NearbyFileConnectorOnly,
     }
 
     #[tokio::test]
@@ -1830,6 +1874,11 @@ mod tests {
     #[tokio::test]
     async fn sealed_bootstrap_and_active_read_use_nearby_file_when_mdns_is_unavailable() {
         run_no_public_connector_flow(NoPublicDiscovery::NearbyFile).await;
+    }
+
+    #[tokio::test]
+    async fn connector_only_launch_intent_downgrades_the_same_signed_site_kit() {
+        run_no_public_connector_flow(NoPublicDiscovery::NearbyFileConnectorOnly).await;
     }
 
     async fn run_no_public_connector_flow(discovery_mode: NoPublicDiscovery) {
@@ -1882,7 +1931,10 @@ mod tests {
             now + 60_000,
         )
         .unwrap();
-        if discovery_mode == NoPublicDiscovery::NearbyFile {
+        if matches!(
+            discovery_mode,
+            NoPublicDiscovery::NearbyFile | NoPublicDiscovery::NearbyFileConnectorOnly
+        ) {
             let file = NearbyConnectorFile::from_helper(helper_addr.clone(), helper_lease.clone())
                 .unwrap();
             NearbyConnectorStore::new(layout.clone())
@@ -1931,6 +1983,13 @@ mod tests {
                 let receipt = registry
                     .claim_with_ceiling(&pass, device_identity, now, ceiling)
                     .unwrap();
+                if mode == BootstrapMemberMode::ConnectorOnly {
+                    assert!(!receipt.effective_grant.member.execute);
+                    assert!(receipt.effective_grant.member.connector);
+                    assert!(!receipt.effective_grant.read);
+                    assert!(!receipt.effective_grant.write);
+                    assert!(!receipt.effective_grant.shell);
+                }
                 sealed
                     .send(&mut stream, &BootstrapResponse::Claimed(receipt.clone()))
                     .await
@@ -2056,13 +2115,20 @@ mod tests {
             site_file,
             pending,
             hostname: "NO-PUBLIC-TARGET".into(),
+            launch_mode: if discovery_mode == NoPublicDiscovery::NearbyFileConnectorOnly {
+                crate::HostLaunchMode::ConnectorOnly
+            } else {
+                crate::HostLaunchMode::Default
+            },
             source: crate::HostSiteSource::Explicit,
         };
         let (_activation_shutdown_tx, activation_shutdown_rx) = tokio::sync::watch::channel(false);
         let activation_started = Instant::now();
         let (activation_timeout, path_window) = match discovery_mode {
             NoPublicDiscovery::MdnsDelayed => (Duration::from_secs(35), Duration::from_secs(8)),
-            NoPublicDiscovery::NearbyFile => (Duration::from_secs(15), Duration::from_secs(10)),
+            NoPublicDiscovery::NearbyFile | NoPublicDiscovery::NearbyFileConnectorOnly => {
+                (Duration::from_secs(15), Duration::from_secs(10))
+            }
         };
         let activated = tokio::time::timeout(
             activation_timeout,
@@ -2084,11 +2150,18 @@ mod tests {
                 "Target unexpectedly activated before the delayed Helper was online"
             );
         }
+        let activated_is_connector_only = activated.is_connector_only();
         let HostLaunchState::Active { membership, .. } = activated else {
             panic!("Target did not become active");
         };
-        assert!(membership.device.capabilities.execute);
-        assert!(membership.device.capabilities.connector);
+        if discovery_mode == NoPublicDiscovery::NearbyFileConnectorOnly {
+            assert!(!membership.device.capabilities.execute);
+            assert!(membership.device.capabilities.connector);
+            assert!(activated_is_connector_only);
+        } else {
+            assert!(membership.device.capabilities.execute);
+            assert!(membership.device.capabilities.connector);
+        }
         assert_eq!(
             membership.marker.controller_bootstrap_noise_public_key,
             Some(controller_bootstrap_public)
@@ -2099,6 +2172,12 @@ mod tests {
             .await
             .expect("Helper tunnel did not close after activation")
             .unwrap();
+
+        if discovery_mode == NoPublicDiscovery::NearbyFileConnectorOnly {
+            helper_outer.close().await;
+            controller_outer.close().await;
+            return;
+        }
 
         let share = temp.path().join("share");
         std::fs::create_dir_all(&share).unwrap();

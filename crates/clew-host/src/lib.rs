@@ -39,8 +39,9 @@ pub use remote::{
     serve_networked_membership_until_with_layout, wait_for_networked_activation_until,
 };
 pub use runtime::{
-    HostLaunchContext, HostLaunchError, HostLaunchState, HostSiteSource, MissingInviteView,
-    cached_outfit_asset_path, detect_archive_temp_launch, resolve_host_launch,
+    HostLaunchContext, HostLaunchError, HostLaunchMode, HostLaunchState, HostSiteSource,
+    MissingInviteView, cached_outfit_asset_path, detect_archive_temp_launch, resolve_host_launch,
+    resolve_host_launch_with_mode,
 };
 pub use selection::{DeviceSelectionError, select_executable_device};
 pub use site::{
