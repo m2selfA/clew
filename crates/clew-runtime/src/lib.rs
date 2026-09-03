@@ -23,8 +23,8 @@ pub use local_api::{
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
     OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest,
-    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteShellAttachRequest,
-    RemoteShellStartRequest, RemoteWriteRequest,
+    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
@@ -36,6 +36,6 @@ pub use outfit_asset::{
     OutfitAssetPreview, OutfitAssetStore,
 };
 pub use remote::{
-    MAX_REMOTE_CONNECTIONS, RemoteConnectionError, RemoteHub, RemoteHubError,
-    handle_remote_connection,
+    MAX_REMOTE_CONNECTIONS, RemoteConnectionError, RemoteHub, RemoteHubError, RemotePathState,
+    RemoteSessionInfo, RemoteSessionState, RemoteSessionTopology, handle_remote_connection,
 };

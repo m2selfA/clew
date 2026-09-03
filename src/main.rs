@@ -261,6 +261,13 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
+    /// Show the current or most recent Controller session generation/path for one stable DeviceId.
+    SessionPathInfo {
+        #[arg(value_name = "DEVICE_ID")]
+        device_id: DeviceId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -755,6 +762,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let config = controller_config(state_dir)?;
             let devices = LocalApiClient::new(config).device_list().await?;
             println!("{}", serde_json::to_string_pretty(&devices)?);
+        }
+        Command::SessionPathInfo {
+            device_id,
+            state_dir,
+        } => {
+            let config = controller_config(state_dir)?;
+            let info = LocalApiClient::new(config)
+                .session_path_info(device_id)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&info)?);
         }
     }
     Ok(())

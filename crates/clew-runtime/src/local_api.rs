@@ -32,8 +32,8 @@ use tokio::{
 
 use crate::{
     ControllerConfig, ControllerControlStore, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore,
-    OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub, export_controller_backup,
-    transport,
+    OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub, RemoteSessionInfo,
+    RemoteSessionState, export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -168,6 +168,13 @@ pub struct RemoteShellAttachRequest {
     #[serde(default)]
     pub stderr_offset: u64,
     pub max_bytes_per_stream: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSessionPathInfo {
+    pub device_id: DeviceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<RemoteSessionInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -373,6 +380,9 @@ struct LocalRequest {
 enum LocalMethod {
     ControllerStatus,
     DeviceList,
+    SessionPathInfo {
+        device_id: DeviceId,
+    },
     InviteIssue(InviteIssueRequest),
     InviteClose {
         invite_id: InviteId,
@@ -434,6 +444,7 @@ enum LocalMethod {
 enum LocalResponse {
     ControllerStatus(ControllerStatus),
     DeviceList(DeviceList),
+    SessionPathInfo(RemoteSessionPathInfo),
     InviteIssued(InviteIssueResult),
     DeviceRenamed(DeviceRecord),
     ReadResult(RemoteReadResult),
@@ -528,6 +539,9 @@ async fn dispatch(
             (LocalResponse::ControllerStatus(state.status.clone()), false)
         }
         LocalMethod::DeviceList => (device_list_response(state), false),
+        LocalMethod::SessionPathInfo { device_id } => {
+            (session_path_info_response(state, device_id), false)
+        }
         LocalMethod::InviteIssue(request) => (issue_invite_response(state, request).await, false),
         LocalMethod::InviteClose { invite_id } => {
             let response = with_control(state, |store| {
@@ -775,11 +789,24 @@ fn device_list_response(state: &LocalApiState) -> LocalResponse {
             continue;
         };
         let allowed = !record.revoked && !site.revoked;
-        let mut summary = DeviceSummary::from_record(
-            &record.device,
-            site.site_name.clone(),
-            allowed && state.remote.is_online(record.device.device_id),
-        );
+        let session = match state.remote.session_info(record.device.device_id) {
+            Ok(session) => session,
+            Err(_) => {
+                return local_error(
+                    LocalApiErrorCode::Internal,
+                    "remote session telemetry is unavailable",
+                );
+            }
+        };
+        let online = allowed
+            && session
+                .as_ref()
+                .is_some_and(|info| info.state == RemoteSessionState::Connected);
+        let mut summary =
+            DeviceSummary::from_record(&record.device, site.site_name.clone(), online);
+        summary.last_seen_unix_ms = session.as_ref().and_then(|info| {
+            (info.state == RemoteSessionState::Disconnected).then_some(info.last_transition_unix_ms)
+        });
         if !allowed {
             summary.executable = false;
             summary.connector = false;
@@ -793,6 +820,31 @@ fn device_list_response(state: &LocalApiState) -> LocalResponse {
             .then_with(|| left.device_id.to_string().cmp(&right.device_id.to_string()))
     });
     LocalResponse::DeviceList(DeviceList { devices })
+}
+
+fn session_path_info_response(state: &LocalApiState, device_id: DeviceId) -> LocalResponse {
+    let known = match state.control.lock() {
+        Ok(store) => store.snapshot().catalog.device(device_id).is_some(),
+        Err(_) => {
+            return local_error(
+                LocalApiErrorCode::Internal,
+                "controller state is unavailable",
+            );
+        }
+    };
+    if !known {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            format!("device {device_id} is not known to this Controller"),
+        );
+    }
+    match state.remote.session_info(device_id) {
+        Ok(session) => LocalResponse::SessionPathInfo(RemoteSessionPathInfo { device_id, session }),
+        Err(_) => local_error(
+            LocalApiErrorCode::Internal,
+            "remote session telemetry is unavailable",
+        ),
+    }
 }
 
 async fn issue_invite_response(
@@ -1785,6 +1837,20 @@ impl LocalApiClient {
                 code: error.code,
                 message: error.message,
             }),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn session_path_info(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<RemoteSessionPathInfo, LocalApiClientError> {
+        match self
+            .request(LocalMethod::SessionPathInfo { device_id })
+            .await?
+        {
+            LocalResponse::SessionPathInfo(info) if info.device_id == device_id => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
     }

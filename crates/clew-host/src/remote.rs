@@ -11,7 +11,7 @@ use clew_transport::{
     ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
     FsMutationErrorCode, FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply,
-    FsQueryRequest, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
+    FsQueryRequest, InnerMessage, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
     NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext,
     SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply,
     ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional,
@@ -843,6 +843,7 @@ async fn serve_networked_membership_with_outer_timing(
             message = inner.recv(&mut stream) => {
                 let message = message?;
                 let reply = match message.kind.as_str() {
+                    "session_ping" => InnerMessage::new("session_pong", message.payload)?,
                     "read" => {
                         let reply = match (service.as_ref(), read_allowed, ReadRequest::from_message(&message)) {
                             (Some(service), true, Ok(request)) => service.execute(request).await,

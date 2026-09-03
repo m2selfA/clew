@@ -11,14 +11,15 @@ use clew_transport::{
     BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest,
     BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
     ControllerSessionAuthority, FsMutationReply, FsMutationRequest, FsQueryReply, FsQueryRequest,
-    HARD_MAX_SHELL_TASKS_PER_SESSION, InnerSession, IrohProtocol, IrohStream, ReadReply,
-    ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
+    HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
+    ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
     ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
     read_bootstrap, read_connector_open, write_bootstrap,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::StreamExt;
 
 use crate::{ControlStoreError, ControllerControlStore};
 
@@ -28,6 +29,43 @@ const MAX_REMOTE_SHELL_TASK_PROJECTIONS: usize =
     MAX_REMOTE_CONNECTIONS * HARD_MAX_SHELL_TASKS_PER_SESSION;
 const CONNECTOR_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
 const SEALED_ACTIVATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSessionTopology {
+    Direct,
+    Connector,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePathState {
+    Direct,
+    Relay,
+    MixedOrUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSessionState {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSessionInfo {
+    pub device_id: DeviceId,
+    /// Monotonic only within the current Controller process instance.
+    pub generation: u64,
+    pub state: RemoteSessionState,
+    pub topology: RemoteSessionTopology,
+    pub path: RemotePathState,
+    pub connected_unix_ms: u64,
+    pub last_transition_unix_ms: u64,
+    pub last_path_change_unix_ms: u64,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteHub {
@@ -36,22 +74,23 @@ pub struct RemoteHub {
 
 #[derive(Debug, Default)]
 struct RemoteHubState {
-    next_token: u64,
+    next_generation: u64,
     sessions: BTreeMap<DeviceId, RemoteSessionSlot>,
+    session_info: BTreeMap<DeviceId, RemoteSessionInfo>,
     shell_tasks: BTreeMap<TaskId, RemoteShellTaskProjection>,
     pending_shell_starts: usize,
 }
 
 #[derive(Debug)]
 struct RemoteSessionSlot {
-    token: u64,
+    generation: u64,
     tx: mpsc::Sender<RemoteCommand>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RemoteShellTaskProjection {
     device_id: DeviceId,
-    token: u64,
+    generation: u64,
 }
 
 struct ShellStartReservation {
@@ -120,6 +159,40 @@ impl RemoteHub {
             .keys()
             .copied()
             .collect()
+    }
+
+    pub fn session_info(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<Option<RemoteSessionInfo>, RemoteHubError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?
+            .session_info
+            .get(&device_id)
+            .cloned())
+    }
+
+    fn update_path(
+        &self,
+        device_id: DeviceId,
+        generation: u64,
+        path: RemotePathState,
+        now_unix_ms: u64,
+    ) {
+        if let Ok(mut state) = self.inner.lock()
+            && state
+                .sessions
+                .get(&device_id)
+                .is_some_and(|slot| slot.generation == generation)
+            && let Some(info) = state.session_info.get_mut(&device_id)
+            && info.generation == generation
+            && info.path != path
+        {
+            info.path = path;
+            info.last_path_change_unix_ms = now_unix_ms;
+        }
     }
 
     pub async fn read(
@@ -206,7 +279,7 @@ impl RemoteHub {
             return Err(RemoteHubError::InvalidShellProjectionRequest);
         }
         request.validate()?;
-        let (token, tx) = {
+        let (generation, tx) = {
             let mut state = self
                 .inner
                 .lock()
@@ -222,10 +295,10 @@ impl RemoteHub {
             {
                 return Err(RemoteHubError::ShellProjectionCapacity);
             }
-            let token = slot.token;
+            let generation = slot.generation;
             let tx = slot.tx.clone();
             state.pending_shell_starts += 1;
-            (token, tx)
+            (generation, tx)
         };
         let reservation = ShellStartReservation::new(self.clone());
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -252,7 +325,7 @@ impl RemoteHub {
                 if !state
                     .sessions
                     .get(&device_id)
-                    .is_some_and(|slot| slot.token == token)
+                    .is_some_and(|slot| slot.generation == generation)
                 {
                     return Err(RemoteHubError::Offline(device_id));
                 }
@@ -261,9 +334,13 @@ impl RemoteHub {
                         if state.shell_tasks.contains_key(&task_id) {
                             return Err(RemoteHubError::ShellTaskIdConflict(task_id));
                         }
-                        state
-                            .shell_tasks
-                            .insert(task_id, RemoteShellTaskProjection { device_id, token });
+                        state.shell_tasks.insert(
+                            task_id,
+                            RemoteShellTaskProjection {
+                                device_id,
+                                generation,
+                            },
+                        );
                         Ok(ShellTaskReply::Started { task_id })
                     }
                     ShellTaskReply::Error(error) => Ok(ShellTaskReply::Error(error)),
@@ -281,7 +358,7 @@ impl RemoteHub {
                 let _ = hub.shell_task(ShellTaskRequest::Cancel { task_id }).await;
                 if let Ok(mut state) = hub.inner.lock()
                     && state.shell_tasks.get(&task_id).is_some_and(|projection| {
-                        projection.device_id == device_id && projection.token == token
+                        projection.device_id == device_id && projection.generation == generation
                     })
                 {
                     state.shell_tasks.remove(&task_id);
@@ -304,7 +381,7 @@ impl RemoteHub {
         if !state
             .sessions
             .get(&projection.device_id)
-            .is_some_and(|slot| slot.token == projection.token)
+            .is_some_and(|slot| slot.generation == projection.generation)
         {
             state.shell_tasks.remove(&task_id);
             return Err(RemoteHubError::UnknownShellTask(task_id));
@@ -319,7 +396,7 @@ impl RemoteHub {
         request.validate()?;
         let task_id =
             shell_request_task_id(&request).ok_or(RemoteHubError::InvalidShellProjectionRequest)?;
-        let (device_id, token, tx) = {
+        let (device_id, generation, tx) = {
             let mut state = self
                 .inner
                 .lock()
@@ -331,11 +408,11 @@ impl RemoteHub {
                 state.shell_tasks.remove(&task_id);
                 return Err(RemoteHubError::UnknownShellTask(task_id));
             };
-            if slot.token != projection.token {
+            if slot.generation != projection.generation {
                 state.shell_tasks.remove(&task_id);
                 return Err(RemoteHubError::UnknownShellTask(task_id));
             }
-            (projection.device_id, projection.token, slot.tx.clone())
+            (projection.device_id, projection.generation, slot.tx.clone())
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::ShellTask {
@@ -355,7 +432,7 @@ impl RemoteHub {
         if !state
             .sessions
             .get(&device_id)
-            .is_some_and(|slot| slot.token == token)
+            .is_some_and(|slot| slot.generation == generation)
         {
             state.shell_tasks.remove(&task_id);
             return Err(RemoteHubError::UnknownShellTask(task_id));
@@ -370,12 +447,21 @@ impl RemoteHub {
     }
 
     pub fn disconnect(&self, device_id: DeviceId) {
+        let disconnected_unix_ms = unix_ms().ok();
         if let Ok(mut state) = self.inner.lock()
             && let Some(slot) = state.sessions.remove(&device_id)
         {
             state.shell_tasks.retain(|_, projection| {
-                projection.device_id != device_id || projection.token != slot.token
+                projection.device_id != device_id || projection.generation != slot.generation
             });
+            if let Some(info) = state.session_info.get_mut(&device_id)
+                && info.generation == slot.generation
+            {
+                info.state = RemoteSessionState::Disconnected;
+                if let Some(disconnected_unix_ms) = disconnected_unix_ms {
+                    info.last_transition_unix_ms = disconnected_unix_ms;
+                }
+            }
             let _ = slot.tx.try_send(RemoteCommand::Stop);
         }
     }
@@ -383,40 +469,64 @@ impl RemoteHub {
     fn register(
         &self,
         device_id: DeviceId,
+        topology: RemoteSessionTopology,
+        path: RemotePathState,
+        connected_unix_ms: u64,
     ) -> Result<(u64, mpsc::Receiver<RemoteCommand>), RemoteHubError> {
         let (tx, rx) = mpsc::channel(REMOTE_COMMAND_CAPACITY);
         let mut state = self
             .inner
             .lock()
             .map_err(|_| RemoteHubError::StatePoisoned)?;
-        state.next_token = state
-            .next_token
+        state.next_generation = state
+            .next_generation
             .checked_add(1)
-            .ok_or(RemoteHubError::TokenOverflow)?;
-        let token = state.next_token;
+            .ok_or(RemoteHubError::GenerationOverflow)?;
+        let generation = state.next_generation;
         state
             .shell_tasks
             .retain(|_, projection| projection.device_id != device_id);
+        state.session_info.insert(
+            device_id,
+            RemoteSessionInfo {
+                device_id,
+                generation,
+                state: RemoteSessionState::Connected,
+                topology,
+                path,
+                connected_unix_ms,
+                last_transition_unix_ms: connected_unix_ms,
+                last_path_change_unix_ms: connected_unix_ms,
+            },
+        );
         if let Some(previous) = state
             .sessions
-            .insert(device_id, RemoteSessionSlot { token, tx })
+            .insert(device_id, RemoteSessionSlot { generation, tx })
         {
             let _ = previous.tx.try_send(RemoteCommand::Stop);
         }
-        Ok((token, rx))
+        Ok((generation, rx))
     }
 
-    fn unregister(&self, device_id: DeviceId, token: u64) {
+    fn unregister(&self, device_id: DeviceId, generation: u64, disconnected_unix_ms: Option<u64>) {
         if let Ok(mut state) = self.inner.lock()
             && state
                 .sessions
                 .get(&device_id)
-                .is_some_and(|slot| slot.token == token)
+                .is_some_and(|slot| slot.generation == generation)
         {
             state.sessions.remove(&device_id);
             state.shell_tasks.retain(|_, projection| {
-                projection.device_id != device_id || projection.token != token
+                projection.device_id != device_id || projection.generation != generation
             });
+            if let Some(info) = state.session_info.get_mut(&device_id)
+                && info.generation == generation
+            {
+                info.state = RemoteSessionState::Disconnected;
+                if let Some(disconnected_unix_ms) = disconnected_unix_ms {
+                    info.last_transition_unix_ms = disconnected_unix_ms;
+                }
+            }
         }
     }
 }
@@ -431,7 +541,16 @@ pub async fn handle_remote_connection(
     match protocol {
         IrohProtocol::Bootstrap => handle_bootstrap(&mut stream, &identity, control).await,
         IrohProtocol::InnerSession => {
-            handle_member(&mut stream, &identity, control, hub, None, true).await
+            handle_member(
+                &mut stream,
+                &identity,
+                control,
+                hub,
+                None,
+                true,
+                RemoteSessionTopology::Direct,
+            )
+            .await
         }
         IrohProtocol::Connector => handle_connector(&mut stream, &identity, control, hub).await,
     }
@@ -487,7 +606,16 @@ async fn handle_connector(
             handle_sealed_bootstrap(stream, identity, control, site_id).await
         }
         ConnectorTunnelPurpose::InnerSession => {
-            handle_member(stream, identity, control, hub, Some(site_tag), false).await
+            handle_member(
+                stream,
+                identity,
+                control,
+                hub,
+                Some(site_tag),
+                false,
+                RemoteSessionTopology::Connector,
+            )
+            .await
         }
     }
 }
@@ -787,6 +915,7 @@ async fn handle_member(
     hub: RemoteHub,
     expected_site_tag: Option<SiteDiscoveryTag>,
     issue_connector_lease: bool,
+    topology: RemoteSessionTopology,
 ) -> Result<(), RemoteConnectionError> {
     let controller_id = identity.public_identity().controller_id;
     let authority = ControllerSessionAuthority::from_stored(identity);
@@ -840,8 +969,63 @@ async fn handle_member(
         )?;
         inner.send(stream, &lease.into_message()?).await?;
     }
-    let (token, mut commands) = hub.register(device_id)?;
-    while let Some(command) = commands.recv().await {
+    let connected_unix_ms = unix_ms()?;
+    let connection = stream.connection().clone();
+    let initial_path = match topology {
+        RemoteSessionTopology::Direct => classify_connection_path(&connection),
+        RemoteSessionTopology::Connector => RemotePathState::MixedOrUnknown,
+    };
+    let (generation, mut commands) =
+        hub.register(device_id, topology, initial_path, connected_unix_ms)?;
+    let path_watcher = if topology == RemoteSessionTopology::Direct {
+        let path_connection = connection.clone();
+        let path_hub = hub.clone();
+        Some(tokio::spawn(async move {
+            let events = path_connection.path_events();
+            tokio::pin!(events);
+            while events.next().await.is_some() {
+                if let Ok(now_unix_ms) = unix_ms() {
+                    path_hub.update_path(
+                        device_id,
+                        generation,
+                        classify_connection_path(&path_connection),
+                        now_unix_ms,
+                    );
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    let connection_closed = connection.closed();
+    tokio::pin!(connection_closed);
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + SESSION_HEARTBEAT_INTERVAL,
+        SESSION_HEARTBEAT_INTERVAL,
+    );
+    loop {
+        let command = tokio::select! {
+            _ = &mut connection_closed => break,
+            _ = heartbeat.tick() => {
+                let payload = generation.to_le_bytes().to_vec();
+                let ping = InnerMessage::new("session_ping", payload.clone())?;
+                let result = tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, async {
+                    inner.send(stream, &ping).await?;
+                    let pong = inner.recv(stream).await?;
+                    Ok::<_, clew_transport::InnerSessionError>(pong)
+                })
+                .await;
+                match result {
+                    Ok(Ok(pong)) if pong.kind == "session_pong" && pong.payload == payload => {}
+                    _ => break,
+                }
+                continue;
+            }
+            command = commands.recv() => {
+                let Some(command) = command else { break; };
+                command
+            }
+        };
         match command {
             RemoteCommand::Read { request, reply } => {
                 let result = async {
@@ -898,8 +1082,30 @@ async fn handle_member(
             RemoteCommand::Stop => break,
         }
     }
-    hub.unregister(device_id, token);
+    if let Some(path_watcher) = path_watcher {
+        path_watcher.abort();
+        let _ = path_watcher.await;
+    }
+    hub.unregister(device_id, generation, unix_ms().ok());
     Ok(())
+}
+
+fn classify_connection_path(connection: &iroh::endpoint::Connection) -> RemotePathState {
+    let paths = connection.paths();
+    let mut selected = paths.iter().filter(|path| path.is_selected());
+    let Some(path) = selected.next() else {
+        return RemotePathState::MixedOrUnknown;
+    };
+    if selected.next().is_some() {
+        return RemotePathState::MixedOrUnknown;
+    }
+    if path.is_ip() {
+        RemotePathState::Direct
+    } else if path.is_relay() {
+        RemotePathState::Relay
+    } else {
+        RemotePathState::MixedOrUnknown
+    }
 }
 
 fn connector_capability_enabled(
@@ -989,8 +1195,8 @@ pub enum RemoteHubError {
     Offline(DeviceId),
     #[error("remote hub state is poisoned")]
     StatePoisoned,
-    #[error("remote session token overflow")]
-    TokenOverflow,
+    #[error("remote session generation overflow")]
+    GenerationOverflow,
     #[error("Controller live Shell task projection capacity is exhausted")]
     ShellProjectionCapacity,
     #[error("Shell follow-up referenced unknown or stale task {0}")]
@@ -1300,13 +1506,83 @@ mod tests {
         controller_outer.close().await;
     }
 
+    #[test]
+    fn session_generation_and_path_telemetry_ignore_stale_updates() {
+        let hub = RemoteHub::default();
+        let device_id = DeviceId::new();
+        let (generation_one, _commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Relay,
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(
+            hub.session_info(device_id).unwrap().unwrap(),
+            RemoteSessionInfo {
+                device_id,
+                generation: generation_one,
+                state: RemoteSessionState::Connected,
+                topology: RemoteSessionTopology::Direct,
+                path: RemotePathState::Relay,
+                connected_unix_ms: 1_000,
+                last_transition_unix_ms: 1_000,
+                last_path_change_unix_ms: 1_000,
+            }
+        );
+
+        hub.update_path(device_id, generation_one, RemotePathState::Direct, 1_100);
+        let first = hub.session_info(device_id).unwrap().unwrap();
+        assert_eq!(first.path, RemotePathState::Direct);
+        assert_eq!(first.last_path_change_unix_ms, 1_100);
+
+        let (generation_two, _commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                2_000,
+            )
+            .unwrap();
+        assert!(generation_two > generation_one);
+        hub.update_path(device_id, generation_one, RemotePathState::Relay, 2_100);
+        hub.unregister(device_id, generation_one, Some(2_200));
+        let second = hub.session_info(device_id).unwrap().unwrap();
+        assert_eq!(second.generation, generation_two);
+        assert_eq!(second.state, RemoteSessionState::Connected);
+        assert_eq!(second.topology, RemoteSessionTopology::Connector);
+        assert_eq!(second.path, RemotePathState::MixedOrUnknown);
+        assert_eq!(second.last_transition_unix_ms, 2_000);
+
+        hub.unregister(device_id, generation_two, Some(2_300));
+        let disconnected = hub.session_info(device_id).unwrap().unwrap();
+        assert_eq!(disconnected.generation, generation_two);
+        assert_eq!(disconnected.state, RemoteSessionState::Disconnected);
+        assert_eq!(disconnected.last_transition_unix_ms, 2_300);
+    }
+
     #[tokio::test]
     async fn shell_projection_binds_task_to_live_device_session_and_reconnect_invalidates_it() {
         let hub = RemoteHub::default();
         let device_a = DeviceId::new();
         let device_b = DeviceId::new();
-        let (_token_a, mut commands_a) = hub.register(device_a).unwrap();
-        let (_token_b, mut commands_b) = hub.register(device_b).unwrap();
+        let (_generation_a, mut commands_a) = hub
+            .register(
+                device_a,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_000,
+            )
+            .unwrap();
+        let (_generation_b, mut commands_b) = hub
+            .register(
+                device_b,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Relay,
+                1_100,
+            )
+            .unwrap();
         let task_id = TaskId::new();
 
         let start_hub = hub.clone();
@@ -1393,7 +1669,14 @@ mod tests {
             Err(RemoteHubError::ShellReplyTaskMismatch(actual)) if actual == task_id
         ));
 
-        let (_replacement_token, _replacement_commands) = hub.register(device_a).unwrap();
+        let (_replacement_generation, _replacement_commands) = hub
+            .register(
+                device_a,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                2_000,
+            )
+            .unwrap();
         assert!(matches!(
             hub.shell_task_device(task_id),
             Err(RemoteHubError::UnknownShellTask(actual)) if actual == task_id
@@ -1405,7 +1688,14 @@ mod tests {
     async fn aborted_shell_start_is_completed_and_orphan_task_is_cancelled() {
         let hub = RemoteHub::default();
         let device_id = DeviceId::new();
-        let (_token, mut commands) = hub.register(device_id).unwrap();
+        let (_generation, mut commands) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_000,
+            )
+            .unwrap();
         let call_hub = hub.clone();
         let call = tokio::spawn(async move {
             call_hub

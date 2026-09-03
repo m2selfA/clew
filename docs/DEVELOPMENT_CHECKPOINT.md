@@ -58,7 +58,7 @@
 | V1.25 | Distribution Studio foundation | DONE | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
 | V2 | Agent minimum | DONE | selector + bounded filesystem + live-session Shell + MCP stdio/Streamable HTTP 全闭合 |
-| V3 | Reliability | TODO | reconnect/replay/reattach/resume/version negotiation |
+| V3 | Reliability | IN PROGRESS | V3a session generation/path telemetry/liveness DONE；继续 replay matrix + Shell reattach + compatibility |
 | V4 | Dynamic networking | TODO | TCP forward / SOCKS5 TCP / HTTP CONNECT，listener 归 Controller |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
 | V6 | Release packaging | TODO | Windows signing、macOS signing/notarization、Linux artifact、ClientFlavor pipeline |
@@ -935,7 +935,21 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：TODO**
+**Status：IN PROGRESS（V3a DONE）**
+
+### V3a — Session generation + path telemetry + idle liveness
+
+**Status：DONE（2026-09-03）**
+
+- 将 V2 Shell projection 内部使用的 RemoteHub `token` 正式提升为 **session generation**：每次 Controller 接受新的 Target InnerSession 都分配新的 process-local monotonic generation；同一 iroh connection 内 Relay↔Direct path 变化只更新 path telemetry，**绝不增加 generation**；generation 不落盘、Controller 重启后重新开始，明确不是持久 request/replay id；
+- 新增 `RemoteSessionInfo`：`connected|disconnected`、`direct|connector` topology、`direct|relay|mixed_or_unknown` path、`connected_unix_ms` / transition / path-change 时间。Direct session 订阅 iroh `path_events()`；Connector path 明确标 `connector + mixed_or_unknown`，不把 Helper↔Controller 外链冒充 Target direct/relay；stale generation 的 path event / unregister 不得覆盖新 session；
+- Local API 新增 `session.path_info` 语义与 `RemoteSessionPathInfo`，CLI 新增 `clew session-path-info <DeviceId>`；MCP 在保留全部 V2 11 tools 的基础上增加 `session_path_info`（V3 当前 12 tools）。该诊断面故意要求 stable DeviceId，因为它也覆盖 helper-only / offline device，不复用只面向 online executable 的 V2 selector；未知 DeviceId fail closed；
+- `Devices.last_seen_unix_ms` 现在在真实 disconnected transition 后投影；在线状态统一由 session telemetry 驱动，不再只看一个裸 `sessions.contains_key`；
+- 真实 Windows product smoke 暴露并修复一个重要 idle-loss bug：旧 member loop 空闲时只等 Controller command，Host hard-kill 后 15s 仍误报 connected。现在 Controller 同时监听 iroh connection close，并增加 **5s interval / 5s timeout 的 InnerSession 加密 heartbeat**；Host 只在 E2E InnerSession 内 echo generation payload 为 `session_pong`，Connector 仍只能搬密文；heartbeat 不改变 generation，也不成为业务 retry；
+- 修复后真实 hard-kill **686ms** 进入 disconnected，`last_seen_unix_ms == last_transition_unix_ms`；同一 Host state 重启复用同一 DeviceId，session **generation 1 → 2**；heartbeat 跨过空闲周期后真实 bounded Read 仍返回 `CLEW-V3A-HEARTBEAT`；MCP `session_path_info` structuredContent PASS；
+- focused generation/stale-event **1/1 PASS**，MCP V3 surface **1/1 PASS**；`cargo check --workspace --all-targets` PASS / 0 warnings；`cargo test --workspace --all-targets` **166 passed / 0 failed / 6 ignored**。
+
+下一块 V3b：request idempotency/replay matrix。先冻结每类现有短 RPC 在“发送前失败 / 已发送未知结果 / 收到结果后 caller 丢失”三种边界下是否可自动 retry；Read/PathInfo/Glob/Grep 可安全 replay，Write/Edit 只能凭现有强 precondition + stable request identity 收口，Shell Start 不能盲 replay。V3b 不把 File resume 或 Shell reattach 偷塞进一次通用 retry wrapper。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1036,13 +1050,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a DONE）**
 
-**Next block：V3 — Reliability**
+**Next block：V3b — request idempotency / replay matrix**
 
-V1.5 已在 `3a20cd2` 正式封板；V2 的 selector、bounded filesystem、live-session Shell、MCP stdio 与 loopback Streamable HTTP 现在全部闭合。下一阶段开始 V3 的 reconnect / replay matrix / Shell reattach / sleep-resume / compatibility，不回填到 V2。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3a 现在建立了 authoritative session generation/path/liveness projection，并修复 idle hard-kill 长时间误报 online；下一块只在这个 generation 边界上定义和实现 request replay 规则，Shell task reattach 与 File resume 继续分别收口。
 
 ### Change log
+
+- **2026-09-03** — V3a session generation + path telemetry + idle liveness DONE：RemoteHub token 升为 process-local generation；Direct iroh path event 只更新 direct/relay/mixed path、不触发 reconnect，Connector topology 不冒充 Target path。新增 Local API/CLI/MCP `session_path_info`，Devices disconnected 后投影 last_seen。真实 product hard-kill 首轮发现空闲 member 15s 仍误报 connected，修复为 connection-close watcher + E2E InnerSession 5s/5s encrypted heartbeat；修复后 hard-kill **686ms** disconnected，同一 DeviceId 重启 generation **1→2**，空闲 heartbeat 后 Read PASS。workspace **166/0/6**。下一块 V3b replay matrix。
 
 - **2026-09-03** — V2e-2 MCP Streamable HTTP DONE / V2 Agent Minimum DONE：`clew mcp http` 复用同一 LocalApiClient/11-tool router，仅增加 loopback HTTP transport；非-loopback bind拒绝，128KiB body hard cap。independent review补显式 same-port Origin allowlist，结合 rmcp loopback Host validation抵御浏览器 cross-origin/DNS-rebinding；真实 HTTP initialize/tools/list PASS，allowed Origin 200、bad Host 403、bad Origin 403、140KiB body 413；HTTP adapter退出后 Controller仍存活并可 authenticated shutdown。workspace **165/0/6**。下一阶段 V3 Reliability。
 

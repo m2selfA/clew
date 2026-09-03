@@ -196,6 +196,14 @@ struct ShellAttachArgs {
     max_bytes_per_stream: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SessionPathInfoArgs {
+    #[schemars(
+        description = "Stable Clew DeviceId from devices. Required exactly because session telemetry also covers helper-only and offline devices, where executable short-name selection is intentionally not used."
+    )]
+    device_id: String,
+}
+
 #[tool_router]
 impl ClewMcpServer {
     #[tool(
@@ -204,6 +212,27 @@ impl ClewMcpServer {
     async fn devices(&self) -> Result<CallToolResult, McpError> {
         match self.client.device_list().await {
             Ok(devices) => structured_result(devices),
+            Err(error) => Ok(tool_error_from_display(error)),
+        }
+    }
+
+    #[tool(
+        description = "Show the current or most recent Controller session generation, topology, iroh path state, and transition timestamps for one stable DeviceId. Generation is monotonic only within the current Controller process and changes on reconnect; path changes inside one iroh connection do not change generation."
+    )]
+    async fn session_path_info(
+        &self,
+        Parameters(args): Parameters<SessionPathInfoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let device_id = match args.device_id.parse::<DeviceId>() {
+            Ok(device_id) => device_id,
+            Err(_) => {
+                return Ok(tool_error(
+                    "device_id must be a canonical non-nil Clew DeviceId",
+                ));
+            }
+        };
+        match self.client.session_path_info(device_id).await {
+            Ok(info) => structured_result(info),
             Err(error) => Ok(tool_error_from_display(error)),
         }
     }
@@ -640,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_router_exposes_exact_v2_agent_surface() {
+    fn tool_router_exposes_v3_session_telemetry_surface_without_removing_v2_tools() {
         let mut names: Vec<_> = ClewMcpServer::tool_router()
             .list_all()
             .into_iter()
@@ -656,6 +685,7 @@ mod tests {
                 "grep",
                 "path_info",
                 "read",
+                "session_path_info",
                 "shell_attach",
                 "shell_cancel",
                 "shell_start",
