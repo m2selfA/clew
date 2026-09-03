@@ -77,6 +77,13 @@ fn run_glob(state_dir: &Path, operands: &[&str]) -> Output {
     command.arg("--state-dir").arg(state_dir).output().unwrap()
 }
 
+fn run_grep(state_dir: &Path, operands: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("grep");
+    command.args(operands);
+    command.arg("--state-dir").arg(state_dir).output().unwrap()
+}
+
 fn run_shutdown(state_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clew"))
         .arg("shutdown")
@@ -197,6 +204,31 @@ fn path_info_and_glob_cli_reuse_shared_device_selection() {
     );
 
     let named = run_glob(state_dir, &["GPU-01", "/shared", "**/*.rs"]);
+    assert!(!named.status.success());
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+}
+
+#[test]
+fn grep_cli_reuses_shared_device_selection() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path();
+    let _controller = spawn_controller(state_dir);
+    wait_until_ready(state_dir);
+
+    let automatic = run_grep(state_dir, &["/shared", "TODO"]);
+    assert!(!automatic.status.success());
+    assert!(
+        String::from_utf8_lossy(&automatic.stderr)
+            .contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
+
+    let named = run_grep(state_dir, &["GPU-01", "/shared", "TODO"]);
     assert!(!named.status.success());
     assert!(
         String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),

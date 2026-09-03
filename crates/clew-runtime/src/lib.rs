@@ -21,8 +21,8 @@ pub use local_api::{
     MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteGlobRequest, RemotePathInfoRequest,
-    RemoteReadRequest, RemoteReadResult,
+    OutfitUpdateRequest, RecoveryStatus, RemoteGlobRequest, RemoteGrepRequest,
+    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,

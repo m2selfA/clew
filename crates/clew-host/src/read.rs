@@ -6,11 +6,13 @@ use std::{
 
 use clew_core::ReadPolicy;
 use clew_transport::{
-    FsGlobPage, FsPathInfo, FsPathKind, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
-    HARD_MAX_FS_SCAN_ENTRIES, ReadErrorCode, ReadReply, ReadRequest,
+    FsGlobPage, FsGrepMatch, FsGrepPage, FsPathInfo, FsPathKind, FsQueryErrorCode, FsQueryReply,
+    FsQueryRequest, HARD_MAX_FS_SCAN_ENTRIES, HARD_MAX_GREP_LINE_BYTES, ReadErrorCode, ReadReply,
+    ReadRequest,
 };
+use regex::bytes::{Regex, RegexBuilder};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
     time::timeout,
 };
 
@@ -64,9 +66,13 @@ impl HostReadService {
                 "filesystem query is outside the allowed policy",
             );
         }
-        if let FsQueryRequest::Glob { max_bytes, .. } = &request
-            && *max_bytes > self.policy.max_result_bytes
-        {
+        let requested_max_bytes = match &request {
+            FsQueryRequest::PathInfo { .. } => None,
+            FsQueryRequest::Glob { max_bytes, .. } | FsQueryRequest::Grep { max_bytes, .. } => {
+                Some(*max_bytes)
+            }
+        };
+        if requested_max_bytes.is_some_and(|max_bytes| max_bytes > self.policy.max_result_bytes) {
             return FsQueryReply::error(
                 FsQueryErrorCode::Denied,
                 "filesystem query byte limit exceeds the allowed policy",
@@ -84,6 +90,26 @@ impl HostReadService {
                 } => {
                     self.glob_once(root, pattern, cursor, limit, max_bytes)
                         .await
+                }
+                FsQueryRequest::Grep {
+                    root,
+                    pattern,
+                    include,
+                    cursor,
+                    limit,
+                    max_bytes,
+                    max_scan_bytes,
+                } => {
+                    self.grep_once(
+                        root,
+                        pattern,
+                        include,
+                        cursor,
+                        limit,
+                        max_bytes,
+                        max_scan_bytes,
+                    )
+                    .await
                 }
             }
         };
@@ -304,6 +330,157 @@ impl HostReadService {
         glob_page(entries, cursor, false)
     }
 
+    async fn grep_once(
+        &self,
+        root: String,
+        pattern: String,
+        include: Option<String>,
+        cursor: u64,
+        limit: u32,
+        max_bytes: u32,
+        max_scan_bytes: u64,
+    ) -> FsQueryReply {
+        let requested = PathBuf::from(&root);
+        let root = match self.canonical_allowed(&requested).await {
+            Ok(path) => path,
+            Err(error) => return fs_access_error(error),
+        };
+        let metadata = match tokio::fs::metadata(&root).await {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return FsQueryReply::error(FsQueryErrorCode::Io, "grep root metadata failed");
+            }
+        };
+        let regex = match RegexBuilder::new(&pattern)
+            .size_limit(1 * 1024 * 1024)
+            .dfa_size_limit(2 * 1024 * 1024)
+            .build()
+        {
+            Ok(regex) => regex,
+            Err(_) => {
+                return FsQueryReply::error(FsQueryErrorCode::InvalidRequest, "invalid grep regex");
+            }
+        };
+        let include = include.map(|pattern| pattern.replace('\\', "/"));
+        if include
+            .as_ref()
+            .is_some_and(|pattern| pattern.starts_with('/') || pattern.split('/').count() > 128)
+        {
+            return FsQueryReply::error(
+                FsQueryErrorCode::InvalidRequest,
+                "grep include must be a bounded relative glob",
+            );
+        }
+
+        let mut state = GrepState {
+            cursor,
+            limit,
+            max_bytes,
+            max_scan_bytes,
+            scanned_bytes: 0,
+            matched: 0,
+            matches: Vec::new(),
+        };
+
+        if metadata.is_file() {
+            let relative = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_owned();
+            if include
+                .as_ref()
+                .is_none_or(|pattern| glob_matches(pattern, &relative))
+            {
+                if let Some(reply) = grep_file(&root, &regex, &mut state).await {
+                    return reply;
+                }
+            }
+            return grep_page(state, false);
+        }
+        if !metadata.is_dir() {
+            return FsQueryReply::error(
+                FsQueryErrorCode::NotDirectory,
+                "grep root is neither a regular file nor a directory",
+            );
+        }
+
+        let mut queue = VecDeque::from([(root.clone(), String::new())]);
+        let mut visited_directories = BTreeSet::from([root.clone()]);
+        let mut scanned_entries = 0_usize;
+        while let Some((directory, prefix)) = queue.pop_front() {
+            let mut reader = match tokio::fs::read_dir(&directory).await {
+                Ok(reader) => reader,
+                Err(_) => {
+                    return FsQueryReply::error(FsQueryErrorCode::Io, "grep directory read failed");
+                }
+            };
+            let mut children = Vec::new();
+            loop {
+                match reader.next_entry().await {
+                    Ok(Some(entry)) => children.push(entry),
+                    Ok(None) => break,
+                    Err(_) => {
+                        return FsQueryReply::error(
+                            FsQueryErrorCode::Io,
+                            "grep directory iteration failed",
+                        );
+                    }
+                }
+            }
+            children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+            for entry in children {
+                scanned_entries = scanned_entries.saturating_add(1);
+                if scanned_entries > HARD_MAX_FS_SCAN_ENTRIES {
+                    return FsQueryReply::error(
+                        FsQueryErrorCode::ScanLimit,
+                        "grep scan exceeded its hard entry bound",
+                    );
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let relative = if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let file_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(_) => {
+                        return FsQueryReply::error(
+                            FsQueryErrorCode::Io,
+                            "grep file type lookup failed",
+                        );
+                    }
+                };
+                if file_type.is_dir()
+                    && !file_type.is_symlink()
+                    && let Ok(canonical_child) = tokio::fs::canonicalize(entry.path()).await
+                    && canonical_child.starts_with(&root)
+                    && visited_directories.insert(canonical_child.clone())
+                {
+                    queue.push_back((canonical_child, relative.clone()));
+                    continue;
+                }
+                if !file_type.is_file() || file_type.is_symlink() {
+                    continue;
+                }
+                if include
+                    .as_ref()
+                    .is_some_and(|pattern| !glob_matches(pattern, &relative))
+                {
+                    continue;
+                }
+                if let Some(reply) = grep_file(&entry.path(), &regex, &mut state).await {
+                    return reply;
+                }
+            }
+        }
+        grep_page(state, false)
+    }
+
     async fn canonical_allowed(&self, requested: &Path) -> Result<PathBuf, PathAccessError> {
         if !requested.is_absolute() {
             return Err(PathAccessError::NotAbsolute);
@@ -325,6 +502,172 @@ impl HostReadService {
         }
         Err(PathAccessError::OutsideRoots)
     }
+}
+
+#[derive(Debug, Default)]
+struct GrepState {
+    cursor: u64,
+    limit: u32,
+    max_bytes: u32,
+    max_scan_bytes: u64,
+    scanned_bytes: u64,
+    matched: u64,
+    matches: Vec<FsGrepMatch>,
+}
+
+async fn grep_file(path: &Path, regex: &Regex, state: &mut GrepState) -> Option<FsQueryReply> {
+    let path_string = match path.to_str() {
+        Some(path) if !path.is_empty() && path.len() <= clew_core::HARD_MAX_READ_ROOT_BYTES => {
+            path.to_owned()
+        }
+        _ => {
+            return Some(FsQueryReply::error(
+                FsQueryErrorCode::ContentLimit,
+                "grep path exceeds the hard UTF-8 path bound",
+            ));
+        }
+    };
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(_) => {
+            return Some(FsQueryReply::error(
+                FsQueryErrorCode::Io,
+                "grep file could not be opened",
+            ));
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut line_number = 0_u64;
+    loop {
+        let remaining = state.max_scan_bytes.saturating_sub(state.scanned_bytes);
+        let (mut line, consumed) = match read_bounded_line(&mut reader, remaining).await {
+            Ok(Some(line)) => line,
+            Ok(None) => return None,
+            Err(GrepLineReadError::Io) => {
+                return Some(FsQueryReply::error(
+                    FsQueryErrorCode::Io,
+                    "grep file read failed",
+                ));
+            }
+            Err(GrepLineReadError::ScanLimit) => {
+                return Some(FsQueryReply::error(
+                    FsQueryErrorCode::ScanLimit,
+                    "grep content scan exceeded its byte budget",
+                ));
+            }
+            Err(GrepLineReadError::LineLimit) => {
+                return Some(FsQueryReply::error(
+                    FsQueryErrorCode::ContentLimit,
+                    "grep encountered a line longer than the hard line bound",
+                ));
+            }
+        };
+        state.scanned_bytes = state.scanned_bytes.saturating_add(consumed as u64);
+        line_number = line_number.saturating_add(1);
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if !regex.is_match(&line) {
+            continue;
+        }
+        state.matched = state.matched.saturating_add(1);
+        if state.matched <= state.cursor {
+            continue;
+        }
+        if state.matches.len() >= state.limit as usize {
+            return Some(grep_page(std::mem::take(state), true));
+        }
+        let line = match String::from_utf8(line) {
+            Ok(line) => line,
+            Err(_) => {
+                return Some(FsQueryReply::error(
+                    FsQueryErrorCode::ContentLimit,
+                    "grep matched non-UTF-8 text that cannot be returned safely",
+                ));
+            }
+        };
+        let item = FsGrepMatch {
+            path: path_string.clone(),
+            line_number,
+            line,
+        };
+        let mut candidate = state.matches.clone();
+        candidate.push(item.clone());
+        let candidate_reply = FsQueryReply::Grep(FsGrepPage {
+            matches: candidate,
+            next_cursor: Some(state.cursor.saturating_add(state.matches.len() as u64 + 1)),
+            truncated: true,
+            scanned_bytes: state.scanned_bytes,
+        });
+        let encoded_len = serde_json::to_vec(&candidate_reply)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if encoded_len > state.max_bytes as usize {
+            if state.matches.is_empty() {
+                return Some(FsQueryReply::error(
+                    FsQueryErrorCode::InvalidRequest,
+                    "grep max_bytes is too small for the next match",
+                ));
+            }
+            return Some(grep_page(std::mem::take(state), true));
+        }
+        state.matches.push(item);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GrepLineReadError {
+    Io,
+    ScanLimit,
+    LineLimit,
+}
+
+async fn read_bounded_line(
+    reader: &mut BufReader<tokio::fs::File>,
+    scan_remaining: u64,
+) -> Result<Option<(Vec<u8>, usize)>, GrepLineReadError> {
+    let mut line = Vec::with_capacity(256);
+    let mut consumed = 0_usize;
+    loop {
+        let buffer = reader.fill_buf().await.map_err(|_| GrepLineReadError::Io)?;
+        if buffer.is_empty() {
+            return if consumed == 0 {
+                Ok(None)
+            } else {
+                Ok(Some((line, consumed)))
+            };
+        }
+        let remaining = scan_remaining.saturating_sub(consumed as u64);
+        if remaining == 0 {
+            return Err(GrepLineReadError::ScanLimit);
+        }
+        let buffer_len = buffer.len();
+        let permitted = buffer_len.min(remaining.min(usize::MAX as u64) as usize);
+        let newline = buffer[..permitted].iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(permitted, |index| index + 1);
+        if line.len().saturating_add(take) > HARD_MAX_GREP_LINE_BYTES {
+            return Err(GrepLineReadError::LineLimit);
+        }
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        consumed = consumed.saturating_add(take);
+        if newline.is_some() {
+            return Ok(Some((line, consumed)));
+        }
+        if permitted < buffer_len {
+            return Err(GrepLineReadError::ScanLimit);
+        }
+    }
+}
+
+fn grep_page(state: GrepState, truncated: bool) -> FsQueryReply {
+    let next_cursor = truncated.then(|| state.cursor.saturating_add(state.matches.len() as u64));
+    FsQueryReply::Grep(FsGrepPage {
+        matches: state.matches,
+        next_cursor,
+        truncated,
+        scanned_bytes: state.scanned_bytes,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -556,6 +899,107 @@ mod tests {
         assert!(matches!(
             denied,
             FsQueryReply::Error(error) if error.code == FsQueryErrorCode::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn grep_is_streaming_paginated_and_hard_bounded() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("a.rs"), b"alpha\nTODO first\n").unwrap();
+        fs::write(nested.join("b.rs"), b"FIXME second\nTODO third\n").unwrap();
+        fs::write(root.join("ignore.txt"), b"TODO ignored\n").unwrap();
+        let service = HostReadService::new(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 4_096, 5_000).unwrap(),
+        )
+        .unwrap();
+
+        let page_one = service
+            .execute_fs_query(
+                FsQueryRequest::grep(
+                    root.to_string_lossy(),
+                    "TODO|FIXME",
+                    Some("**/*.rs".into()),
+                    0,
+                    2,
+                    4_096,
+                    4_096,
+                )
+                .unwrap(),
+            )
+            .await;
+        let FsQueryReply::Grep(page_one) = page_one else {
+            panic!("expected first grep page");
+        };
+        assert_eq!(page_one.matches.len(), 2);
+        assert!(page_one.matches[0].path.ends_with("a.rs"));
+        assert_eq!(page_one.matches[0].line_number, 2);
+        assert_eq!(page_one.matches[0].line, "TODO first");
+        assert!(page_one.matches[1].path.ends_with("b.rs"));
+        assert_eq!(page_one.matches[1].line, "FIXME second");
+        assert!(page_one.truncated);
+        assert_eq!(page_one.next_cursor, Some(2));
+
+        let page_two = service
+            .execute_fs_query(
+                FsQueryRequest::grep(
+                    root.to_string_lossy(),
+                    "TODO|FIXME",
+                    Some("**/*.rs".into()),
+                    2,
+                    4,
+                    4_096,
+                    4_096,
+                )
+                .unwrap(),
+            )
+            .await;
+        let FsQueryReply::Grep(page_two) = page_two else {
+            panic!("expected second grep page");
+        };
+        assert_eq!(page_two.matches.len(), 1);
+        assert_eq!(page_two.matches[0].line, "TODO third");
+        assert!(!page_two.truncated);
+        assert_eq!(page_two.next_cursor, None);
+        assert!(page_two.scanned_bytes > 0);
+
+        let invalid_regex = service
+            .execute_fs_query(
+                FsQueryRequest::grep(root.to_string_lossy(), "(", None, 0, 4, 4_096, 4_096)
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            invalid_regex,
+            FsQueryReply::Error(error) if error.code == FsQueryErrorCode::InvalidRequest
+        ));
+
+        let scan_limited = service
+            .execute_fs_query(
+                FsQueryRequest::grep(root.to_string_lossy(), "TODO", None, 0, 4, 4_096, 1).unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            scan_limited,
+            FsQueryReply::Error(error) if error.code == FsQueryErrorCode::ScanLimit
+        ));
+
+        let long = root.join("long.rs");
+        let mut oversized_line = b"TODO ".to_vec();
+        oversized_line.extend(std::iter::repeat_n(b'x', HARD_MAX_GREP_LINE_BYTES));
+        oversized_line.push(b'\n');
+        fs::write(&long, oversized_line).unwrap();
+        let line_limited = service
+            .execute_fs_query(
+                FsQueryRequest::grep(long.to_string_lossy(), "TODO", None, 0, 4, 4_096, 32 * 1024)
+                    .unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            line_limited,
+            FsQueryReply::Error(error) if error.code == FsQueryErrorCode::ContentLimit
         ));
     }
 

@@ -20,8 +20,8 @@ use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
     OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteGlobRequest, RemotePathInfoRequest, RemoteReadRequest,
-    restore_controller_backup, start_controller,
+    OutfitSetFieldRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
+    RemoteReadRequest, restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -127,6 +127,23 @@ enum Command {
         limit: u32,
         #[arg(long, default_value_t = 32_768)]
         max_bytes: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Search bounded UTF-8 lines under one allowed root using a linear-time regex.
+    Grep {
+        #[arg(value_name = "DEVICE_ROOT_REGEX", num_args = 2..=3)]
+        operands: Vec<String>,
+        #[arg(long, value_name = "GLOB")]
+        include: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        cursor: u64,
+        #[arg(long, default_value_t = 128)]
+        limit: u32,
+        #[arg(long, default_value_t = 32_768)]
+        max_bytes: u32,
+        #[arg(long, default_value_t = 8_388_608)]
+        max_scan_bytes: u64,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -444,6 +461,40 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     cursor,
                     limit,
                     max_bytes,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&page)?);
+        }
+        Command::Grep {
+            operands,
+            include,
+            cursor,
+            limit,
+            max_bytes,
+            max_scan_bytes,
+            state_dir,
+        } => {
+            let (selector, root, pattern) = match operands.as_slice() {
+                [root, pattern] => (None, root.clone(), pattern.clone()),
+                [selector, root, pattern] => {
+                    (Some(selector.as_str()), root.clone(), pattern.clone())
+                }
+                _ => unreachable!("clap enforces two or three grep operands"),
+            };
+            let config = controller_config(state_dir)?;
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let page = client
+                .grep(RemoteGrepRequest {
+                    device_id,
+                    root,
+                    pattern,
+                    include,
+                    cursor,
+                    limit,
+                    max_bytes,
+                    max_scan_bytes,
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&page)?);

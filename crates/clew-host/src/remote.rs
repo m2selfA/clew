@@ -2307,7 +2307,7 @@ mod tests {
                 inner
                     .send(
                         &mut stream,
-                        &FsQueryRequest::glob(share_path, "*.txt", 0, 8, 4_096)
+                        &FsQueryRequest::glob(share_path.clone(), "*.txt", 0, 8, 4_096)
                             .unwrap()
                             .into_message()
                             .unwrap(),
@@ -2321,6 +2321,35 @@ mod tests {
                 };
                 assert_eq!(page.entries.len(), 1);
                 assert!(page.entries[0].path.ends_with("proof.txt"));
+                assert!(!page.truncated);
+
+                inner
+                    .send(
+                        &mut stream,
+                        &FsQueryRequest::grep(
+                            share_path,
+                            "CLEW-V15C",
+                            Some("*.txt".into()),
+                            0,
+                            8,
+                            4_096,
+                            4_096,
+                        )
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let grep_reply = inner.recv(&mut stream).await.unwrap();
+                let FsQueryReply::Grep(page) = FsQueryReply::from_message(&grep_reply).unwrap()
+                else {
+                    panic!("expected Grep reply over Connector InnerSession");
+                };
+                assert_eq!(page.matches.len(), 1);
+                assert!(page.matches[0].path.ends_with("proof.txt"));
+                assert_eq!(page.matches[0].line_number, 1);
+                assert_eq!(page.matches[0].line, "CLEW-V15C-NO-PUBLIC-CONNECTOR-READ");
                 assert!(!page.truncated);
             }
         });

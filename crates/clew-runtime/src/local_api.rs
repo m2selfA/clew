@@ -15,8 +15,8 @@ use clew_core::{
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
 use clew_transport::{
-    FsGlobPage, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
-    IrohOuter, ReadErrorCode, ReadReply, ReadRequest, noise_static_public,
+    FsGlobPage, FsGrepPage, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode, FsQueryReply,
+    FsQueryRequest, IrohOuter, ReadErrorCode, ReadReply, ReadRequest, noise_static_public,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -109,6 +109,20 @@ pub struct RemoteGlobRequest {
     pub cursor: u64,
     pub limit: u32,
     pub max_bytes: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteGrepRequest {
+    pub device_id: DeviceId,
+    pub root: String,
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include: Option<String>,
+    #[serde(default)]
+    pub cursor: u64,
+    pub limit: u32,
+    pub max_bytes: u32,
+    pub max_scan_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -328,6 +342,7 @@ enum LocalMethod {
     Read(RemoteReadRequest),
     PathInfo(RemotePathInfoRequest),
     Glob(RemoteGlobRequest),
+    Grep(RemoteGrepRequest),
     ActivityList {
         limit: u32,
     },
@@ -370,6 +385,7 @@ enum LocalResponse {
     ReadError(clew_transport::ReadErrorBody),
     PathInfo(FsPathInfo),
     Glob(FsGlobPage),
+    Grep(FsGrepPage),
     FsQueryError(FsQueryErrorBody),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
@@ -497,6 +513,7 @@ async fn dispatch(
         LocalMethod::Read(request) => (read_response(state, request).await, false),
         LocalMethod::PathInfo(request) => (path_info_response(state, request).await, false),
         LocalMethod::Glob(request) => (glob_response(state, request).await, false),
+        LocalMethod::Grep(request) => (grep_response(state, request).await, false),
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
                 return (
@@ -883,6 +900,30 @@ async fn glob_response(state: &LocalApiState, request: RemoteGlobRequest) -> Loc
     .await
 }
 
+async fn grep_response(state: &LocalApiState, request: RemoteGrepRequest) -> LocalResponse {
+    let wire_request = match FsQueryRequest::grep(
+        &request.root,
+        &request.pattern,
+        request.include,
+        request.cursor,
+        request.limit,
+        request.max_bytes,
+        request.max_scan_bytes,
+    ) {
+        Ok(request) => request,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
+    fs_query_response(
+        state,
+        request.device_id,
+        wire_request,
+        "grep",
+        request.root,
+        Some(request.max_bytes),
+    )
+    .await
+}
+
 async fn fs_query_response(
     state: &LocalApiState,
     device_id: DeviceId,
@@ -920,7 +961,11 @@ async fn fs_query_response(
             );
         }
     };
-    let expected_path_info = matches!(wire_request, FsQueryRequest::PathInfo { .. });
+    let expected_kind = match &wire_request {
+        FsQueryRequest::PathInfo { .. } => "path_info",
+        FsQueryRequest::Glob { .. } => "glob",
+        FsQueryRequest::Grep { .. } => "grep",
+    };
     let started = Instant::now();
     let remote_timeout = Duration::from_millis(u64::from(policy.timeout_ms).saturating_add(2_000));
     let remote_result = timeout(
@@ -946,7 +991,7 @@ async fn fs_query_response(
             ActivityResult::Failed,
             0,
         ),
-        Ok(Ok(FsQueryReply::PathInfo(info))) if expected_path_info => {
+        Ok(Ok(FsQueryReply::PathInfo(info))) if expected_kind == "path_info" => {
             let bytes = serde_json::to_vec(&info).map_or(0, |encoded| encoded.len() as u64);
             (
                 LocalResponse::PathInfo(info),
@@ -954,7 +999,7 @@ async fn fs_query_response(
                 bytes,
             )
         }
-        Ok(Ok(FsQueryReply::Glob(page))) if !expected_path_info => {
+        Ok(Ok(FsQueryReply::Glob(page))) if expected_kind == "glob" => {
             match serde_json::to_vec(&page) {
                 Ok(encoded)
                     if requested_max_bytes
@@ -971,6 +1016,36 @@ async fn fs_query_response(
                 }
                 Ok(encoded) => (
                     LocalResponse::Glob(page),
+                    ActivityResult::Succeeded,
+                    encoded.len() as u64,
+                ),
+                Err(_) => (
+                    local_error(
+                        LocalApiErrorCode::Internal,
+                        "device returned an invalid filesystem result",
+                    ),
+                    ActivityResult::Failed,
+                    0,
+                ),
+            }
+        }
+        Ok(Ok(FsQueryReply::Grep(page))) if expected_kind == "grep" => {
+            match serde_json::to_vec(&page) {
+                Ok(encoded)
+                    if requested_max_bytes
+                        .is_some_and(|max_bytes| encoded.len() > max_bytes as usize) =>
+                {
+                    (
+                        local_error(
+                            LocalApiErrorCode::Internal,
+                            "device returned a filesystem result larger than requested",
+                        ),
+                        ActivityResult::Failed,
+                        0,
+                    )
+                }
+                Ok(encoded) => (
+                    LocalResponse::Grep(page),
                     ActivityResult::Succeeded,
                     encoded.len() as u64,
                 ),
@@ -1296,6 +1371,21 @@ impl LocalApiClient {
     ) -> Result<FsGlobPage, LocalApiClientError> {
         match self.request(LocalMethod::Glob(request)).await? {
             LocalResponse::Glob(page) => Ok(page),
+            LocalResponse::FsQueryError(error) => Err(LocalApiClientError::FsQueryRemote {
+                code: error.code,
+                message: error.message,
+            }),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn grep(
+        &self,
+        request: RemoteGrepRequest,
+    ) -> Result<FsGrepPage, LocalApiClientError> {
+        match self.request(LocalMethod::Grep(request)).await? {
+            LocalResponse::Grep(page) => Ok(page),
             LocalResponse::FsQueryError(error) => Err(LocalApiClientError::FsQueryRemote {
                 code: error.code,
                 message: error.message,

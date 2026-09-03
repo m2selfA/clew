@@ -21,9 +21,10 @@ pub use discovery::{
     ConnectorDiscoveryEvent, ConnectorDiscoveryEvents, MdnsConnectorDiscovery, SiteDiscoveryTag,
 };
 pub use fs_query::{
-    FsGlobPage, FsPathInfo, FsPathKind, FsQueryErrorBody, FsQueryErrorCode, FsQueryProtocolError,
-    FsQueryReply, FsQueryRequest, HARD_MAX_FS_PATTERN_BYTES, HARD_MAX_FS_RESULT_ITEMS,
-    HARD_MAX_FS_SCAN_ENTRIES,
+    FsGlobPage, FsGrepMatch, FsGrepPage, FsPathInfo, FsPathKind, FsQueryErrorBody,
+    FsQueryErrorCode, FsQueryProtocolError, FsQueryReply, FsQueryRequest,
+    HARD_MAX_FS_PATTERN_BYTES, HARD_MAX_FS_RESULT_ITEMS, HARD_MAX_FS_SCAN_ENTRIES,
+    HARD_MAX_GREP_LINE_BYTES, HARD_MAX_GREP_SCAN_BYTES,
 };
 pub use inner::{
     ControllerSessionAuthority, ControllerSessionIdentity, DeviceSessionClaim,

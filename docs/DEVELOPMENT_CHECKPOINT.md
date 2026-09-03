@@ -772,7 +772,7 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 
 ## 9. V2 — Agent Minimum
 
-**Status：IN PROGRESS（V2a + V2b-1 DONE）**
+**Status：IN PROGRESS（V2a + V2b read-only surface DONE）**
 
 ### V2a — Shared device selection + selector-aware bounded Read
 
@@ -797,7 +797,19 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 - Controller Local API 新增 DeviceId-only `RemotePathInfoRequest` / `RemoteGlobRequest`，继续在 Controller catalog 复核 Site/device revoke、execute capability、ReadPolicy 与 timeout，并记录 `path_info` / `glob` Activity；CLI `path-info` / `glob` 只在 adapter 层使用 V2a shared selector，wire 里仍没有人类名称；
 - focused validation：protocol roundtrip/hard-bound **1/1 PASS**；Host root/pagination/byte-bound **1/1 PASS**；真实 no-public Connector regression 在同一 InnerSession 中连续 `Read → PathInfo → Glob` **1/1 PASS（3.48s）**；CLI shared-selector surface **1/1 PASS**；`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **148 passed / 0 failed / 6 ignored**。
 
-下一块 V2b-2：在同一个 `FsQuery`/ReadPolicy/selector/Activity 骨架上实现 bounded Grep；文件内容扫描必须流式有 scan-byte/file-byte/line-length hard bounds，不用无界 `read_to_string`，完成后再封 read-only filesystem surface。
+### V2b-2 — Bounded streaming Grep
+
+**Status：DONE（2026-09-03）**
+
+- `FsQueryRequest/FsQueryReply` 在 V2b-1 同一 RPC 上增加 `Grep`，没有新增第二套文件协议；Local API 仍只吃 DeviceId，CLI `grep` 继续复用 V2a shared selector，Connector 仍只转发 InnerSession ciphertext；
+- regex 使用 `regex::bytes` 线性时间引擎，pattern 继续受 **1,024-byte** hard bound，并显式把 regex compiler NFA/DFA size limit 固定为 **1 MiB / 2 MiB**，不依赖 crate 默认内存预算；invalid regex 结构化 `InvalidRequest`；
+- 内容扫描完全流式：`BufReader::fill_buf/consume` 自实现 bounded line reader，不使用 `read_to_string/read_until` 等可能对单行/整文件无界扩容的 API；单行 hard cap **16 KiB**，单请求 content scan hard cap **32 MiB**，调用方还可进一步降低 `max_scan_bytes`；超 line/scan budget 分别 fail closed 为 `ContentLimit` / `ScanLimit`，不把部分结果冒充完整结果；
+- 目录模式复用 Glob 的 deterministic BFS、每目录稳定排序、最多 **100,000 entries**、canonical-root containment + canonical visited set；symlink file 不扫描、symlink/junction/reparse directory 不递归逃出 root；也支持直接 grep 一个 authorized regular file；可选 `--include` 复用 bounded relative glob；
+- cursor 与 Glob 一致，是“已消费匹配数”；page item 上限 **1,024**。返回前逐项按真实 JSON payload 检查请求 `max_bytes`，transport 再封 **48 KiB** hard reply cap，Controller Local API 再复核实际 Grep reply 不超过请求 budget；匹配到无法安全返回的非 UTF-8 line 时 fail closed，不做 lossy 文本伪造；
+- Controller 继续复核 Site/device revoke、execute capability、ReadPolicy、timeout，并记录 `operation=grep` Activity；真实 Windows product smoke 用 isolated Controller + 普通 Host 运行 `clew grep <root> 'TODO|FIXME' --include '**/*.rs'`，自动选择唯一在线 executable device，精确返回 2 个 `.rs` 匹配、排除 `.txt`；Activity 记录 `grep / succeeded / transferred_bytes=320 / duration_ms=6`；smoke Controller authenticated shutdown、Host job 与 state 均已清理；
+- focused validation：protocol Grep request/reply/bounds **1/1 PASS**；Host streaming pagination + regex/scan/line hard caps **1/1 PASS**；真实 no-public Connector regression 在同一 InnerSession 中连续 `Read → PathInfo → Glob → Grep` **1/1 PASS（3.33s）**；CLI selector surface **1/1 PASS**；`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **150 passed / 0 failed / 6 ignored**。
+
+V2 的 read-only filesystem surface（Devices/selector + Read/PathInfo/Glob/Grep）至此封板。下一块 V2c：Edit/Write，要求 explicit preconditions + atomic replace + hard write/result bounds；不提前引入 V3 generic task/replay/resume。
 
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
@@ -913,13 +925,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b-1 DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b read-only surface DONE）**
 
-**Next block：V2b-2 — bounded Grep read-only surface**
+**Next block：V2c — bounded atomic Edit / Write**
 
-V1.5 已在 `3a20cd2` 正式封板。V2a 已把既有设备选择规则从 Host 私有实现提升为 `clew-core` 共享语义，并把 `clew read` 接到 `device.list → shared selector → DeviceId-only Local API Read`；DeviceId、`Site/Device`、唯一短名、唯一设备自动选择、重名候选与 helper-only 拒绝均已 focused 覆盖。后续 MCP 必须复用这层 target resolution，而不是自己按列表顺序挑设备。下一步 V2b 只扩展 bounded read-only filesystem tools，不提前回灌 V3 reconnect/reattach 或 V5 transfer plane。
+V1.5 已在 `3a20cd2` 正式封板。V2a 的 shared target resolution 与 V2b 的 DeviceId-only Read/PathInfo/Glob/Grep 现在形成一套完整 bounded read-only agent filesystem surface：selector 只存在于 adapter，Local API/wire 只使用稳定 DeviceId；filesystem business payload 始终在 Target↔Controller InnerSession 内；Host 与 Controller 双重执行 roots/capability/output budget。下一步只增加带 precondition 的 atomic Edit/Write，不提前回灌 V3 reconnect/reattach/replay 或 V5 transfer plane。
 
 ### Change log
+
+- **2026-09-03** — V2b-2 bounded Grep DONE / read-only filesystem surface closed：在同一 `fs_query` RPC 增加 streaming Grep，`regex::bytes` + explicit 1MiB/2MiB compile budgets，16KiB line / 32MiB scan / 48KiB reply / 1024 item hard bounds；目录 traversal 继续 canonical-root containment + visited 去重，内容用 `fill_buf/consume`，无 unbounded full-file/line read。focused protocol/Host/CLI 与真实 Connector `Read→PathInfo→Glob→Grep` 均 PASS；Windows product smoke `clew grep` 返回正确 `.rs` matches 并写 Activity；workspace **150/0/6**。下一块 V2c atomic Edit/Write。
 
 - **2026-09-03** — V2b-1 bounded PathInfo/Glob DONE：新增 `fs_query` InnerSession RPC 与 DeviceId-only Local API/CLI adapters；PathInfo/Glob 全复用 ReadPolicy canonical roots/timeout，Glob 加 deterministic BFS、cursor、100k scan-entry/1024 item/pattern/byte hard bounds，并对 junction/reparse 目录做 canonical-root containment + visited 去重。transport 与 Controller 双重校验 reply byte budget。focused protocol、Host、CLI、真实 Connector `Read→PathInfo→Glob` 均 PASS；下一块 V2b-2 bounded Grep。
 
