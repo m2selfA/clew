@@ -1,14 +1,16 @@
 use std::{env, fs, path::PathBuf};
 
 use clew_core::StateLayout;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, unix))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(windows)]
 const PIPE_NAME_DOMAIN: &[u8] = b"clew/local-api-pipe/v1\0";
-#[cfg(target_os = "macos")]
-const MACOS_SOCKET_DOMAIN: &[u8] = b"clew/local-api-socket/v1\0";
+#[cfg(unix)]
+const UNIX_SOCKET_DOMAIN: &[u8] = b"clew/local-api-socket/v1\0";
+#[cfg(unix)]
+const UNIX_SOCKET_SAFE_BYTES: usize = 96;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControllerConfig {
@@ -62,20 +64,30 @@ impl ControllerConfig {
         }
         #[cfg(target_os = "macos")]
         {
-            let mut hasher = Sha256::new();
-            hasher.update(MACOS_SOCKET_DOMAIN);
-            hasher.update(self.state_root.to_string_lossy().as_bytes());
-            let digest = hasher.finalize();
-            let suffix = hex_prefix(&digest[..8]);
-            LocalEndpoint::UnixSocket(
-                env::temp_dir().join(format!("clew-controller-{suffix}.sock")),
-            )
+            LocalEndpoint::UnixSocket(short_unix_controller_socket(&self.state_root))
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            LocalEndpoint::UnixSocket(self.state_layout().local_api_socket_path())
+            use std::os::unix::ffi::OsStrExt;
+
+            let candidate = self.state_layout().local_api_socket_path();
+            if candidate.as_os_str().as_bytes().len() < UNIX_SOCKET_SAFE_BYTES {
+                LocalEndpoint::UnixSocket(candidate)
+            } else {
+                LocalEndpoint::UnixSocket(short_unix_controller_socket(&self.state_root))
+            }
         }
     }
+}
+
+#[cfg(unix)]
+fn short_unix_controller_socket(state_root: &std::path::Path) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(UNIX_SOCKET_DOMAIN);
+    hasher.update(state_root.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let suffix = hex_prefix(&digest[..8]);
+    env::temp_dir().join(format!("clew-controller-{suffix}.sock"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,7 +141,7 @@ pub enum ControllerConfigError {
     UnsupportedPlatform,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, unix))]
 fn hex_prefix(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -150,15 +162,26 @@ mod tests {
         assert_eq!(config.local_endpoint(), config.local_endpoint());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn macos_endpoint_uses_short_user_temp_socket_for_deep_state_root() {
+    fn unix_endpoint_uses_short_temp_socket_for_deep_state_root() {
         let config = ControllerConfig::new(
-            "/Users/test/Documents/Scratch/scratchpad/a-very-long-clew-test-directory-name/nested-controller-state-directory",
+            std::env::temp_dir()
+                .join("clew-deep-state")
+                .join("nested-controller-state-directory-that-would-overflow-sun-path-because-it-is-deliberately-very-long")
+                .join("another-deliberately-long-segment"),
         );
         let LocalEndpoint::UnixSocket(path) = config.local_endpoint();
         assert!(path.starts_with(env::temp_dir()));
         assert!(path.to_string_lossy().len() < 100);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_short_controller_socket_stays_inside_private_state_dir() {
+        let config = ControllerConfig::new("/tmp/c");
+        let LocalEndpoint::UnixSocket(path) = config.local_endpoint();
+        assert_eq!(path, config.state_layout().local_api_socket_path());
     }
 
     #[cfg(windows)]

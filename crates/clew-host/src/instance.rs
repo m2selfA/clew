@@ -21,8 +21,10 @@ use crate::ClientFlavorId;
 const INSTANCE_KEY_DOMAIN: &[u8] = b"clew/host-instance-key/v1\0";
 #[cfg(windows)]
 const PIPE_NAME_DOMAIN: &[u8] = b"clew/host-instance-pipe/v1\0";
-#[cfg(target_os = "macos")]
-const MACOS_SOCKET_DOMAIN: &[u8] = b"clew/host-instance-socket/v1\0";
+#[cfg(unix)]
+const UNIX_SOCKET_DOMAIN: &[u8] = b"clew/host-instance-socket/v1\0";
+#[cfg(unix)]
+const UNIX_SOCKET_SAFE_BYTES: usize = 96;
 const MAX_WAKE_FRAME: usize = 4 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -197,20 +199,29 @@ fn endpoint(layout: &StateLayout, key: HostInstanceKey, _runtime_dir: &Path) -> 
     }
     #[cfg(target_os = "macos")]
     {
-        let mut hasher = Sha256::new();
-        hasher.update(MACOS_SOCKET_DOMAIN);
-        hasher.update(layout.root().to_string_lossy().as_bytes());
-        hasher.update(key.0);
-        let digest = hasher.finalize();
-        LocalEndpoint::UnixSocket(
-            std::env::temp_dir().join(format!("clew-host-{}.sock", hex(&digest[..8]))),
-        )
+        LocalEndpoint::UnixSocket(short_unix_socket_path(layout, key))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = (layout, key);
-        LocalEndpoint::UnixSocket(_runtime_dir.join("wake.sock"))
+        use std::os::unix::ffi::OsStrExt;
+
+        let candidate = _runtime_dir.join("wake.sock");
+        if candidate.as_os_str().as_bytes().len() < UNIX_SOCKET_SAFE_BYTES {
+            LocalEndpoint::UnixSocket(candidate)
+        } else {
+            LocalEndpoint::UnixSocket(short_unix_socket_path(layout, key))
+        }
     }
+}
+
+#[cfg(unix)]
+fn short_unix_socket_path(layout: &StateLayout, key: HostInstanceKey) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(UNIX_SOCKET_DOMAIN);
+    hasher.update(layout.root().to_string_lossy().as_bytes());
+    hasher.update(key.0);
+    let digest = hasher.finalize();
+    std::env::temp_dir().join(format!("clew-host-{}.sock", hex(&digest[..8])))
 }
 
 #[cfg(windows)]
@@ -490,12 +501,13 @@ mod tests {
 
     use super::*;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn macos_wake_socket_stays_short_for_deep_state_root() {
-        let deep_root = PathBuf::from("/Users/test/Documents/Scratch/scratchpad")
-            .join("a-very-long-clew-test-directory-name")
-            .join("nested-state-directory-that-would-overflow-sun-path");
+    fn unix_wake_socket_stays_short_for_deep_state_root() {
+        let deep_root = std::env::temp_dir()
+            .join("clew-deep-state")
+            .join("nested-state-directory-that-would-overflow-sun-path-because-it-is-deliberately-very-long")
+            .join("another-deliberately-long-segment");
         let layout = StateLayout::new(deep_root);
         let key = HostInstanceKey::membership(ControllerId::new(), SiteId::new());
         let LocalEndpoint::UnixSocket(path) = endpoint(
@@ -508,6 +520,19 @@ mod tests {
         );
         assert!(path.starts_with(std::env::temp_dir()));
         assert!(path.to_string_lossy().len() < 100);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_short_wake_socket_stays_inside_private_runtime_dir() {
+        let layout = StateLayout::new("/tmp/c");
+        let key = HostInstanceKey::membership(ControllerId::new(), SiteId::new());
+        let runtime_dir = layout
+            .version_root()
+            .join("host-runtime")
+            .join(key.path_component());
+        let LocalEndpoint::UnixSocket(path) = endpoint(&layout, key, &runtime_dir);
+        assert_eq!(path, runtime_dir.join("wake.sock"));
     }
 
     #[tokio::test]
