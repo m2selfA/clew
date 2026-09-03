@@ -54,10 +54,10 @@
 | V1.1 | ControllerKey / DeviceKey / enrollment | DONE | signed bootstrap、持久 DeviceKey、claim/半提交边界有测试 |
 | V1.2 | Site Kit / Host lifecycle / naming | DONE | sidecar recovery、identity reuse、DeviceTag、Host 单实例与基础 UI |
 | V1.3 | Direct iroh + InnerSession E2E | DONE | Controller/Target 双向认证，业务 payload 全部在 inner ciphertext |
-| V1.4 | Bounded Read + v1 control plane | BLOCKED | 实现完成；Windows 双机 Read/Activity/backup 已闭环，仍缺 live revoke + macOS/Linux 真机 release 证据 |
-| V1.25 | Distribution Studio foundation | TODO | preset → preview → branded Site Kit，不增加朋友步骤 |
-| V1.5 | Zero-config Site Connector | TODO | 无公网 Target 经 helper 首次 enrollment + Read，helper 看不到业务明文 |
-| V2 | Agent minimum | TODO | Glob/Grep/Read/Edit/Write/Shell + MCP stdio/HTTP + bounds/cancel |
+| V1.4 | Bounded Read + v1 control plane | DONE | Windows/Linux/macOS release gate、live revoke、Read/Activity/backup 全闭合 |
+| V1.25 | Distribution Studio foundation | DONE | preset → preview → branded Site Kit，不增加朋友步骤 |
+| V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
+| V2 | Agent minimum | IN PROGRESS | V2a shared selector + bounded Read adapter DONE；继续 Glob/Grep/Edit/Write/Shell + MCP |
 | V3 | Reliability | TODO | reconnect/replay/reattach/resume/version negotiation |
 | V4 | Dynamic networking | TODO | TCP forward / SOCKS5 TCP / HTTP CONNECT，listener 归 Controller |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
@@ -772,7 +772,20 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 
 ## 9. V2 — Agent Minimum
 
-**Status：TODO**
+**Status：IN PROGRESS（V2a DONE）**
+
+### V2a — Shared device selection + selector-aware bounded Read
+
+**Status：DONE（2026-09-03）**
+
+- 把原本位于 `clew-host`、但只依赖 `DeviceSummary/DeviceId` 的 target selector 提升到 `clew-core`，作为 CLI 与后续 MCP 共享的 authoritative adapter 语义；`clew-host` 保留兼容 re-export，不复制规则；
+- 选择规则与设计冻结一致：稳定 DeviceId、`Site/Device` qualified name、在线 executable 集合内唯一短名；省略 selector 时仅在恰好一个在线 executable device 时自动选择；重名返回完整候选，不静默取第一台；helper-only 显式选择返回 `NotExecutable`，永远不成为默认执行候选；
+- `Devices` 继续直接来自 Controller Local API 的 `DeviceSummary`，已包含 `site_name/display_name/hostname_observed/online/executable/connector/last_seen`，不新增第二份 agent catalog；
+- `clew read` 保持旧的双 positional 兼容：`read <DeviceId> <path>` 仍有效，同时第一项现在可以是 `Site/Device` 或唯一短名；只给一个 operand 时把它解释为 path，并通过同一 selector 规则自动选择唯一在线 executable device；
+- selector 只在 CLI/MCP adapter 层把人类/agent selector 解析成 DeviceId；Local Controller API 与远端 `ReadRequest` 仍只接受稳定 DeviceId，因此没有把名称歧义或 GUI 状态带进 wire protocol；真正 Read 继续复用 V1.4 已有 policy/root/byte-limit/timeout/InnerSession 路径；
+- focused regression：core selector **3/3 PASS**（helper-only、qualified/unique/ambiguous、omitted selector）；CLI adapter **1/1 PASS**，证明单 operand 会进入唯一设备自动选择语义、双 operand 会进入 named selector 语义；`cargo fmt -- --check` 与 `cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **145 passed / 0 failed / 6 ignored**。
+
+下一块 V2b：在同一 DeviceId resolution 和 InnerSession business boundary 上增加 bounded `PathInfo/Glob/Grep`，先闭 read-only agent filesystem surface，再进入 Edit/Write 与 Shell task；不提前实现 V3 reconnect/reattach。
 
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
@@ -888,13 +901,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.5 — Zero-config Site Connector（DONE，2026-09-03）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；V2a DONE）**
 
-**Next block：V2 — Agent Minimum**
+**Next block：V2b — bounded PathInfo / Glob / Grep read-only surface**
 
-V1.5 协议、产品入口与 formal release evidence 已全部收口：mDNS discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序、Nearby fallback、bounded concurrent Helper selection、Helper-A→B session rebuild、LAN presence refresh、GUI invite、same-Site-Kit helper-only entry、bounded 30 秒 lease not-before clock-skew，以及最终 `delta Controller + dnk Helper + 3dv0 Target` 三物理机 no-public fallback gate 均已有明确证据。最终 Target 在 rootless process-scoped nft 隔离下只允许 UDP→Helper private IP，public/Controller/relay 全拒绝，仍完成 fresh enrollment 并在约 51 秒内 **6/6 online + 6/6 bounded Read PASS**；negative control 无 Nearby file 时保持 pending。V1.5 现在正式 DONE，后续开发进入 V2 Agent Minimum；V3 reliability 与 V6 packaging 不提前回灌。
+V1.5 已在 `3a20cd2` 正式封板。V2a 已把既有设备选择规则从 Host 私有实现提升为 `clew-core` 共享语义，并把 `clew read` 接到 `device.list → shared selector → DeviceId-only Local API Read`；DeviceId、`Site/Device`、唯一短名、唯一设备自动选择、重名候选与 helper-only 拒绝均已 focused 覆盖。后续 MCP 必须复用这层 target resolution，而不是自己按列表顺序挑设备。下一步 V2b 只扩展 bounded read-only filesystem tools，不提前回灌 V3 reconnect/reattach 或 V5 transfer plane。
 
 ### Change log
+
+- **2026-09-03** — V2a shared selector + bounded Read adapter DONE：将 `select_executable_device` / `DeviceSelectionError` 从 Host 提升到 `clew-core`，保留 Host compatibility re-export；`clew read` 从 DeviceId-only 扩展为 DeviceId / `Site/Device` / unique short name，并支持单 operand 时唯一在线 executable device 自动选择。Local API/wire 仍只吃 DeviceId，helper-only 与 ambiguity fail closed。focused selector **3/3**、CLI **1/1**，workspace **145/0/6**；下一块 V2b PathInfo/Glob/Grep。
 
 - **2026-09-03** — V1.5 DONE / formal physical no-public gate closed：exact `7f01cb8` tracked source 在 3dv0 构建 Linux binary `eb464aed...bb4b6`，同一 ELF 部署到 delta/dnk/3dv0；delta Linux Controller 签同一 `site.clew`，dnk helper-only production enrollment/export/lease-renewal PASS。3dv0 Target 放入 rootless `pasta` + nft process-scoped no-public namespace，只允许 UDP→dnk private Helper IP；无 Nearby negative 26s 保持 pending、433 packets rejected；fresh Nearby positive 约 8s Active，约 51s 内 **6/6 online + 6/6 Read PASS**，最终 951 packets rejected。纯 mDNS physical diagnostic 仍受当前 multicast 环境限制，因此 zero-input mDNS 证据继续由已有 real-mDNS integration 承担，不把 fallback gate 冒充 mDNS。V1.5 正式封板，下一块 V2 Agent Minimum。
 

@@ -8,10 +8,10 @@ mod outfit;
 mod read;
 mod remote;
 mod runtime;
-mod selection;
 mod site;
 mod ui;
 
+pub use clew_core::{DeviceSelectionError, select_executable_device};
 pub use instance::{HostInstance, HostInstanceKey, HostInstanceStart, acquire_host_instance};
 pub use membership::{
     HostMembership, HostMembershipError, HostMembershipMarker, HostMembershipStore,
@@ -43,7 +43,6 @@ pub use runtime::{
     MissingInviteView, cached_outfit_asset_path, detect_archive_temp_launch, resolve_host_launch,
     resolve_host_launch_with_mode,
 };
-pub use selection::{DeviceSelectionError, select_executable_device};
 pub use site::{
     ClientFlavor, ClientFlavorId, HostRoleHint, SignedSiteClew, SiteClewError, SiteKitContract,
     TargetPlatform,

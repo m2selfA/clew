@@ -1,5 +1,6 @@
-use clew_core::{DeviceId, DeviceSummary};
 use thiserror::Error;
+
+use crate::{DeviceId, DeviceSummary};
 
 pub fn select_executable_device(
     devices: &[DeviceSummary],
@@ -85,15 +86,15 @@ pub enum DeviceSelectionError {
 
 #[cfg(test)]
 mod tests {
-    use clew_core::SiteId;
+    use crate::SiteId;
 
     use super::*;
 
-    fn summary(name: &str, executable: bool, online: bool) -> DeviceSummary {
+    fn summary(site: &str, name: &str, executable: bool, online: bool) -> DeviceSummary {
         DeviceSummary {
             device_id: DeviceId::new(),
             site_id: SiteId::new(),
-            site_name: "Alice Lab".into(),
+            site_name: site.into(),
             display_name: name.into(),
             hostname_observed: name.into(),
             online,
@@ -105,8 +106,8 @@ mod tests {
 
     #[test]
     fn helper_only_is_never_an_executable_candidate() {
-        let helper = summary("Helper", false, true);
-        let target = summary("GPU-01", true, true);
+        let helper = summary("Alice Lab", "Helper", false, true);
+        let target = summary("Alice Lab", "GPU-01", true, true);
         let devices = vec![helper.clone(), target.clone()];
         assert_eq!(
             select_executable_device(&devices, None).unwrap(),
@@ -119,14 +120,38 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_short_name_returns_candidates_instead_of_first() {
-        let first = summary("GPU-01", true, true);
-        let mut second = summary("GPU-01", true, true);
-        second.site_name = "Bob Lab".into();
-        let devices = vec![first, second];
+    fn qualified_and_unique_short_names_resolve_but_duplicates_do_not() {
+        let first = summary("Alice Lab", "GPU-01", true, true);
+        let second = summary("Bob Lab", "GPU-01", true, true);
+        let unique = summary("Alice Lab", "CPU-01", true, true);
+        let devices = vec![first.clone(), second, unique.clone()];
+        assert_eq!(
+            select_executable_device(&devices, Some("Alice Lab/GPU-01")).unwrap(),
+            first.device_id
+        );
+        assert_eq!(
+            select_executable_device(&devices, Some("CPU-01")).unwrap(),
+            unique.device_id
+        );
         assert!(matches!(
             select_executable_device(&devices, Some("GPU-01")),
             Err(DeviceSelectionError::Ambiguous(candidates)) if candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn omitted_selector_requires_exactly_one_online_executable_device() {
+        let first = summary("Alice Lab", "GPU-01", true, true);
+        let second = summary("Bob Lab", "GPU-02", true, true);
+        assert!(matches!(
+            select_executable_device(&[first.clone(), second], None),
+            Err(DeviceSelectionError::Ambiguous(candidates)) if candidates.len() == 2
+        ));
+        let mut offline = first;
+        offline.online = false;
+        assert!(matches!(
+            select_executable_device(&[offline], None),
+            Err(DeviceSelectionError::NoOnlineExecutableDevice)
         ));
     }
 }

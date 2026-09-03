@@ -9,7 +9,7 @@ mod invite_io;
 mod studio;
 
 use clap::{Parser, Subcommand};
-use clew_core::{DeviceId, InviteId};
+use clew_core::{DeviceId, InviteId, select_executable_device};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
     acquire_host_instance, resolve_host_launch_with_mode,
@@ -95,9 +95,13 @@ enum Command {
         state_dir: Option<PathBuf>,
     },
     /// Read one bounded byte range from an enrolled executable device.
+    ///
+    /// With two operands, the first is a DeviceId, Site/Device qualified name, or unique short
+    /// name and the second is the path. With one operand, it is the path and Clew selects the
+    /// device only when exactly one online executable device exists.
     Read {
-        device_id: DeviceId,
-        path: String,
+        #[arg(value_name = "DEVICE_OR_PATH", num_args = 1..=2)]
+        operands: Vec<String>,
         #[arg(long, default_value_t = 0)]
         offset: u64,
         #[arg(long, default_value_t = 16_384)]
@@ -351,14 +355,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             LocalApiClient::new(config).invite_close(invite_id).await?;
         }
         Command::Read {
-            device_id,
-            path,
+            operands,
             offset,
             limit,
             state_dir,
         } => {
+            let (selector, path) = match operands.as_slice() {
+                [path] => (None, path.clone()),
+                [selector, path] => (Some(selector.as_str()), path.clone()),
+                _ => unreachable!("clap enforces one or two read operands"),
+            };
             let config = controller_config(state_dir)?;
-            let result = LocalApiClient::new(config)
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let result = client
                 .read(RemoteReadRequest {
                     device_id,
                     path,

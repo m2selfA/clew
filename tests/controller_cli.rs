@@ -56,6 +56,13 @@ fn run_devices(state_dir: &Path) -> Output {
         .unwrap()
 }
 
+fn run_read(state_dir: &Path, operands: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("read");
+    command.args(operands);
+    command.arg("--state-dir").arg(state_dir).output().unwrap()
+}
+
 fn run_shutdown(state_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clew"))
         .arg("shutdown")
@@ -124,6 +131,31 @@ fn authenticated_cli_shutdown_stops_controller_and_allows_restart() {
     assert_eq!(
         restarted_json["controller_id"].as_str().unwrap(),
         first_controller_id
+    );
+}
+
+#[test]
+fn read_cli_accepts_shared_device_selector_or_single_device_auto_selection() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path();
+    let _controller = spawn_controller(state_dir);
+    wait_until_ready(state_dir);
+
+    let automatic = run_read(state_dir, &["proof.txt"]);
+    assert!(!automatic.status.success());
+    assert!(
+        String::from_utf8_lossy(&automatic.stderr)
+            .contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
+
+    let named = run_read(state_dir, &["GPU-01", "proof.txt"]);
+    assert!(!named.status.success());
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
     );
 }
 
