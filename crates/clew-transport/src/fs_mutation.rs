@@ -146,6 +146,7 @@ pub enum FsMutationErrorCode {
     Conflict,
     NotFile,
     ContentLimit,
+    Capacity,
     Io,
     Timeout,
 }

@@ -1,12 +1,13 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, Metadata, Permissions},
     io::{Read as _, Write as _},
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, UNIX_EPOCH},
 };
 
-use clew_core::ReadPolicy;
+use clew_core::{ReadPolicy, RequestId};
 use clew_transport::{
     FsGlobPage, FsGrepMatch, FsGrepPage, FsMutationErrorCode, FsMutationReply, FsMutationRequest,
     FsMutationResult, FsPathInfo, FsPathKind, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
@@ -18,18 +19,39 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
+    sync::watch,
     time::timeout,
 };
+
+const HARD_MAX_MUTATION_REPLAY_ENTRIES: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct HostReadService {
     policy: ReadPolicy,
+    mutation_replay: Arc<Mutex<MutationReplayCache>>,
+}
+
+#[derive(Debug, Default)]
+struct MutationReplayCache {
+    next_sequence: u64,
+    entries: BTreeMap<RequestId, MutationReplayEntry>,
+}
+
+#[derive(Debug)]
+struct MutationReplayEntry {
+    sequence: u64,
+    fingerprint: [u8; 32],
+    reply: Option<FsMutationReply>,
+    completion: watch::Sender<bool>,
 }
 
 impl HostReadService {
     pub fn new(policy: ReadPolicy) -> Result<Self, clew_core::ControlModelError> {
         policy.validate()?;
-        Ok(Self { policy })
+        Ok(Self {
+            policy,
+            mutation_replay: Arc::new(Mutex::new(MutationReplayCache::default())),
+        })
     }
 
     #[must_use]
@@ -134,6 +156,16 @@ impl HostReadService {
         request: FsMutationRequest,
         allow_write: bool,
     ) -> FsMutationReply {
+        self.execute_fs_mutation_rpc(RequestId::new(), request, allow_write)
+            .await
+    }
+
+    pub async fn execute_fs_mutation_rpc(
+        &self,
+        request_id: RequestId,
+        request: FsMutationRequest,
+        allow_write: bool,
+    ) -> FsMutationReply {
         if request.validate().is_err() {
             return FsMutationReply::error(
                 FsMutationErrorCode::InvalidRequest,
@@ -146,22 +178,118 @@ impl HostReadService {
                 "filesystem mutation is outside the allowed policy",
             );
         }
-        let policy = self.policy.clone();
-        let operation =
-            tokio::task::spawn_blocking(move || execute_mutation_blocking(&policy, request));
+        let fingerprint = match mutation_request_fingerprint(&request) {
+            Ok(fingerprint) => fingerprint,
+            Err(reply) => return reply,
+        };
+        let (mut completion, launch_worker) = {
+            let mut replay = match self.mutation_replay.lock() {
+                Ok(replay) => replay,
+                Err(_) => {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::Io,
+                        "mutation replay state is unavailable",
+                    );
+                }
+            };
+            if let Some(entry) = replay.entries.get(&request_id) {
+                if entry.fingerprint != fingerprint {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::InvalidRequest,
+                        "mutation request id was reused with different contents",
+                    );
+                }
+                if let Some(reply) = &entry.reply {
+                    return reply.clone();
+                }
+                (entry.completion.subscribe(), false)
+            } else {
+                prune_completed_mutation_replay(&mut replay);
+                if replay.entries.len() >= HARD_MAX_MUTATION_REPLAY_ENTRIES {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::Capacity,
+                        "mutation replay capacity is exhausted",
+                    );
+                }
+                replay.next_sequence = replay.next_sequence.saturating_add(1);
+                let sequence = replay.next_sequence;
+                let (completion, receiver) = watch::channel(false);
+                replay.entries.insert(
+                    request_id,
+                    MutationReplayEntry {
+                        sequence,
+                        fingerprint,
+                        reply: None,
+                        completion,
+                    },
+                );
+                (receiver, true)
+            }
+        };
+
+        if launch_worker {
+            let policy = self.policy.clone();
+            let replay = Arc::clone(&self.mutation_replay);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    execute_mutation_blocking(&policy, request)
+                })
+                .await
+                {
+                    Ok(reply) => reply,
+                    Err(_) => FsMutationReply::error(
+                        FsMutationErrorCode::Io,
+                        "filesystem mutation worker failed",
+                    ),
+                };
+                if let Ok(mut replay) = replay.lock()
+                    && let Some(entry) = replay.entries.get_mut(&request_id)
+                    && entry.fingerprint == fingerprint
+                {
+                    entry.reply = Some(reply);
+                    entry.completion.send_replace(true);
+                }
+            });
+        }
+
+        let wait_for_completion = async {
+            loop {
+                let cached = match self.mutation_replay.lock() {
+                    Ok(replay) => replay
+                        .entries
+                        .get(&request_id)
+                        .and_then(|entry| {
+                            (entry.fingerprint == fingerprint).then(|| entry.reply.clone())
+                        })
+                        .flatten(),
+                    Err(_) => {
+                        return FsMutationReply::error(
+                            FsMutationErrorCode::Io,
+                            "mutation replay state is unavailable",
+                        );
+                    }
+                };
+                if let Some(reply) = cached {
+                    return reply;
+                }
+                if completion.changed().await.is_err() {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::Io,
+                        "mutation replay completion channel closed",
+                    );
+                }
+            }
+        };
         match timeout(
             Duration::from_millis(self.policy.timeout_ms as u64),
-            operation,
+            wait_for_completion,
         )
         .await
         {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(_)) => {
-                FsMutationReply::error(FsMutationErrorCode::Io, "filesystem mutation worker failed")
-            }
+            Ok(reply) => reply,
             Err(_) => FsMutationReply::error(
                 FsMutationErrorCode::Timeout,
-                "filesystem mutation timed out",
+                "filesystem mutation is still in progress",
             ),
         }
     }
@@ -710,6 +838,39 @@ fn grep_page(state: GrepState, truncated: bool) -> FsQueryReply {
         truncated,
         scanned_bytes: state.scanned_bytes,
     })
+}
+
+fn prune_completed_mutation_replay(replay: &mut MutationReplayCache) {
+    while replay.entries.len() >= HARD_MAX_MUTATION_REPLAY_ENTRIES {
+        let oldest_completed = replay
+            .entries
+            .iter()
+            .filter_map(|(request_id, entry)| {
+                entry
+                    .reply
+                    .is_some()
+                    .then_some((*request_id, entry.sequence))
+            })
+            .min_by_key(|(_, sequence)| *sequence)
+            .map(|(request_id, _)| request_id);
+        let Some(request_id) = oldest_completed else {
+            break;
+        };
+        replay.entries.remove(&request_id);
+    }
+}
+
+fn mutation_request_fingerprint(request: &FsMutationRequest) -> Result<[u8; 32], FsMutationReply> {
+    let encoded = serde_json::to_vec(request).map_err(|_| {
+        FsMutationReply::error(
+            FsMutationErrorCode::InvalidRequest,
+            "filesystem mutation could not be fingerprinted",
+        )
+    })?;
+    let digest = Sha256::digest(encoded);
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(&digest);
+    Ok(fingerprint)
 }
 
 fn execute_mutation_blocking(policy: &ReadPolicy, request: FsMutationRequest) -> FsMutationReply {
@@ -1504,6 +1665,64 @@ mod tests {
             FsMutationReply::Error(error) if error.code == FsMutationErrorCode::Conflict
         ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "old + old\n");
+    }
+
+    #[tokio::test]
+    async fn mutation_request_id_replay_returns_first_result_without_reexecution() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        fs::create_dir_all(&root).unwrap();
+        let service = HostReadService::new(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 4_096, 5_000).unwrap(),
+        )
+        .unwrap();
+        let target = root.join("replay.txt");
+        let request_id = RequestId::new();
+        let request = FsMutationRequest::write(
+            target.to_string_lossy(),
+            "first result\n",
+            FsWritePrecondition::CreateOnly,
+        )
+        .unwrap();
+
+        let first = service
+            .execute_fs_mutation_rpc(request_id, request.clone(), true)
+            .await;
+        let FsMutationReply::Result(first_result) = first.clone() else {
+            panic!("expected first mutation result");
+        };
+        assert!(first_result.created);
+        fs::write(&target, "changed after completion\n").unwrap();
+
+        let replayed = service
+            .execute_fs_mutation_rpc(request_id, request, true)
+            .await;
+        assert_eq!(replayed, first);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "changed after completion\n"
+        );
+
+        let mismatched = service
+            .execute_fs_mutation_rpc(
+                request_id,
+                FsMutationRequest::write(
+                    target.to_string_lossy(),
+                    "different logical request\n",
+                    FsWritePrecondition::CreateOnly,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            mismatched,
+            FsMutationReply::Error(error) if error.code == FsMutationErrorCode::InvalidRequest
+        ));
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "changed after completion\n"
+        );
     }
 
     #[tokio::test]

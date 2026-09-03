@@ -879,7 +879,7 @@ async fn serve_networked_membership_with_outer_timing(
                     }
                     "fs_mutation" => {
                         let reply = match (service.as_ref(), write_allowed, FsMutationRequest::from_message(&message)) {
-                            (Some(service), true, Ok(request)) => service.execute_fs_mutation(request, true).await,
+                            (Some(service), true, Ok(request)) => service.execute_fs_mutation_rpc(request_id, request, true).await,
                             (_, false, Ok(_)) | (None, true, Ok(_)) => FsMutationReply::error(
                                 FsMutationErrorCode::Denied,
                                 "filesystem mutation is not permitted by this device grant",

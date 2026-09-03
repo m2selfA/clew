@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a + V3b-1 DONE）**
+**Status：IN PROGRESS（V3a + V3b-1 + V3b-2a DONE）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -962,6 +962,18 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 - focused validation：RPC typed/binary roundtrip + wrong-id/nil/truncation/wrong-kind **2/2 PASS**；真实 no-public NearbyFile Connector 的全业务链在 correlation envelope 下 **1/1 PASS（3.77s）**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **168 passed / 0 failed / 6 ignored**。
 
 下一块 V3b-2：冻结并实现 replay matrix。Read/PathInfo/Glob/Grep 可在新 generation 上以**同一 RequestId**安全 replay；Write/Edit 需要 Host bounded RequestId result cache，重复 RequestId只能返回第一次已完成结果，绝不能再次落盘；Shell Start 不自动 replay，Status/Attach/Cancel 仍依赖后续 V3 Shell reattach 语义，不能由通用 RPC retry 擅自恢复。
+
+### V3b-2a — Host-process mutation RequestId dedupe
+
+**Status：DONE（2026-09-03）**
+
+- `HostReadService` 增加跨 active InnerSession reconnect 保持的 mutation replay state；它与 Host membership runtime 同寿命，不放在单次 dispatcher/session 内。cache hard cap **128 entries**，只保存 `RequestId + SHA-256 request fingerprint + bounded FsMutationReply`，不保存 Write/Edit 正文；completed entries按最老 sequence有界淘汰，in-flight entry不被驱逐；
+- Host `fs_mutation` dispatcher 把 V3b-1 envelope 的 RequestId传给 service。相同 RequestId + 相同 request fingerprint：已完成时直接返回第一次 reply；仍 in-flight 时等待同一个 worker；相同 RequestId但正文/precondition不同则 `InvalidRequest`，绝不执行磁盘操作；cache 全为 in-flight 时结构化 `Capacity` fail closed；
+- 修复一个 V2 mutation timeout 的真实未知结果边界：原实现 `timeout(spawn_blocking)` 超时后 worker仍可能继续落盘，但超时 reply之后没有任何状态可供重试识别。现在首次 request先登记 in-flight，再由独立 completion task等待 blocking worker；调用等待超过 signed policy timeout只返回“still in progress”，worker最终真实 reply仍写入 cache并唤醒后续同 RequestId replay；
+- 这不是无限 exactly-once：cache只在当前 Host process内且有界。Host进程重启/entry淘汰后，同一逻辑 mutation仍依靠既有 create-only / expected SHA-256 precondition fail closed；Controller重启或客户端发起一个**新**逻辑请求会产生新 RequestId，不把 bounded cache宣传成持久事务日志；
+- focused dedupe **1/1 PASS**：首次 create-only成功后测试人为修改目标文件，再用同 RequestId重放，精确返回第一次 result且目标保持人为修改内容，证明没有再次执行；同 RequestId换正文明确 `InvalidRequest`。既有 mutation authority/precondition **1/1 PASS**；no-public Connector全业务链 **1/1 PASS（3.62s）**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **169 passed / 0 failed / 6 ignored**。
+
+下一块 V3b-2b：Controller在同一 Local API总 timeout预算内等待新 session generation，并对 Read/FsQuery/FsMutation用**同一 RequestId**重发。Read/PathInfo/Glob/Grep天然安全；FsMutation依赖本块 Host dedupe + 原强 precondition；Shell Start/Status/Attach/Cancel仍不进入通用 replay。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1062,13 +1074,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b-1 DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b-1 + V3b-2a DONE）**
 
-**Next block：V3b-2 — operation-specific replay + mutation dedupe**
+**Next block：V3b-2b — Controller cross-generation replay**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3a 建立 authoritative session generation/path/liveness；V3b-1 已给所有业务短 RPC 加 stable RequestId + fail-closed reply correlation，但尚未承诺 replay。下一块只实现按操作分类的 retry/dedupe：安全只读可 replay，mutation 需 Host bounded result cache，Shell Start 禁止 blind replay；Shell reattach 与 File resume 继续分别收口。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b-1建立 stable RequestId correlation；V3b-2a已让 Host mutation在当前 Host process内对同 RequestId dedupe，并收口 blocking worker timeout后的未知结果。下一块让 Controller在既有 Local API deadline内等待新 generation、以同 RequestId重放 Read/FsQuery/FsMutation；Shell lifecycle继续单独处理。
 
 ### Change log
+
+- **2026-09-03** — V3b-2a Host mutation RequestId dedupe DONE：HostReadService增加128-entry process-lifetime replay cache，只存 fingerprint+bounded reply；同 ID同请求返回首次结果、同 ID异请求拒绝，in-flight worker跨 InnerSession继续完成并缓存，修复旧 `timeout(spawn_blocking)` 后副作用无人记录的歧义。dedupe **1/1 PASS**、mutation regression **1/1 PASS**、no-public Connector **1/1 PASS（3.62s）**、workspace **169/0/6**。下一块 V3b-2b Controller cross-generation replay。
 
 - **2026-09-03** — V3b-1 stable RequestId / RPC correlation DONE：新增 RequestId 与 bounded `rpc_request/rpc_reply` envelope，Read/FsQuery/FsMutation/ShellTask 全部要求 reply id 精确匹配；heartbeat 保持独立。RPC focused **2/2 PASS**、no-public Connector full business chain **1/1 PASS（3.77s）**、workspace **168/0/6**。本块明确只做 correlation，不宣称 retry/dedupe/exactly-once；下一块 V3b-2 operation-specific replay + mutation dedupe。
 
