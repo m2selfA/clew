@@ -59,7 +59,7 @@
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
 | V2 | Agent minimum | DONE | selector + bounded filesystem + live-session Shell + MCP stdio/Streamable HTTP 全闭合 |
 | V3 | Reliability | IN PROGRESS | V3a session generation/path telemetry/liveness DONE；继续 replay matrix + Shell reattach + compatibility |
-| V4 | Dynamic networking | TODO | TCP forward / SOCKS5 TCP / HTTP CONNECT，listener 归 Controller |
+| V4 | Dynamic networking | IN PROGRESS | V4a-0 signed TCP egress authority DONE；继续 bounded TCP forward |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
 | V6 | Release packaging | TODO | Windows signing、macOS signing/notarization、Linux artifact、ClientFlavor pipeline |
 | V7 | Advanced Service Runtime | TODO | systemd --user → Windows Service/Linux system service，显式 opt-in |
@@ -1070,7 +1070,20 @@ V3e至此封板。下一块 V3f：wire/capability compatibility matrix。重点�
 
 ## 11. V4 — Dynamic Networking
 
-**Status：TODO**
+**Status：IN PROGRESS（V4a-0 DONE）**
+
+### V4a-0 — Signed TCP egress authority projection
+
+**Status：DONE（2026-09-03）**
+
+- 在真正打开 TCP forward data plane 前先补长期授权：`PermissionGrant` 新增 serde-default `tcp_egress=false`。旧 bootstrap/backup/state 缺字段时一律按 false 解析，避免升级后静默获得出网能力；
+- 新增 execute-preferred ceiling `EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR`，但 enrollment 继续执行 `signed grant ∩ Controller ceiling ∩ claim ceiling`，因此 ceiling 只允许 owner 明确签出的 TCP egress 穿过，绝不主动提权；`CONNECTOR_ONLY` 继续把 read/write/shell/tcp_egress 全部剥离；
+- owner CLI `mint/invite` 新增显式 `--allow-tcp-egress`；`InviteIssueRequest` 增加 serde-default false。Controller GUI 明确传 false，所以朋友侧默认 invitation 仍没有 TCP egress；write/shell/tcp egress 三项彼此独立 opt-in；
+- Host membership sidecar recovery 使用新的 full execute ceiling 重算 persisted effective grant，Controller bootstrap execute-preferred 同样使用 full ceiling；旧 Host marker/legacy grant仍 fail closed；
+- 真实 isolated Controller mint smoke：默认 `site.clew` 为 `execute=true/connector=true/read=true/write=false/shell=false/tcp_egress=false`；仅加 `--allow-tcp-egress` 后精确变为 `tcp_egress=true`，write/shell保持 false；
+- focused grant **3/3 PASS**（helper-only降权、ceiling不提权、legacy缺字段false）；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS；`cargo test --workspace --all-targets` **188 passed / 0 failed / 6 ignored**。
+
+下一块 V4a-1：冻结 bounded TCP forward control/data contract 与 Controller-owned loopback listener lifecycle。默认只做 local side `127.0.0.1:L → Target dest`；非-loopback listener、SOCKS5/HTTP CONNECT、remote-side listener分别后置，不能从一个 forward primitive顺手放大暴露面。
 
 - TCP forward；
 - SOCKS5 TCP egress；
@@ -1159,13 +1172,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（DONE；V3a–V3f 全部封板）**
+**Current block：V4 — Dynamic Networking（IN PROGRESS；V4a-0 DONE）**
 
-**Next block：V4a — bounded TCP forward**
+**Next block：V4a-1 — bounded TCP forward control/data + Controller-owned loopback listener**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum，V3现在也完整封板：session generation/path/liveness、same-RequestId replay、same-Device Shell TaskId reattach、File resume控制契约、sleep/resume continuity与wire/capability matrix全部具备明确fail-closed边界。V3f进一步冻结“peer广告 / 本地实现 / 双方协商”三层feature语义，当前build只协商ToolRpc+ShellTask；V4/V5枚举占位不会提前变成可用能力。下一块进入V4a TCP forward。
+V3 已在 `524ba88` 完整封板。V4a-0 先把 TCP egress 变成真正的 signed owner opt-in：legacy/default false、GUI默认false、helper-only剥离、Controller/Host recovery都沿 authoritative effective grant。下一块开始 TCP forward 本身，只允许 Controller-owned loopback listener 到授权 Target 的 outbound TCP destination；不提前混入 SOCKS5/HTTP CONNECT、remote listener 或 V5 file stream。
 
 ### Change log
+
+- **2026-09-03** — V4a-0 signed TCP egress authority DONE：PermissionGrant新增serde-default `tcp_egress=false`与full execute ceiling，owner CLI仅显式 `--allow-tcp-egress`可签出，GUI/legacy/default均false，helper-only继续剥离。真实mint对照确认默认false、opt-in true且write/shell不被顺带打开；grant **3/3**，workspace **188/0/6**。下一块 V4a-1 bounded TCP forward。
 
 - **2026-09-03** — V3f wire/capability compatibility matrix DONE / **V3 Reliability DONE**：feature语义拆成peer advertisement、current-build implementation、bilateral negotiation三层；`IMPLEMENTED_FEATURES`当前只含ToolRpc+ShellTask，Forward/Socks5/HttpConnect/FileResume即使双方Hello都广告也不协商。capability_version 1↔999不推断feature，unknown 999保真但忽略；wrong WIRE_MAJOR硬拒绝；frame/concurrency negotiated limit取双方valid bounds的min。proto **11/11**、workspace **187/0/6**。V3七项全部封板，下一阶段V4a bounded TCP forward。
 

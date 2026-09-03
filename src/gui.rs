@@ -668,6 +668,7 @@ impl ControllerApp {
                         read_timeout_ms: INVITE_READ_TIMEOUT_MS,
                         allow_write: false,
                         allow_shell: false,
+                        allow_tcp_egress: false,
                     };
                     self.backend.invite_issue(request, folder.join("site.clew"));
                     self.invite_in_flight = true;

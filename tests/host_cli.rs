@@ -57,6 +57,7 @@ fn fixture(root: &Path) -> Fixture {
             read: true,
             write: false,
             shell: false,
+            tcp_egress: false,
         },
     );
     let bootstrap = registry

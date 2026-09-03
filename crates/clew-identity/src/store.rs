@@ -735,6 +735,7 @@ mod tests {
                 read: true,
                 write: false,
                 shell: false,
+                tcp_egress: false,
             },
         );
         let pass = registry
@@ -821,6 +822,7 @@ mod tests {
                 read: true,
                 write: false,
                 shell: false,
+                tcp_egress: false,
             },
         );
         let pass = registry

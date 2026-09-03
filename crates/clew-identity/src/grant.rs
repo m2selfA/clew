@@ -7,6 +7,8 @@ pub struct PermissionGrant {
     pub read: bool,
     pub write: bool,
     pub shell: bool,
+    #[serde(default)]
+    pub tcp_egress: bool,
 }
 
 impl PermissionGrant {
@@ -15,6 +17,7 @@ impl PermissionGrant {
         read: true,
         write: false,
         shell: false,
+        tcp_egress: false,
     };
 
     pub const EXECUTE_READ_CONNECTOR: Self = Self {
@@ -22,6 +25,7 @@ impl PermissionGrant {
         read: true,
         write: false,
         shell: false,
+        tcp_egress: false,
     };
 
     pub const EXECUTE_READ_WRITE_CONNECTOR: Self = Self {
@@ -29,6 +33,7 @@ impl PermissionGrant {
         read: true,
         write: true,
         shell: false,
+        tcp_egress: false,
     };
 
     pub const EXECUTE_READ_WRITE_SHELL_CONNECTOR: Self = Self {
@@ -36,6 +41,15 @@ impl PermissionGrant {
         read: true,
         write: true,
         shell: true,
+        tcp_egress: false,
+    };
+
+    pub const EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR: Self = Self {
+        member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
+        read: true,
+        write: true,
+        shell: true,
+        tcp_egress: true,
     };
 
     pub const CONNECTOR_ONLY: Self = Self {
@@ -43,6 +57,7 @@ impl PermissionGrant {
         read: false,
         write: false,
         shell: false,
+        tcp_egress: false,
     };
 
     #[must_use]
@@ -57,6 +72,7 @@ impl PermissionGrant {
             read: executable && self.read && ceiling.read,
             write: executable && self.write && ceiling.write,
             shell: executable && self.shell && ceiling.shell,
+            tcp_egress: executable && self.tcp_egress && ceiling.tcp_egress,
         }
     }
 }
@@ -72,6 +88,7 @@ mod tests {
             read: true,
             write: true,
             shell: true,
+            tcp_egress: true,
         };
         let effective = requested.intersect(PermissionGrant::CONNECTOR_ONLY);
         assert!(!effective.member.execute);
@@ -79,33 +96,51 @@ mod tests {
         assert!(!effective.read);
         assert!(!effective.write);
         assert!(!effective.shell);
+        assert!(!effective.tcp_egress);
     }
 
     #[test]
-    fn full_execute_ceiling_never_adds_unsigned_write_or_shell() {
+    fn full_execute_ceiling_never_adds_unsigned_write_shell_or_tcp_egress() {
         let read_only = PermissionGrant::EXECUTE_READ_CONNECTOR
-            .intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR);
+            .intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR);
         assert!(read_only.member.execute);
         assert!(read_only.member.connector);
         assert!(read_only.read);
         assert!(!read_only.write);
         assert!(!read_only.shell);
+        assert!(!read_only.tcp_egress);
 
         let write_only = PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
-            .intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR);
+            .intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR);
         assert!(write_only.read);
         assert!(write_only.write);
         assert!(!write_only.shell);
+        assert!(!write_only.tcp_egress);
 
         let requested = PermissionGrant {
             member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
             read: true,
             write: true,
             shell: true,
+            tcp_egress: true,
         };
-        let effective = requested.intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR);
+        let effective =
+            requested.intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR);
         assert!(effective.read);
         assert!(effective.write);
         assert!(effective.shell);
+        assert!(effective.tcp_egress);
+    }
+
+    #[test]
+    fn legacy_grant_without_tcp_egress_deserializes_fail_closed() {
+        let legacy = serde_json::json!({
+            "member": { "execute": true, "connector": true },
+            "read": true,
+            "write": true,
+            "shell": true
+        });
+        let decoded: PermissionGrant = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.tcp_egress);
     }
 }

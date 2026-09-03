@@ -36,6 +36,7 @@ impl ControllerControlSnapshot {
                     read: true,
                     write: true,
                     shell: true,
+                    tcp_egress: true,
                 },
             ),
             catalog: ControllerCatalog::default(),

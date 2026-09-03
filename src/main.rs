@@ -63,6 +63,9 @@ struct MintArgs {
     /// Explicitly grant V2 Shell task authority. Disabled by default.
     #[arg(long)]
     allow_shell: bool,
+    /// Explicitly grant V4 TCP egress authority. Disabled by default.
+    #[arg(long)]
+    allow_tcp_egress: bool,
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
 }
@@ -470,6 +473,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             read_timeout_ms,
             allow_write,
             allow_shell,
+            allow_tcp_egress,
             state_dir,
         }) => {
             let valid_for_ms = valid_hours
@@ -495,6 +499,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     read_timeout_ms,
                     allow_write,
                     allow_shell,
+                    allow_tcp_egress,
                 })
                 .await?;
             invite_io::write_invitation(&client, &result.site_file, &output).await?;

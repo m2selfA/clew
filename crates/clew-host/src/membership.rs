@@ -260,7 +260,7 @@ impl HostMembershipStore {
             return Err(HostMembershipError::MarkerMismatch);
         }
         let grant_ceiling = if device.capabilities.execute {
-            PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
+            PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR
         } else {
             PermissionGrant::CONNECTOR_ONLY
         };
@@ -565,6 +565,7 @@ mod tests {
                 read: true,
                 write: false,
                 shell: false,
+                tcp_egress: false,
             },
         );
         let pass = registry

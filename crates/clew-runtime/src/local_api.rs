@@ -82,6 +82,8 @@ pub struct InviteIssueRequest {
     pub allow_write: bool,
     #[serde(default)]
     pub allow_shell: bool,
+    #[serde(default)]
+    pub allow_tcp_egress: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -886,6 +888,7 @@ async fn issue_invite_response(
                 read: true,
                 write: request.allow_write,
                 shell: request.allow_shell,
+                tcp_egress: request.allow_tcp_egress,
             },
             not_before_unix_ms: now,
             expires_unix_ms,

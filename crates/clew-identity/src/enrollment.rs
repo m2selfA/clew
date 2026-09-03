@@ -614,6 +614,7 @@ mod tests {
             read: true,
             write: false,
             shell: true,
+            tcp_egress: false,
         };
         let registry = EnrollmentRegistry::new(controller.controller_id(), ceiling);
         (controller, registry)
@@ -629,6 +630,7 @@ mod tests {
                 read: true,
                 write: true,
                 shell: true,
+                tcp_egress: false,
             },
             not_before_unix_ms: 1_000,
             expires_unix_ms: 10_000,

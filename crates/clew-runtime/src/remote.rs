@@ -995,7 +995,7 @@ async fn handle_bootstrap_inner(
                 let now = unix_ms()?;
                 let claim_ceiling = match mode {
                     BootstrapMemberMode::ExecutePreferred => {
-                        clew_identity::PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR
+                        clew_identity::PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR
                     }
                     BootstrapMemberMode::ConnectorOnly => {
                         clew_identity::PermissionGrant::CONNECTOR_ONLY

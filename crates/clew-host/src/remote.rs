@@ -2059,7 +2059,7 @@ mod tests {
 
         let mut registry = EnrollmentRegistry::new(
             controller.controller_id(),
-            PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR,
+            PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR,
         );
         let bootstrap = registry
             .issue_bootstrap(
@@ -2068,7 +2068,7 @@ mod tests {
                     site_id,
                     invite_id,
                     site_name: "Connector Lab".into(),
-                    grant: PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR,
+                    grant: PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR,
                     not_before_unix_ms: now.saturating_sub(1_000),
                     expires_unix_ms: now + 60_000,
                     deployment_window_ms: 60_000,
@@ -2135,7 +2135,7 @@ mod tests {
                 };
                 let ceiling = match mode {
                     BootstrapMemberMode::ExecutePreferred => {
-                        PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR
+                        PermissionGrant::EXECUTE_READ_WRITE_SHELL_TCP_CONNECTOR
                     }
                     BootstrapMemberMode::ConnectorOnly => PermissionGrant::CONNECTOR_ONLY,
                 };
@@ -2148,6 +2148,7 @@ mod tests {
                     assert!(!receipt.effective_grant.read);
                     assert!(!receipt.effective_grant.write);
                     assert!(!receipt.effective_grant.shell);
+                    assert!(!receipt.effective_grant.tcp_egress);
                 }
                 sealed
                     .send(&mut stream, &BootstrapResponse::Claimed(receipt.clone()))

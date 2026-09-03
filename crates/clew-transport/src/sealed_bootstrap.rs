@@ -398,6 +398,7 @@ mod tests {
                     read: true,
                     write: false,
                     shell: false,
+                    tcp_egress: false,
                 },
                 not_before_unix_ms: 1,
                 expires_unix_ms: u64::MAX - 1,
