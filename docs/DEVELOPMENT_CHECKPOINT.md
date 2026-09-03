@@ -1139,7 +1139,7 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 
 ## 12. V5 — File Plane
 
-**Status：IN PROGRESS（V5a-0 DONE）**
+**Status：IN PROGRESS（V5a-0 + V5a-1a DONE）**
 
 ### V5a-0 — Single-file manifest / deterministic chunk contract
 
@@ -1155,6 +1155,21 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 - focused manifest/chunk/privacy/hash/bounds **4/4 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **201 passed / 0 failed / 6 ignored**。
 
 下一块 V5a-1：单文件 data plane + Controller-owned transfer state。先只做一个transfer内的顺序chunk put/get、final hash、atomic finalization、status/cancel与V3d contiguous-prefix resume；不做directory tree或多transfer并发调度。
+
+### V5a-1a — Host-owned put part/checkpoint/finalize state machine
+
+**Status：DONE（2026-09-04）**
+
+- `FileTransferRequest/Reply`把实际put生命周期冻结为`PutBegin → PutChunk* → Status → Finalize/Cancel`，仍走V3b `rpc_request/rpc_reply` InnerSession envelope；phase显式分`Receiving / ReadyToFinalize / Completed`，避免“最后一块已确认”被误当作“atomic目标已可见”；RPC payload hard cap **56 KiB**，32KiB chunk JSON仍落在既有60KiB InnerSession plaintext内；
+- 新增membership-owned `HostFileTransferService`，只在persisted `effective_grant.write=true`的executable membership创建；legacy grant=None、read-only、helper-only没有transfer owner。service与Host membership reconnect runtime同寿命而不是per-InnerSession，因此part/checkpoint可跨session generation继续；Host进程重启持久化resume仍后续收口，不在本块伪称已支持；
+- PutBegin再次绑定ControllerId/SiteId/DeviceId/direction与signed roots；destination必须absolute且parent canonicalize后仍在signed roots。symlink target直接拒绝；FailIfExists/Replace/Rename device-side conflict policy均在Host执行，Rename使用bounded **1024**次候选，不允许无界找名；
+- part使用device destination**同目录** secure `NamedTempFile`，目标文件在Finalize前不可见。每个chunk先验证TransferId、offset对齐、deterministic expected length与chunk SHA；part现有长度必须精确等于confirmed_offset；durable `write + sync_data`成功后才推进revision/offset/prefix SHA；
+- 最后一块在实际写入前先对`prefix_hasher + bytes`计算完整SHA，若不等于manifest final SHA则`HashMismatch`且**不落最后一块**，因此V3d descriptor始终保持合法。相同上一chunk的直接重放返回同Status而不再次写入；跳块/乱序返回OutOfOrder；零字节文件从Begin直接ReadyToFinalize；
+- Finalize要求完整prefix SHA==final SHA；同目录atomic persist后sync最终文件，Unix额外sync parent dir。pre-commit错误保留temp可重试；若rename已commit但后续sync报错，状态会标记Completed并返回I/O error，使后续Status能区分“已可见但durability确认失败”，不伪造可重试未提交状态；Cancel只允许未完成transfer，drop temp即删除part；
+- independent consistency checks：每次chunk前核对part长度/checkpoint；completed entry可被bounded prune，active/in-flight不会因capacity被静默驱逐；Host transfer store hard cap **16**。Controller-private source path仍不进入peer state；
+- focused transport file-transfer RPC/manifest/chunk **5/5 PASS**；Host put/resume/finalize/cancel/scope/authority/conflict **2/2 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **204 passed / 0 failed / 6 ignored**。
+
+下一块 V5a-1b：Controller-owned single-file put task。Controller私有保存source path/manifest/current Host descriptor，后台顺序读chunk；session loss后同TransferId先Status拿confirmed_offset再seek续传，CLI退出不拆task；完成后再做真实跨generation hard-kill/firewall resume gate。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1233,13 +1248,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a-0 DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a-0 + V5a-1a DONE）**
 
-**Next block：V5a-1 — single-file data plane + resume state**
+**Next block：V5a-1b — Controller-owned single-file put task + reconnect resume**
 
-V4已在`dfa373d`完整封板。V5a-0现在冻结了与V3d一致的single-file peer contract：stable TransferId、16KiB manifest、4–32KiB deterministic chunks、per-chunk/final SHA、32KiB raw/48KiB encoded chunk hard bounds，以及Controller-private local-path/conflict-policy边界。它尚未启用FileResume feature或文件I/O；下一块才把这套contract接到Controller-owned transfer state与Target file I/O，按read/get、write/put现有signed grant严格授权。
+V4已在`dfa373d`完整封板。V5a-0冻结single-file manifest/chunk contract；V5a-1a已经把Controller→Device方向接到真实Host part/checkpoint/finalize state machine，并把service提升到membership reconnect owner。当前仍缺Controller-owned source/task/Local API，因此尚未宣称用户可用put；下一块由Controller后台task持有source私有path与TransferId，跨generation按Host Status confirmed_offset续传。
 
 ### Change log
+
+- **2026-09-04** — V5a-1a Host put state machine DONE：新增`file_transfer` PutBegin/Chunk/Status/Finalize/Cancel与Receiving/Ready/Completed phase；membership-owned HostFileTransferService在signed write grant下持有同目录secure part、durable chunk checkpoint/prefix SHA、final SHA pre-write gate、atomic conflict-policy finalize与Cancel。wire **5/5**、Host **2/2**、workspace **204/0/6**。下一块V5a-1b Controller-owned put task/reconnect resume。
 
 - **2026-09-04** — V5a-0 single-file manifest/chunk foundation DONE：复用V3d TransferId/resume descriptor，新增16KiB manifest与deterministic 4–32KiB chunks，per-chunk/final SHA，Base64 pre-decode与48KiB chunk-doc hard gates；Controller local path永不进入peer manifest，get/put权限明确映射现有read/write grant。focused **4/4**、workspace **201/0/6**；FileResume feature仍未实现，下一块V5a-1 single-file data plane。
 

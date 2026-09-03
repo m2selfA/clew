@@ -10,8 +10,9 @@ use clew_transport::{
     BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
     ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
-    FsMutationErrorCode, FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply,
-    FsQueryRequest, InnerMessage, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
+    FileTransferErrorCode, FileTransferReply, FileTransferRequest, FsMutationErrorCode,
+    FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
+    InnerMessage, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
     NearbyConnectorFile, RPC_PROGRESS_INTERVAL_MS, ReadErrorCode, ReadReply, ReadRequest,
     SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode,
     ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, TcpForwardErrorCode,
@@ -24,8 +25,8 @@ use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{
-    HostLaunchState, HostMembership, HostMembershipStore, HostReadService, HostShellService,
-    HostTcpForwardService, NearbyConnectorStore,
+    HostFileTransferService, HostLaunchState, HostMembership, HostMembershipStore, HostReadService,
+    HostShellService, HostTcpForwardService, NearbyConnectorStore,
 };
 
 const MAX_CONNECTOR_TUNNELS: usize = 64;
@@ -313,7 +314,8 @@ async fn serve_networked_membership_until_inner<F>(
 where
     F: Future<Output = ()>,
 {
-    let (endpoint, service, shell_service) = member_remote_config(membership)?;
+    let (endpoint, service, shell_service, file_transfer_service) =
+        member_remote_config(membership)?;
     tokio::pin!(shutdown);
     let outer = tokio::select! {
         _ = &mut shutdown => return Ok(()),
@@ -328,6 +330,7 @@ where
                 endpoint.clone(),
                 &service,
                 &shell_service,
+                &file_transfer_service,
                 layout,
             ) => result,
         };
@@ -347,7 +350,8 @@ where
 pub async fn serve_networked_membership_once(
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
-    let (endpoint, service, shell_service) = member_remote_config(membership)?;
+    let (endpoint, service, shell_service, file_transfer_service) =
+        member_remote_config(membership)?;
     let outer = IrohOuter::bind().await?;
     serve_networked_membership_with_outer(
         membership,
@@ -355,6 +359,7 @@ pub async fn serve_networked_membership_once(
         endpoint,
         &service,
         &shell_service,
+        &file_transfer_service,
         None,
     )
     .await
@@ -364,7 +369,8 @@ pub async fn serve_networked_membership_once_with_layout(
     layout: &StateLayout,
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
-    let (endpoint, service, shell_service) = member_remote_config(membership)?;
+    let (endpoint, service, shell_service, file_transfer_service) =
+        member_remote_config(membership)?;
     let outer = IrohOuter::bind().await?;
     serve_networked_membership_with_outer(
         membership,
@@ -372,6 +378,7 @@ pub async fn serve_networked_membership_once_with_layout(
         endpoint,
         &service,
         &shell_service,
+        &file_transfer_service,
         Some(layout),
     )
     .await
@@ -384,6 +391,7 @@ fn member_remote_config(
         EndpointAddr,
         Option<HostReadService>,
         Option<HostShellService>,
+        Option<HostFileTransferService>,
     ),
     HostRemoteError,
 > {
@@ -395,24 +403,38 @@ fn member_remote_config(
         .controller_endpoint
         .clone()
         .ok_or(HostRemoteError::MissingNetworkConfig)?;
-    let (service, shell_service) = if membership.device.capabilities.execute {
+    let (service, shell_service, file_transfer_service) = if membership.device.capabilities.execute
+    {
         let policy = membership
             .marker
             .read_policy
             .clone()
             .ok_or(HostRemoteError::MissingNetworkConfig)?;
-        let shell_service = membership
-            .marker
-            .effective_grant
-            .as_ref()
+        let grant = membership.marker.effective_grant.as_ref();
+        let shell_service = grant
             .is_some_and(|grant| grant.shell)
             .then(|| HostShellService::new(policy.clone()))
             .transpose()?;
-        (Some(HostReadService::new(policy)?), shell_service)
+        let file_transfer_service = grant
+            .is_some_and(|grant| grant.write)
+            .then(|| {
+                HostFileTransferService::new(
+                    policy.clone(),
+                    membership.marker.controller.controller_id,
+                    membership.marker.site_id,
+                    membership.marker.device_id,
+                )
+            })
+            .transpose()?;
+        (
+            Some(HostReadService::new(policy)?),
+            shell_service,
+            file_transfer_service,
+        )
     } else {
-        (None, None)
+        (None, None, None)
     };
-    Ok((endpoint, service, shell_service))
+    Ok((endpoint, service, shell_service, file_transfer_service))
 }
 
 enum HostBootstrapChannel {
@@ -780,6 +802,7 @@ async fn serve_networked_membership_with_outer(
     endpoint: EndpointAddr,
     service: &Option<HostReadService>,
     shell_service: &Option<HostShellService>,
+    file_transfer_service: &Option<HostFileTransferService>,
     layout: Option<&StateLayout>,
 ) -> Result<(), HostRemoteError> {
     serve_networked_membership_with_outer_timing(
@@ -788,6 +811,7 @@ async fn serve_networked_membership_with_outer(
         endpoint,
         service,
         shell_service,
+        file_transfer_service,
         layout,
         CONNECTOR_PRESENCE_REFRESH_INTERVAL,
     )
@@ -824,6 +848,7 @@ async fn serve_networked_membership_with_outer_timing(
     endpoint: EndpointAddr,
     service: &Option<HostReadService>,
     shell_service: &Option<HostShellService>,
+    file_transfer_service: &Option<HostFileTransferService>,
     layout: Option<&StateLayout>,
     presence_refresh_interval: Duration,
 ) -> Result<(), HostRemoteError> {
@@ -949,6 +974,26 @@ async fn serve_networked_membership_with_outer_timing(
                                 (_, _, Err(_)) => FsMutationReply::error(
                                     FsMutationErrorCode::InvalidRequest,
                                     "malformed bounded filesystem mutation",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        "file_transfer" => {
+                            let reply = match (
+                                file_transfer_service.as_ref(),
+                                write_allowed,
+                                FileTransferRequest::from_message(&message),
+                            ) {
+                                (Some(service), true, Ok(request)) => {
+                                    service.execute(request, true).await
+                                }
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => FileTransferReply::error(
+                                    FileTransferErrorCode::Denied,
+                                    "file put is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => FileTransferReply::error(
+                                    FileTransferErrorCode::InvalidRequest,
+                                    "malformed bounded file transfer request",
                                 ),
                             };
                             reply.into_message()?
@@ -1214,6 +1259,8 @@ pub enum HostRemoteError {
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    FileTransfer(#[from] clew_transport::FileTransferError),
     #[error(transparent)]
     TcpForward(#[from] clew_transport::TcpForwardProtocolError),
     #[error(transparent)]
@@ -1486,6 +1533,7 @@ mod tests {
                     &membership,
                     &host_outer,
                     controller_addr,
+                    &None,
                     &None,
                     &None,
                     Some(&layout),

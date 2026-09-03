@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    EMPTY_SHA256_HEX, FileResumeDescriptor, FileResumeError, FileTransferDirection,
-    MAX_FILE_RESUME_PATH_BYTES,
+    EMPTY_SHA256_HEX, FileResumeDescriptor, FileResumeError, FileTransferDirection, InnerMessage,
+    InnerSessionError, MAX_FILE_RESUME_PATH_BYTES,
 };
 
 pub const FILE_TRANSFER_MANIFEST_VERSION: u32 = 1;
@@ -15,6 +15,8 @@ pub const MIN_FILE_CHUNK_BYTES: u32 = 4 * 1024;
 pub const MAX_FILE_CHUNK_BYTES: u32 = 32 * 1024;
 pub const MAX_FILE_CHUNK_BASE64_BYTES: usize = ((MAX_FILE_CHUNK_BYTES as usize + 2) / 3) * 4;
 pub const MAX_FILE_TRANSFER_CHUNK_ENCODED_BYTES: usize = 48 * 1024;
+pub const MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES: usize = 56 * 1024;
+const MAX_FILE_TRANSFER_ERROR_MESSAGE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -266,6 +268,173 @@ fn validate_sha256(value: &str) -> Result<(), FileTransferError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum FileTransferRequest {
+    PutBegin { manifest: FileTransferManifest },
+    PutChunk { chunk: FileTransferChunk },
+    Status { transfer_id: TransferId },
+    Finalize { transfer_id: TransferId },
+    Cancel { transfer_id: TransferId },
+}
+
+impl FileTransferRequest {
+    pub fn validate(&self) -> Result<(), FileTransferError> {
+        match self {
+            Self::PutBegin { manifest } => {
+                manifest.validate()?;
+                if manifest.direction != FileTransferDirection::ControllerToDevice {
+                    return Err(FileTransferError::WrongDirection);
+                }
+            }
+            Self::PutChunk { chunk } => chunk.validate()?,
+            Self::Status { .. } | Self::Finalize { .. } | Self::Cancel { .. } => {}
+        }
+        Ok(())
+    }
+
+    pub fn into_message(self) -> Result<InnerMessage, FileTransferError> {
+        self.validate()?;
+        let payload = serde_json::to_vec(&self)?;
+        if payload.len() > MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES {
+            return Err(FileTransferError::RpcPayloadTooLarge(payload.len()));
+        }
+        Ok(InnerMessage::new("file_transfer", payload)?)
+    }
+
+    pub fn from_message(message: &InnerMessage) -> Result<Self, FileTransferError> {
+        if message.kind != "file_transfer" {
+            return Err(FileTransferError::UnexpectedKind(message.kind.clone()));
+        }
+        if message.payload.len() > MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES {
+            return Err(FileTransferError::RpcPayloadTooLarge(message.payload.len()));
+        }
+        let request: Self = serde_json::from_slice(&message.payload)?;
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileTransferPhase {
+    Receiving,
+    ReadyToFinalize,
+    Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileTransferStatus {
+    pub descriptor: FileResumeDescriptor,
+    pub phase: FileTransferPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_device_path: Option<String>,
+}
+
+impl FileTransferStatus {
+    pub fn validate(&self) -> Result<(), FileTransferError> {
+        self.descriptor.validate()?;
+        match self.phase {
+            FileTransferPhase::Receiving if self.descriptor.is_complete() => {
+                return Err(FileTransferError::InvalidPhase);
+            }
+            FileTransferPhase::ReadyToFinalize | FileTransferPhase::Completed
+                if !self.descriptor.is_complete() =>
+            {
+                return Err(FileTransferError::InvalidPhase);
+            }
+            _ => {}
+        }
+        match (self.phase, &self.final_device_path) {
+            (FileTransferPhase::Completed, Some(path)) => {
+                if path.trim().is_empty()
+                    || path.len() > MAX_FILE_RESUME_PATH_BYTES
+                    || path.contains('\0')
+                {
+                    return Err(FileTransferError::InvalidDevicePath);
+                }
+            }
+            (FileTransferPhase::Completed, None) => return Err(FileTransferError::InvalidPhase),
+            (_, Some(_)) => return Err(FileTransferError::InvalidPhase),
+            (_, None) => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileTransferErrorCode {
+    InvalidRequest,
+    Denied,
+    NotFound,
+    Conflict,
+    OutOfOrder,
+    Capacity,
+    HashMismatch,
+    Io,
+    Timeout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileTransferErrorBody {
+    pub code: FileTransferErrorCode,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum FileTransferReply {
+    Status(FileTransferStatus),
+    Cancelled { transfer_id: TransferId },
+    Error(FileTransferErrorBody),
+}
+
+impl FileTransferReply {
+    #[must_use]
+    pub fn error(code: FileTransferErrorCode, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        if message.len() > MAX_FILE_TRANSFER_ERROR_MESSAGE_BYTES {
+            message.truncate(MAX_FILE_TRANSFER_ERROR_MESSAGE_BYTES);
+        }
+        Self::Error(FileTransferErrorBody { code, message })
+    }
+
+    pub fn validate(&self) -> Result<(), FileTransferError> {
+        match self {
+            Self::Status(status) => status.validate(),
+            Self::Cancelled { .. } => Ok(()),
+            Self::Error(error) => {
+                if error.message.len() > MAX_FILE_TRANSFER_ERROR_MESSAGE_BYTES {
+                    return Err(FileTransferError::ErrorMessageTooLarge);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn into_message(self) -> Result<InnerMessage, FileTransferError> {
+        self.validate()?;
+        let payload = serde_json::to_vec(&self)?;
+        if payload.len() > MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES {
+            return Err(FileTransferError::RpcPayloadTooLarge(payload.len()));
+        }
+        Ok(InnerMessage::new("file_transfer_result", payload)?)
+    }
+
+    pub fn from_message(message: &InnerMessage) -> Result<Self, FileTransferError> {
+        if message.kind != "file_transfer_result" {
+            return Err(FileTransferError::UnexpectedKind(message.kind.clone()));
+        }
+        if message.payload.len() > MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES {
+            return Err(FileTransferError::RpcPayloadTooLarge(message.payload.len()));
+        }
+        let reply: Self = serde_json::from_slice(&message.payload)?;
+        reply.validate()?;
+        Ok(reply)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FileTransferError {
     #[error("unsupported file transfer manifest version {0}")]
@@ -304,6 +473,18 @@ pub enum FileTransferError {
     ChunkOffsetUnaligned { offset: u64, chunk_size: u32 },
     #[error("file transfer chunk length mismatch: expected {expected}, got {actual}")]
     UnexpectedChunkLength { expected: usize, actual: usize },
+    #[error("file transfer request uses the wrong direction for this operation")]
+    WrongDirection,
+    #[error("file transfer status phase is inconsistent with its resume descriptor")]
+    InvalidPhase,
+    #[error("file transfer RPC payload exceeds {MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES} bytes: {0}")]
+    RpcPayloadTooLarge(usize),
+    #[error("file transfer error message exceeds its hard bound")]
+    ErrorMessageTooLarge,
+    #[error("unexpected file transfer message kind: {0}")]
+    UnexpectedKind(String),
+    #[error(transparent)]
+    Inner(#[from] InnerSessionError),
     #[error(transparent)]
     Resume(#[from] FileResumeError),
     #[error("file transfer JSON failed: {0}")]
@@ -435,6 +616,62 @@ mod tests {
         assert!(matches!(
             oversized_encoding.validate(),
             Err(FileTransferError::ChunkEncodingTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn put_rpc_separates_receiving_ready_and_completed_phases() {
+        let put_manifest = manifest(FileTransferDirection::ControllerToDevice, 5_000);
+        let begin = FileTransferRequest::PutBegin {
+            manifest: put_manifest.clone(),
+        };
+        assert_eq!(
+            FileTransferRequest::from_message(&begin.clone().into_message().unwrap()).unwrap(),
+            begin
+        );
+
+        let receiving = FileTransferStatus {
+            descriptor: put_manifest.initial_resume_descriptor().unwrap(),
+            phase: FileTransferPhase::Receiving,
+            final_device_path: None,
+        };
+        receiving.validate().unwrap();
+
+        let mut complete_descriptor = receiving.descriptor.clone();
+        complete_descriptor.checkpoint_revision = 2;
+        complete_descriptor.confirmed_offset = put_manifest.total_size;
+        complete_descriptor.confirmed_prefix_sha256 = put_manifest.final_sha256.clone();
+        let ready = FileTransferReply::Status(FileTransferStatus {
+            descriptor: complete_descriptor.clone(),
+            phase: FileTransferPhase::ReadyToFinalize,
+            final_device_path: None,
+        });
+        assert_eq!(
+            FileTransferReply::from_message(&ready.clone().into_message().unwrap()).unwrap(),
+            ready
+        );
+        let completed = FileTransferStatus {
+            descriptor: complete_descriptor,
+            phase: FileTransferPhase::Completed,
+            final_device_path: Some("/device/data.bin".into()),
+        };
+        completed.validate().unwrap();
+
+        let invalid = FileTransferStatus {
+            phase: FileTransferPhase::Completed,
+            final_device_path: None,
+            ..completed
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(FileTransferError::InvalidPhase)
+        ));
+        assert!(matches!(
+            FileTransferRequest::PutBegin {
+                manifest: manifest(FileTransferDirection::DeviceToController, 1),
+            }
+            .validate(),
+            Err(FileTransferError::WrongDirection)
         ));
     }
 

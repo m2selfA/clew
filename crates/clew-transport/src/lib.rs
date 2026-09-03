@@ -32,9 +32,10 @@ pub use file_resume::{
 };
 pub use file_transfer::{
     FILE_TRANSFER_MANIFEST_VERSION, FileConflictPolicy, FileTransferChunk, FileTransferError,
-    FileTransferManifest, MAX_FILE_CHUNK_BASE64_BYTES, MAX_FILE_CHUNK_BYTES,
-    MAX_FILE_TRANSFER_CHUNK_ENCODED_BYTES, MAX_FILE_TRANSFER_MANIFEST_BYTES, MIN_FILE_CHUNK_BYTES,
-    sha256_hex as file_sha256_hex,
+    FileTransferErrorBody, FileTransferErrorCode, FileTransferManifest, FileTransferPhase,
+    FileTransferReply, FileTransferRequest, FileTransferStatus, MAX_FILE_CHUNK_BASE64_BYTES,
+    MAX_FILE_CHUNK_BYTES, MAX_FILE_TRANSFER_CHUNK_ENCODED_BYTES, MAX_FILE_TRANSFER_MANIFEST_BYTES,
+    MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES, MIN_FILE_CHUNK_BYTES, sha256_hex as file_sha256_hex,
 };
 pub use fs_mutation::{
     FsMutationErrorBody, FsMutationErrorCode, FsMutationProtocolError, FsMutationReply,
