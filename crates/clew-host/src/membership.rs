@@ -10,7 +10,7 @@ use clew_core::{
 };
 use clew_identity::{
     ActiveDeviceIdentity, ControllerPublicIdentity, DeviceIdentityStore, DeviceIdentityStoreError,
-    EnrollmentReceipt, PendingDeviceIdentity,
+    EnrollmentReceipt, PendingDeviceIdentity, PermissionGrant,
 };
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,8 @@ pub struct HostMembershipMarker {
     pub controller_endpoint: Option<EndpointAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_policy: Option<ReadPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_grant: Option<PermissionGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_bootstrap_noise_public_key: Option<[u8; 32]>,
 }
@@ -169,6 +171,7 @@ impl HostMembershipStore {
             invite_id: receipt.invite_id,
             controller_endpoint,
             read_policy,
+            effective_grant: Some(receipt.effective_grant),
             controller_bootstrap_noise_public_key,
         };
         write_or_verify_state(
@@ -232,6 +235,7 @@ impl HostMembershipStore {
         site_name: &str,
         controller_endpoint: Option<EndpointAddr>,
         read_policy: Option<ReadPolicy>,
+        signed_grant: PermissionGrant,
         controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     ) -> Result<Option<HostMembership>, HostMembershipError> {
         controller.validate()?;
@@ -255,6 +259,15 @@ impl HostMembershipStore {
         {
             return Err(HostMembershipError::MarkerMismatch);
         }
+        let grant_ceiling = if device.capabilities.execute {
+            PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
+        } else {
+            PermissionGrant::CONNECTOR_ONLY
+        };
+        let effective_grant = signed_grant.intersect(grant_ceiling);
+        if effective_grant.member != device.capabilities {
+            return Err(HostMembershipError::MarkerMismatch);
+        }
         let marker = HostMembershipMarker {
             client_flavor_id,
             client_flavor: Some(client_flavor),
@@ -266,6 +279,7 @@ impl HostMembershipStore {
             invite_id: identity.invite_id(),
             controller_endpoint,
             read_policy,
+            effective_grant: Some(effective_grant),
             controller_bootstrap_noise_public_key,
         };
         write_or_verify_state(
@@ -589,6 +603,15 @@ mod tests {
         let recovered = store.recover_for_flavor(flavor_id).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].marker.device_id, receipt.device_id);
+        assert_eq!(active.marker.effective_grant, Some(receipt.effective_grant));
+
+        let mut legacy_json = serde_json::to_value(&active.marker).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("effective_grant");
+        let legacy: HostMembershipMarker = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.effective_grant, None);
     }
 
     #[test]

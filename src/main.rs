@@ -81,6 +81,9 @@ enum Command {
         max_result_bytes: u32,
         #[arg(long, default_value_t = 5_000)]
         read_timeout_ms: u32,
+        /// Explicitly grant bounded V2 Edit/Write authority inside the signed roots.
+        #[arg(long)]
+        allow_write: bool,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -356,6 +359,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             deployment_hours,
             max_result_bytes,
             read_timeout_ms,
+            allow_write,
             state_dir,
         } => {
             let valid_for_ms = valid_hours
@@ -379,6 +383,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     deployment_window_ms,
                     max_result_bytes,
                     read_timeout_ms,
+                    allow_write,
                 })
                 .await?;
             invite_io::write_invitation(&client, &result.site_file, &output).await?;

@@ -811,6 +811,19 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 
 V2 的 read-only filesystem surface（Devices/selector + Read/PathInfo/Glob/Grep）至此封板。下一块 V2c：Edit/Write，要求 explicit preconditions + atomic replace + hard write/result bounds；不提前引入 V3 generic task/replay/resume。
 
+### V2c-0 — Signed write authority projection
+
+**Status：DONE（2026-09-03）**
+
+- 先修长期权限投影再写 mutation RPC：`PermissionGrant.write` 原本已存在于签名 bootstrap / enrollment receipt / Controller enrollment registry，但 Host membership marker 只持久化 member + ReadPolicy；直接实现 Write 会把长期 Host runtime 错误退化成“只要 EXECUTE 就能写”；
+- 新增 `PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR` 作为 execute-preferred **ceiling**：允许 read/write/connector、仍明确 `shell=false`。Controller bootstrap 继续做 `signed_grant ∩ ceiling`，所以旧/默认 Site Kit 的 `write=false` 不会被 ceiling 提权，helper-only 仍与 `CONNECTOR_ONLY` 相交；
+- owner CLI `mint/invite` 新增显式 `--allow-write`；`InviteIssueRequest` 增加 serde-default `allow_write=false`。默认 CLI/Controller GUI 仍签 `EXECUTE_READ_CONNECTOR`，GUI 明确传 `false`，因此现有产品流程不会静默获得写权限；只有 owner 明确 opt-in 才签 `EXECUTE_READ_WRITE_CONNECTOR`；
+- `HostMembershipMarker` 新增可选 `effective_grant`，新 enrollment 直接持久化 Controller receipt 的完整 effective grant；sidecar 丢失后从 signed Site Kit 恢复 active membership 时按 persisted member mode 重算同一 ceiling intersection；旧 marker 缺字段时 serde 为 `None`，后续 Write/Shell 必须把 `None` 当 deny，因此 legacy device 不会因升级获得新工具权限；
+- Controller 长期运行态不新增第二份 site write flag：per-device authoritative tooling grant 继续由 enrollment registry 的 `effective_grant` 持久化，后续 mutation Local API 必须同时检查 registry grant、device/site revoke、execute 与 signed roots；
+- focused regression：grant ceiling/intersection **2/2 PASS**，证明 write ceiling 不会给 unsigned read-only grant 增加 write、且始终剥离 shell；Host membership **1/1 PASS**，证明新 marker 保存 receipt grant、legacy JSON 删除该字段后解析为 `None`；`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **151 passed / 0 failed / 6 ignored**。
+
+下一块 V2c-1：实现 bounded text Write/Edit mutation RPC。Write 只允许 `create-only` 或 `expected SHA-256 replace`，Edit 必须 `expected SHA-256` 且 old text 恰好一次；同目录 secure temp + sync + atomic persist，Host/Controller 双端都验证 write authority/root/bounds，不引入 V5 大文件或 V3 replay/task。
+
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
 - MCP stdio + Streamable HTTP；
@@ -925,13 +938,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b read-only surface DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b + V2c-0 DONE）**
 
-**Next block：V2c — bounded atomic Edit / Write**
+**Next block：V2c-1 — bounded atomic text Edit / Write**
 
-V1.5 已在 `3a20cd2` 正式封板。V2a 的 shared target resolution 与 V2b 的 DeviceId-only Read/PathInfo/Glob/Grep 现在形成一套完整 bounded read-only agent filesystem surface：selector 只存在于 adapter，Local API/wire 只使用稳定 DeviceId；filesystem business payload 始终在 Target↔Controller InnerSession 内；Host 与 Controller 双重执行 roots/capability/output budget。下一步只增加带 precondition 的 atomic Edit/Write，不提前回灌 V3 reconnect/reattach/replay 或 V5 transfer plane。
+V1.5 已在 `3a20cd2` 正式封板。V2 read-only surface 已闭合；V2c-0 又把签名/有效 `write` grant 从 Site Kit/Controller enrollment registry 正确投影到 Host membership，并保证 legacy marker 缺 grant 时 fail closed。下一步 V2c-1 才开始真正 mutation RPC：只做 bounded text Edit/Write + explicit precondition + atomic replace，不提前回灌 V3 reconnect/reattach/replay 或 V5 transfer plane。
 
 ### Change log
+
+- **2026-09-03** — V2c-0 signed write authority projection DONE：新增 execute/read/write/connector ceiling（shell=false），owner CLI `--allow-write` 显式 opt-in，默认 CLI/GUI 仍 read-only；Controller 继续以 signed grant intersection 为权威，Host membership 新增可选 full effective grant，新 enrollment 持久化 receipt，legacy JSON 缺字段解析 `None` 并对 mutation fail closed。focused grant **2/2**、membership **1/1**、workspace **151/0/6**；下一块 V2c-1 atomic text Edit/Write。
 
 - **2026-09-03** — V2b-2 bounded Grep DONE / read-only filesystem surface closed：在同一 `fs_query` RPC 增加 streaming Grep，`regex::bytes` + explicit 1MiB/2MiB compile budgets，16KiB line / 32MiB scan / 48KiB reply / 1024 item hard bounds；目录 traversal 继续 canonical-root containment + visited 去重，内容用 `fill_buf/consume`，无 unbounded full-file/line read。focused protocol/Host/CLI 与真实 Connector `Read→PathInfo→Glob→Grep` 均 PASS；Windows product smoke `clew grep` 返回正确 `.rs` matches 并写 Activity；workspace **150/0/6**。下一块 V2c atomic Edit/Write。
 

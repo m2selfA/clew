@@ -74,6 +74,8 @@ pub struct InviteIssueRequest {
     pub deployment_window_ms: u64,
     pub max_result_bytes: u32,
     pub read_timeout_ms: u32,
+    #[serde(default)]
+    pub allow_write: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -744,7 +746,11 @@ async fn issue_invite_response(
             site_id,
             invite_id,
             site_name: request.site_name.clone(),
-            grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+            grant: if request.allow_write {
+                PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
+            } else {
+                PermissionGrant::EXECUTE_READ_CONNECTOR
+            },
             not_before_unix_ms: now,
             expires_unix_ms,
             deployment_window_ms: request.deployment_window_ms,

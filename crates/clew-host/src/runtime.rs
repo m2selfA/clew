@@ -271,6 +271,7 @@ fn resolve_site_file(
         &site_name,
         site_file.payload.controller_endpoint.clone(),
         site_file.payload.read_policy.clone(),
+        site_file.payload.bootstrap.payload.grant,
         site_file.payload.controller_bootstrap_noise_public_key,
     )? {
         return Ok(HostLaunchState::Active { membership, source });
