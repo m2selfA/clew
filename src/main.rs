@@ -18,10 +18,11 @@ use clew_host::{
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
-    BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
-    OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
-    RemoteReadRequest, restore_controller_backup, start_controller,
+    BackupExportRequest, ControllerConfig, ControllerStart, FsWritePrecondition,
+    InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitCloneRequest,
+    OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteEditRequest,
+    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
+    RemoteWriteRequest, restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -147,6 +148,32 @@ enum Command {
         max_bytes: u32,
         #[arg(long, default_value_t = 8_388_608)]
         max_scan_bytes: u64,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Create or replace one bounded UTF-8 file with an explicit write precondition.
+    Write {
+        #[arg(value_name = "DEVICE_OR_PATH", num_args = 1..=2)]
+        operands: Vec<String>,
+        #[arg(long, value_name = "TEXT")]
+        contents: String,
+        #[arg(long)]
+        create_only: bool,
+        #[arg(long, value_name = "SHA256")]
+        expected_sha256: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Replace one uniquely occurring text fragment under an expected file SHA-256.
+    Edit {
+        #[arg(value_name = "DEVICE_OR_PATH", num_args = 1..=2)]
+        operands: Vec<String>,
+        #[arg(long, value_name = "SHA256")]
+        expected_sha256: String,
+        #[arg(long, value_name = "TEXT")]
+        old: String,
+        #[arg(long, value_name = "TEXT")]
+        new: String,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -503,6 +530,68 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&page)?);
+        }
+        Command::Write {
+            operands,
+            contents,
+            create_only,
+            expected_sha256,
+            state_dir,
+        } => {
+            let (selector, path) = match operands.as_slice() {
+                [path] => (None, path.clone()),
+                [selector, path] => (Some(selector.as_str()), path.clone()),
+                _ => unreachable!("clap enforces one or two write operands"),
+            };
+            let precondition = match (create_only, expected_sha256) {
+                (true, None) => FsWritePrecondition::CreateOnly,
+                (false, Some(hash)) => FsWritePrecondition::MatchSha256(hash),
+                _ => {
+                    return Err(
+                        "write requires exactly one of --create-only or --expected-sha256".into(),
+                    );
+                }
+            };
+            let config = controller_config(state_dir)?;
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let result = client
+                .write(RemoteWriteRequest {
+                    device_id,
+                    path,
+                    contents,
+                    precondition,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Edit {
+            operands,
+            expected_sha256,
+            old,
+            new,
+            state_dir,
+        } => {
+            let (selector, path) = match operands.as_slice() {
+                [path] => (None, path.clone()),
+                [selector, path] => (Some(selector.as_str()), path.clone()),
+                _ => unreachable!("clap enforces one or two edit operands"),
+            };
+            let config = controller_config(state_dir)?;
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let result = client
+                .edit(RemoteEditRequest {
+                    device_id,
+                    path,
+                    expected_sha256,
+                    old,
+                    new,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Rename {
             device_id,

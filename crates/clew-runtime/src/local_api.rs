@@ -15,8 +15,10 @@ use clew_core::{
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
 use clew_transport::{
-    FsGlobPage, FsGrepPage, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode, FsQueryReply,
-    FsQueryRequest, IrohOuter, ReadErrorCode, ReadReply, ReadRequest, noise_static_public,
+    FsGlobPage, FsGrepPage, FsMutationErrorBody, FsMutationErrorCode, FsMutationReply,
+    FsMutationRequest, FsMutationResult, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode,
+    FsQueryReply, FsQueryRequest, FsWritePrecondition, IrohOuter, ReadErrorCode, ReadReply,
+    ReadRequest, noise_static_public,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -125,6 +127,23 @@ pub struct RemoteGrepRequest {
     pub limit: u32,
     pub max_bytes: u32,
     pub max_scan_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteWriteRequest {
+    pub device_id: DeviceId,
+    pub path: String,
+    pub contents: String,
+    pub precondition: FsWritePrecondition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteEditRequest {
+    pub device_id: DeviceId,
+    pub path: String,
+    pub expected_sha256: String,
+    pub old: String,
+    pub new: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -345,6 +364,8 @@ enum LocalMethod {
     PathInfo(RemotePathInfoRequest),
     Glob(RemoteGlobRequest),
     Grep(RemoteGrepRequest),
+    Write(RemoteWriteRequest),
+    Edit(RemoteEditRequest),
     ActivityList {
         limit: u32,
     },
@@ -389,6 +410,8 @@ enum LocalResponse {
     Glob(FsGlobPage),
     Grep(FsGrepPage),
     FsQueryError(FsQueryErrorBody),
+    FsMutationResult(FsMutationResult),
+    FsMutationError(FsMutationErrorBody),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -516,6 +539,8 @@ async fn dispatch(
         LocalMethod::PathInfo(request) => (path_info_response(state, request).await, false),
         LocalMethod::Glob(request) => (glob_response(state, request).await, false),
         LocalMethod::Grep(request) => (grep_response(state, request).await, false),
+        LocalMethod::Write(request) => (write_response(state, request).await, false),
+        LocalMethod::Edit(request) => (edit_response(state, request).await, false),
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
                 return (
@@ -930,6 +955,132 @@ async fn grep_response(state: &LocalApiState, request: RemoteGrepRequest) -> Loc
     .await
 }
 
+async fn write_response(state: &LocalApiState, request: RemoteWriteRequest) -> LocalResponse {
+    let wire_request =
+        match FsMutationRequest::write(&request.path, request.contents, request.precondition) {
+            Ok(request) => request,
+            Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+        };
+    fs_mutation_response(
+        state,
+        request.device_id,
+        wire_request,
+        "write",
+        request.path,
+    )
+    .await
+}
+
+async fn edit_response(state: &LocalApiState, request: RemoteEditRequest) -> LocalResponse {
+    let wire_request = match FsMutationRequest::edit(
+        &request.path,
+        request.expected_sha256,
+        request.old,
+        request.new,
+    ) {
+        Ok(request) => request,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
+    fs_mutation_response(state, request.device_id, wire_request, "edit", request.path).await
+}
+
+async fn fs_mutation_response(
+    state: &LocalApiState,
+    device_id: DeviceId,
+    wire_request: FsMutationRequest,
+    operation: &'static str,
+    path_summary: String,
+) -> LocalResponse {
+    let (site_id, timeout_ms) = match state.control.lock() {
+        Ok(store) => {
+            let Some(device) = store.snapshot().catalog.device(device_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
+            let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
+            let Some(enrollment) = store.snapshot().registry.device(device_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
+            if device.revoked
+                || site.revoked
+                || !device.device.capabilities.execute
+                || !enrollment.effective_grant.write
+                || !site.read_policy.allows_read()
+            {
+                return local_error(
+                    LocalApiErrorCode::Denied,
+                    "filesystem mutation is not permitted",
+                );
+            }
+            (site.site_id, site.read_policy.timeout_ms)
+        }
+        Err(_) => {
+            return local_error(
+                LocalApiErrorCode::Internal,
+                "controller state is unavailable",
+            );
+        }
+    };
+    let started = Instant::now();
+    let remote_timeout = Duration::from_millis(u64::from(timeout_ms).saturating_add(2_000));
+    let remote_result = timeout(
+        remote_timeout,
+        state.remote.fs_mutation(device_id, wire_request),
+    )
+    .await;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let (response, activity_result, transferred_bytes) = match remote_result {
+        Err(_) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "remote filesystem mutation timed out",
+            ),
+            ActivityResult::TimedOut,
+            0,
+        ),
+        Ok(Err(_)) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "device is offline or reconnecting",
+            ),
+            ActivityResult::Failed,
+            0,
+        ),
+        Ok(Ok(FsMutationReply::Result(result))) => {
+            let bytes = result.size;
+            (
+                LocalResponse::FsMutationResult(result),
+                ActivityResult::Succeeded,
+                bytes,
+            )
+        }
+        Ok(Ok(FsMutationReply::Error(error))) => {
+            let result = match error.code {
+                FsMutationErrorCode::Denied => ActivityResult::Denied,
+                FsMutationErrorCode::Timeout => ActivityResult::TimedOut,
+                _ => ActivityResult::Failed,
+            };
+            (LocalResponse::FsMutationError(error), result, 0)
+        }
+    };
+    if let Ok(now) = unix_ms_value()
+        && let Ok(mut store) = state.control.lock()
+    {
+        let _ = store.record_activity(
+            now,
+            site_id,
+            device_id,
+            operation,
+            Some(path_summary),
+            activity_result,
+            duration_ms,
+            transferred_bytes,
+        );
+    }
+    response
+}
+
 async fn fs_query_response(
     state: &LocalApiState,
     device_id: DeviceId,
@@ -946,9 +1097,13 @@ async fn fs_query_response(
             let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
                 return local_error(LocalApiErrorCode::Denied, "device is not available");
             };
+            let Some(enrollment) = store.snapshot().registry.device(device_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
             if device.revoked
                 || site.revoked
                 || !device.device.capabilities.execute
+                || !enrollment.effective_grant.read
                 || !site.read_policy.allows_read()
                 || requested_max_bytes
                     .is_some_and(|max_bytes| max_bytes > site.read_policy.max_result_bytes)
@@ -1108,9 +1263,13 @@ async fn read_response(state: &LocalApiState, request: RemoteReadRequest) -> Loc
             let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
                 return local_error(LocalApiErrorCode::Denied, "device is not available");
             };
+            let Some(enrollment) = store.snapshot().registry.device(request.device_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
             if device.revoked
                 || site.revoked
                 || !device.device.capabilities.execute
+                || !enrollment.effective_grant.read
                 || !site.read_policy.allows_read()
                 || request.limit > site.read_policy.max_result_bytes
             {
@@ -1401,6 +1560,35 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn write(
+        &self,
+        request: RemoteWriteRequest,
+    ) -> Result<FsMutationResult, LocalApiClientError> {
+        self.fs_mutation(LocalMethod::Write(request)).await
+    }
+
+    pub async fn edit(
+        &self,
+        request: RemoteEditRequest,
+    ) -> Result<FsMutationResult, LocalApiClientError> {
+        self.fs_mutation(LocalMethod::Edit(request)).await
+    }
+
+    async fn fs_mutation(
+        &self,
+        method: LocalMethod,
+    ) -> Result<FsMutationResult, LocalApiClientError> {
+        match self.request(method).await? {
+            LocalResponse::FsMutationResult(result) => Ok(result),
+            LocalResponse::FsMutationError(error) => Err(LocalApiClientError::FsMutationRemote {
+                code: error.code,
+                message: error.message,
+            }),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn activity_list(&self, limit: u32) -> Result<ActivityList, LocalApiClientError> {
         match self.request(LocalMethod::ActivityList { limit }).await? {
             LocalResponse::ActivityList(result) => Ok(result),
@@ -1682,6 +1870,11 @@ pub enum LocalApiClientError {
     #[error("remote filesystem query failed ({code:?}): {message}")]
     FsQueryRemote {
         code: FsQueryErrorCode,
+        message: String,
+    },
+    #[error("remote filesystem mutation failed ({code:?}): {message}")]
+    FsMutationRemote {
+        code: FsMutationErrorCode,
         message: String,
     },
     #[error("local API request timed out")]

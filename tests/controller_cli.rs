@@ -84,6 +84,32 @@ fn run_grep(state_dir: &Path, operands: &[&str]) -> Output {
     command.arg("--state-dir").arg(state_dir).output().unwrap()
 }
 
+fn run_write(state_dir: &Path, operands: &[&str], precondition_args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("write");
+    command.args(operands);
+    command.arg("--contents").arg("hello");
+    command.args(precondition_args);
+    command.arg("--state-dir").arg(state_dir).output().unwrap()
+}
+
+fn run_edit(state_dir: &Path, operands: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("edit");
+    command.args(operands);
+    command
+        .arg("--expected-sha256")
+        .arg("00".repeat(32))
+        .arg("--old")
+        .arg("old")
+        .arg("--new")
+        .arg("new")
+        .arg("--state-dir")
+        .arg(state_dir)
+        .output()
+        .unwrap()
+}
+
 fn run_shutdown(state_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clew"))
         .arg("shutdown")
@@ -234,6 +260,52 @@ fn grep_cli_reuses_shared_device_selection() {
         String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
         "{}",
         String::from_utf8_lossy(&named.stderr)
+    );
+}
+
+#[test]
+fn write_and_edit_cli_reuse_shared_device_selection_and_require_preconditions() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path();
+    let _controller = spawn_controller(state_dir);
+    wait_until_ready(state_dir);
+
+    let invalid = run_write(state_dir, &["/shared/new.txt"], &[]);
+    assert!(!invalid.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr)
+            .contains("write requires exactly one of --create-only or --expected-sha256"),
+        "{}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+
+    let automatic = run_write(state_dir, &["/shared/new.txt"], &["--create-only"]);
+    assert!(!automatic.status.success());
+    assert!(
+        String::from_utf8_lossy(&automatic.stderr)
+            .contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
+
+    let named = run_write(
+        state_dir,
+        &["GPU-01", "/shared/new.txt"],
+        &["--create-only"],
+    );
+    assert!(!named.status.success());
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+
+    let edit = run_edit(state_dir, &["/shared/new.txt"]);
+    assert!(!edit.status.success());
+    assert!(
+        String::from_utf8_lossy(&edit.stderr).contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&edit.stderr)
     );
 }
 

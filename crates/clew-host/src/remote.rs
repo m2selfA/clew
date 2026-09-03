@@ -10,11 +10,12 @@ use clew_transport::{
     BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
     ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
-    FsQueryErrorCode, FsQueryReply, FsQueryRequest, InnerSession, IrohOuter, IrohProtocol,
-    MdnsConnectorDiscovery, NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest,
-    SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease,
-    SiteDiscoveryTag, forward_opaque_bidirectional, read_bootstrap, read_connector_open,
-    read_connector_ready, write_bootstrap, write_connector_open, write_connector_ready,
+    FsMutationErrorCode, FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply,
+    FsQueryRequest, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
+    NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext,
+    SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease, SiteDiscoveryTag,
+    forward_opaque_bidirectional, read_bootstrap, read_connector_open, read_connector_ready,
+    write_bootstrap, write_connector_open, write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
@@ -816,19 +817,29 @@ async fn serve_networked_membership_with_outer_timing(
     };
 
     let mut tunnels = JoinSet::new();
+    let read_allowed = membership
+        .marker
+        .effective_grant
+        .as_ref()
+        .map_or(true, |grant| grant.read);
+    let write_allowed = membership
+        .marker
+        .effective_grant
+        .as_ref()
+        .is_some_and(|grant| grant.write);
     loop {
         tokio::select! {
             message = inner.recv(&mut stream) => {
                 let message = message?;
                 let reply = match message.kind.as_str() {
                     "read" => {
-                        let reply = match (service.as_ref(), ReadRequest::from_message(&message)) {
-                            (Some(service), Ok(request)) => service.execute(request).await,
-                            (None, Ok(_)) => ReadReply::error(
+                        let reply = match (service.as_ref(), read_allowed, ReadRequest::from_message(&message)) {
+                            (Some(service), true, Ok(request)) => service.execute(request).await,
+                            (_, false, Ok(_)) | (None, true, Ok(_)) => ReadReply::error(
                                 ReadErrorCode::Denied,
-                                "read is not permitted on this Connector-only device",
+                                "read is not permitted by this device grant",
                             ),
-                            (_, Err(_)) => ReadReply::error(
+                            (_, _, Err(_)) => ReadReply::error(
                                 ReadErrorCode::InvalidRequest,
                                 "malformed bounded Read request",
                             ),
@@ -836,15 +847,29 @@ async fn serve_networked_membership_with_outer_timing(
                         reply.into_message()?
                     }
                     "fs_query" => {
-                        let reply = match (service.as_ref(), FsQueryRequest::from_message(&message)) {
-                            (Some(service), Ok(request)) => service.execute_fs_query(request).await,
-                            (None, Ok(_)) => FsQueryReply::error(
+                        let reply = match (service.as_ref(), read_allowed, FsQueryRequest::from_message(&message)) {
+                            (Some(service), true, Ok(request)) => service.execute_fs_query(request).await,
+                            (_, false, Ok(_)) | (None, true, Ok(_)) => FsQueryReply::error(
                                 FsQueryErrorCode::Denied,
-                                "filesystem query is not permitted on this Connector-only device",
+                                "filesystem query is not permitted by this device grant",
                             ),
-                            (_, Err(_)) => FsQueryReply::error(
+                            (_, _, Err(_)) => FsQueryReply::error(
                                 FsQueryErrorCode::InvalidRequest,
                                 "malformed bounded filesystem query",
+                            ),
+                        };
+                        reply.into_message()?
+                    }
+                    "fs_mutation" => {
+                        let reply = match (service.as_ref(), write_allowed, FsMutationRequest::from_message(&message)) {
+                            (Some(service), true, Ok(request)) => service.execute_fs_mutation(request, true).await,
+                            (_, false, Ok(_)) | (None, true, Ok(_)) => FsMutationReply::error(
+                                FsMutationErrorCode::Denied,
+                                "filesystem mutation is not permitted by this device grant",
+                            ),
+                            (_, _, Err(_)) => FsMutationReply::error(
+                                FsMutationErrorCode::InvalidRequest,
+                                "malformed bounded filesystem mutation",
                             ),
                         };
                         reply.into_message()?
@@ -1067,6 +1092,8 @@ pub enum HostRemoteError {
     #[error(transparent)]
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
+    FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
     Read(#[from] clew_transport::ReadProtocolError),
     #[error(transparent)]
     Membership(#[from] crate::HostMembershipError),
@@ -1095,7 +1122,7 @@ impl HostRemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clew_core::{DeviceNameOrigin, InviteId, MemberCapabilities, ReadPolicy};
+    use clew_core::{DeviceNameOrigin, InviteId, ReadPolicy};
     use clew_identity::{
         ControllerIdentity, EnrollmentRegistry, PermissionGrant, SiteBootstrapSpec,
     };
@@ -1921,12 +1948,7 @@ mod tests {
 
         let mut registry = EnrollmentRegistry::new(
             controller.controller_id(),
-            PermissionGrant {
-                member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
-                read: true,
-                write: false,
-                shell: false,
-            },
+            PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR,
         );
         let bootstrap = registry
             .issue_bootstrap(
@@ -1935,7 +1957,7 @@ mod tests {
                     site_id,
                     invite_id,
                     site_name: "Connector Lab".into(),
-                    grant: PermissionGrant::EXECUTE_READ_CONNECTOR,
+                    grant: PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR,
                     not_before_unix_ms: now.saturating_sub(1_000),
                     expires_unix_ms: now + 60_000,
                     deployment_window_ms: 60_000,
@@ -2002,7 +2024,7 @@ mod tests {
                 };
                 let ceiling = match mode {
                     BootstrapMemberMode::ExecutePreferred => {
-                        PermissionGrant::EXECUTE_READ_CONNECTOR
+                        PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
                     }
                     BootstrapMemberMode::ConnectorOnly => PermissionGrant::CONNECTOR_ONLY,
                 };
@@ -2188,6 +2210,15 @@ mod tests {
             assert!(membership.device.capabilities.execute);
             assert!(membership.device.capabilities.connector);
         }
+        if discovery_mode != NoPublicDiscovery::NearbyFileConnectorOnly {
+            assert!(
+                membership
+                    .marker
+                    .effective_grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.read && grant.write && !grant.shell)
+            );
+        }
         assert_eq!(
             membership.marker.controller_bootstrap_noise_public_key,
             Some(controller_bootstrap_public)
@@ -2248,6 +2279,7 @@ mod tests {
             let device_id = membership.marker.device_id;
             let proof_path = proof_path.to_string_lossy().into_owned();
             let share_path = share.to_string_lossy().into_owned();
+            let mutation_path = share.join("mutation.txt").to_string_lossy().into_owned();
             async move {
                 let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
                 assert_eq!(protocol, IrohProtocol::Connector);
@@ -2327,7 +2359,7 @@ mod tests {
                     .send(
                         &mut stream,
                         &FsQueryRequest::grep(
-                            share_path,
+                            share_path.clone(),
                             "CLEW-V15C",
                             Some("*.txt".into()),
                             0,
@@ -2351,6 +2383,69 @@ mod tests {
                 assert_eq!(page.matches[0].line_number, 1);
                 assert_eq!(page.matches[0].line, "CLEW-V15C-NO-PUBLIC-CONNECTOR-READ");
                 assert!(!page.truncated);
+
+                inner
+                    .send(
+                        &mut stream,
+                        &FsMutationRequest::write(
+                            mutation_path.clone(),
+                            "alpha OLD omega\n",
+                            clew_transport::FsWritePrecondition::CreateOnly,
+                        )
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let write_reply = inner.recv(&mut stream).await.unwrap();
+                let FsMutationReply::Result(created) =
+                    FsMutationReply::from_message(&write_reply).unwrap()
+                else {
+                    panic!("expected Write reply over Connector InnerSession");
+                };
+                assert!(created.created);
+                assert_eq!(created.size, 16);
+
+                inner
+                    .send(
+                        &mut stream,
+                        &FsMutationRequest::edit(
+                            mutation_path.clone(),
+                            created.sha256,
+                            "OLD",
+                            "NEW",
+                        )
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let edit_reply = inner.recv(&mut stream).await.unwrap();
+                let FsMutationReply::Result(edited) =
+                    FsMutationReply::from_message(&edit_reply).unwrap()
+                else {
+                    panic!("expected Edit reply over Connector InnerSession");
+                };
+                assert!(!edited.created);
+                assert_eq!(edited.size, 16);
+
+                inner
+                    .send(
+                        &mut stream,
+                        &ReadRequest::new(mutation_path, 0, 4_096)
+                            .unwrap()
+                            .into_message()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let mutated_reply = inner.recv(&mut stream).await.unwrap();
+                assert_eq!(
+                    ReadReply::from_message(&mutated_reply).unwrap(),
+                    ReadReply::Data(b"alpha NEW omega\n".to_vec())
+                );
             }
         });
 

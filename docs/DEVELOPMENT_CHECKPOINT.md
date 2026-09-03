@@ -824,6 +824,21 @@ V2 的 read-only filesystem surface（Devices/selector + Read/PathInfo/Glob/Grep
 
 下一块 V2c-1：实现 bounded text Write/Edit mutation RPC。Write 只允许 `create-only` 或 `expected SHA-256 replace`，Edit 必须 `expected SHA-256` 且 old text 恰好一次；同目录 secure temp + sync + atomic persist，Host/Controller 双端都验证 write authority/root/bounds，不引入 V5 大文件或 V3 replay/task。
 
+### V2c-1 — Bounded atomic text Write / Edit
+
+**Status：DONE（2026-09-03）**
+
+- 新增独立但同一 InnerSession 内的 `fs_mutation` business RPC；Helper/Connector 仍只搬运 InnerSession ciphertext，没有新增旁路文件通道。`Write` / `Edit` Local API 继续只接 DeviceId，CLI adapter 复用 V2a selector；
+- mutation 只定位为小文本 agent editing，不冒充 V5 transfer plane：Write UTF-8 content hard cap **32 KiB**；Edit `old/new` 各 **16 KiB**，编辑后文件仍必须 ≤ **32 KiB**；路径继续受既有 signed root/path hard bounds；SHA-256 precondition 必须是 **64-hex**；
+- `Write` 强制二选一 precondition：`CreateOnly` 使用 same-directory secure temp + sync + `persist_noclobber`，已有目标绝不覆盖；`MatchSha256` 仅在当前 bounded file SHA-256 匹配时 replace。`Edit` 必须 expected SHA-256，且 `old` 在 UTF-8 文件中**恰好出现一次**；0 次或多次都返回 Conflict；
+- Host 不用 `fs::read` 读取 mutation target：先 `symlink_metadata` / regular-file check，再 canonical-root containment，随后 `File::open + take(32KiB+1)` bounded read；create-only 先 canonicalize parent 并要求仍在 signed roots，最终组件必须是 normal filename；symlink target 直接拒绝；
+- 落盘使用同目录 `NamedTempFile`，写入后 flush + `sync_all`，replace/edit 保留原权限，再 `persist` 到目标；Unix 额外 sync parent directory。这里的 **atomic** 指落地 replace 不暴露半写文件；expected SHA-256 是 mutation 前的 optimistic stale-check，不宣称跨进程 OS-level CAS；
+- write authority 三层 fail closed：Controller Local API 查 enrollment registry `effective_grant.write` + site/device revoke + execute + signed roots；Host dispatcher 查 persisted membership grant；Host service 还要求显式 `allow_write=true`。legacy marker 的 grant=`None` 永远不能 mutation；同时 Read/FsQuery 的 Controller/Host 路径也补齐 `effective_grant.read` 双端检查；
+- 默认 invitation 继续 read-only；真实 Windows product smoke 中 `mint --allow-write` Host 完成 Write(create-only) → Edit(expected returned SHA) → Read，最终精确得到 `alpha NEW omega`，Activity 仅记录 `write/edit`、path/result/15 bytes，不记录正文；另一个未带 `--allow-write` 的 `V2C-READONLY` Site 对同一 Write 明确返回 `Denied: filesystem mutation is not permitted`，目标文件不存在；所有 smoke jobs/state 已清理；
+- focused validation：transport mutation roundtrip/bounds **1/1 PASS**；Host authority/root/create/conflict/edit **1/1 PASS**；真实 no-public NearbyFile Connector 在同一 InnerSession 中连续 `Read → PathInfo → Glob → Grep → Write → Edit → Read verify` **1/1 PASS（3.45s）**；同一 write-capable Site Kit 的 `--connector-only` ceiling 降权 **1/1 PASS（2.99s）**；CLI selector/precondition surface **1/1 PASS**；`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **154 passed / 0 failed / 6 ignored**。
+
+V2 filesystem agent surface（Devices/selector + Read/PathInfo/Glob/Grep/Write/Edit）至此封板。下一块 V2d：live-session bounded Shell task；只做明确 command/cwd/env policy、bounded stdout/stderr、timeout/cancel 与同一会话内 task lifecycle，V3 才增加 reconnect 后 reattach/replay。
+
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
 - MCP stdio + Streamable HTTP；
@@ -938,13 +953,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b + V2c-0 DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b + V2c filesystem surface DONE）**
 
-**Next block：V2c-1 — bounded atomic text Edit / Write**
+**Next block：V2d — bounded live-session Shell task**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 read-only surface 已闭合；V2c-0 又把签名/有效 `write` grant 从 Site Kit/Controller enrollment registry 正确投影到 Host membership，并保证 legacy marker 缺 grant 时 fail closed。下一步 V2c-1 才开始真正 mutation RPC：只做 bounded text Edit/Write + explicit precondition + atomic replace，不提前回灌 V3 reconnect/reattach/replay 或 V5 transfer plane。
+V1.5 已在 `3a20cd2` 正式封板。V2 filesystem agent surface 现在已经完整覆盖 Devices/selector + Read/PathInfo/Glob/Grep/Write/Edit：selector 只在 adapter，wire/Local API 只使用 DeviceId；业务 payload 始终在 Target↔Controller InnerSession 内；read/write grant、signed roots、bounds 都由 Controller 与 Host 双端 fail closed。下一块进入 Shell，但 V2 只建立 live-session task lifecycle、bounded output、timeout/cancel；reconnect 后 reattach/replay 仍严格留在 V3。
 
 ### Change log
+
+- **2026-09-03** — V2c-1 bounded atomic text Write/Edit DONE / filesystem agent surface closed：新增 32KiB small-text `fs_mutation`，Write 强制 create-only 或 expected SHA-256，Edit 强制 expected SHA + unique old text；Host bounded existing-file read、canonical roots、same-directory secure temp + sync + atomic persist、permission preservation，Controller/Host/service 三层 write grant fail closed，legacy grant=None 不可写。真实 no-public Connector 同一 InnerSession `Read→PathInfo→Glob→Grep→Write→Edit→Read` PASS；write-capable same-kit connector-only 降权 PASS；Windows product positive Write/Edit/Read/Activity 与 default-read-only Denied negative 均 PASS；workspace **154/0/6**。下一块 V2d bounded live-session Shell task。
 
 - **2026-09-03** — V2c-0 signed write authority projection DONE：新增 execute/read/write/connector ceiling（shell=false），owner CLI `--allow-write` 显式 opt-in，默认 CLI/GUI 仍 read-only；Controller 继续以 signed grant intersection 为权威，Host membership 新增可选 full effective grant，新 enrollment 持久化 receipt，legacy JSON 缺字段解析 `None` 并对 mutation fail closed。focused grant **2/2**、membership **1/1**、workspace **151/0/6**；下一块 V2c-1 atomic text Edit/Write。
 

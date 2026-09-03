@@ -2,6 +2,7 @@
 
 mod connector;
 mod discovery;
+mod fs_mutation;
 mod fs_query;
 mod inner;
 mod lease;
@@ -19,6 +20,11 @@ pub use connector::{
 pub use discovery::{
     ConnectorCandidate, ConnectorDiscoveryAdvertisement, ConnectorDiscoveryError,
     ConnectorDiscoveryEvent, ConnectorDiscoveryEvents, MdnsConnectorDiscovery, SiteDiscoveryTag,
+};
+pub use fs_mutation::{
+    FsMutationErrorBody, FsMutationErrorCode, FsMutationProtocolError, FsMutationReply,
+    FsMutationRequest, FsMutationResult, FsWritePrecondition, HARD_MAX_EDIT_FRAGMENT_BYTES,
+    HARD_MAX_WRITE_TEXT_BYTES, normalize_sha256_hex,
 };
 pub use fs_query::{
     FsGlobPage, FsGrepMatch, FsGrepPage, FsPathInfo, FsPathKind, FsQueryErrorBody,

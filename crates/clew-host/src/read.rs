@@ -1,16 +1,21 @@
 use std::{
     collections::{BTreeSet, VecDeque},
-    path::{Path, PathBuf},
+    fs::{self, File, Metadata, Permissions},
+    io::{Read as _, Write as _},
+    path::{Component, Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
 };
 
 use clew_core::ReadPolicy;
 use clew_transport::{
-    FsGlobPage, FsGrepMatch, FsGrepPage, FsPathInfo, FsPathKind, FsQueryErrorCode, FsQueryReply,
-    FsQueryRequest, HARD_MAX_FS_SCAN_ENTRIES, HARD_MAX_GREP_LINE_BYTES, ReadErrorCode, ReadReply,
-    ReadRequest,
+    FsGlobPage, FsGrepMatch, FsGrepPage, FsMutationErrorCode, FsMutationReply, FsMutationRequest,
+    FsMutationResult, FsPathInfo, FsPathKind, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
+    FsWritePrecondition, HARD_MAX_FS_SCAN_ENTRIES, HARD_MAX_GREP_LINE_BYTES,
+    HARD_MAX_WRITE_TEXT_BYTES, ReadErrorCode, ReadReply, ReadRequest, normalize_sha256_hex,
 };
 use regex::bytes::{Regex, RegexBuilder};
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
     time::timeout,
@@ -121,6 +126,43 @@ impl HostReadService {
         {
             Ok(reply) => reply,
             Err(_) => FsQueryReply::error(FsQueryErrorCode::Timeout, "filesystem query timed out"),
+        }
+    }
+
+    pub async fn execute_fs_mutation(
+        &self,
+        request: FsMutationRequest,
+        allow_write: bool,
+    ) -> FsMutationReply {
+        if request.validate().is_err() {
+            return FsMutationReply::error(
+                FsMutationErrorCode::InvalidRequest,
+                "invalid bounded filesystem mutation",
+            );
+        }
+        if !allow_write || self.policy.roots.is_empty() {
+            return FsMutationReply::error(
+                FsMutationErrorCode::Denied,
+                "filesystem mutation is outside the allowed policy",
+            );
+        }
+        let policy = self.policy.clone();
+        let operation =
+            tokio::task::spawn_blocking(move || execute_mutation_blocking(&policy, request));
+        match timeout(
+            Duration::from_millis(self.policy.timeout_ms as u64),
+            operation,
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => {
+                FsMutationReply::error(FsMutationErrorCode::Io, "filesystem mutation worker failed")
+            }
+            Err(_) => FsMutationReply::error(
+                FsMutationErrorCode::Timeout,
+                "filesystem mutation timed out",
+            ),
         }
     }
 
@@ -670,6 +712,341 @@ fn grep_page(state: GrepState, truncated: bool) -> FsQueryReply {
     })
 }
 
+fn execute_mutation_blocking(policy: &ReadPolicy, request: FsMutationRequest) -> FsMutationReply {
+    match request {
+        FsMutationRequest::Write {
+            path,
+            contents,
+            precondition,
+        } => match precondition {
+            FsWritePrecondition::CreateOnly => {
+                let target = match prepare_create_target(policy, &path) {
+                    Ok(target) => target,
+                    Err(reply) => return reply,
+                };
+                match persist_mutation(&target, contents.as_bytes(), None, true) {
+                    Ok(()) => mutation_result(contents.as_bytes(), true),
+                    Err(reply) => reply,
+                }
+            }
+            FsWritePrecondition::MatchSha256(expected) => {
+                let existing = match read_existing_mutation_target(policy, &path) {
+                    Ok(existing) => existing,
+                    Err(reply) => return reply,
+                };
+                let expected = match normalize_sha256_hex(&expected) {
+                    Ok(expected) => expected,
+                    Err(_) => {
+                        return FsMutationReply::error(
+                            FsMutationErrorCode::InvalidRequest,
+                            "invalid SHA-256 precondition",
+                        );
+                    }
+                };
+                if existing.sha256 != expected {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::Conflict,
+                        "write precondition SHA-256 does not match current file",
+                    );
+                }
+                match persist_mutation(
+                    &existing.path,
+                    contents.as_bytes(),
+                    Some(existing.metadata.permissions()),
+                    false,
+                ) {
+                    Ok(()) => mutation_result(contents.as_bytes(), false),
+                    Err(reply) => reply,
+                }
+            }
+        },
+        FsMutationRequest::Edit {
+            path,
+            expected_sha256,
+            old,
+            new,
+        } => {
+            let existing = match read_existing_mutation_target(policy, &path) {
+                Ok(existing) => existing,
+                Err(reply) => return reply,
+            };
+            let expected = match normalize_sha256_hex(&expected_sha256) {
+                Ok(expected) => expected,
+                Err(_) => {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::InvalidRequest,
+                        "invalid SHA-256 precondition",
+                    );
+                }
+            };
+            if existing.sha256 != expected {
+                return FsMutationReply::error(
+                    FsMutationErrorCode::Conflict,
+                    "edit precondition SHA-256 does not match current file",
+                );
+            }
+            let current = match String::from_utf8(existing.bytes) {
+                Ok(current) => current,
+                Err(_) => {
+                    return FsMutationReply::error(
+                        FsMutationErrorCode::ContentLimit,
+                        "Edit requires a UTF-8 text file",
+                    );
+                }
+            };
+            let Some(position) = unique_text_occurrence(&current, &old) else {
+                return FsMutationReply::error(
+                    FsMutationErrorCode::Conflict,
+                    "Edit old text must occur exactly once",
+                );
+            };
+            if !current.is_char_boundary(position)
+                || !current.is_char_boundary(position + old.len())
+            {
+                return FsMutationReply::error(
+                    FsMutationErrorCode::Conflict,
+                    "Edit old text does not align to UTF-8 boundaries",
+                );
+            }
+            let new_len = current
+                .len()
+                .saturating_sub(old.len())
+                .saturating_add(new.len());
+            if new_len > HARD_MAX_WRITE_TEXT_BYTES {
+                return FsMutationReply::error(
+                    FsMutationErrorCode::ContentLimit,
+                    "edited file exceeds the small-text mutation hard bound",
+                );
+            }
+            let mut updated = String::with_capacity(new_len);
+            updated.push_str(&current[..position]);
+            updated.push_str(&new);
+            updated.push_str(&current[position + old.len()..]);
+            match persist_mutation(
+                &existing.path,
+                updated.as_bytes(),
+                Some(existing.metadata.permissions()),
+                false,
+            ) {
+                Ok(()) => mutation_result(updated.as_bytes(), false),
+                Err(reply) => reply,
+            }
+        }
+    }
+}
+
+struct ExistingMutationTarget {
+    path: PathBuf,
+    metadata: Metadata,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+fn read_existing_mutation_target(
+    policy: &ReadPolicy,
+    requested: &str,
+) -> Result<ExistingMutationTarget, FsMutationReply> {
+    let requested = PathBuf::from(requested);
+    if !requested.is_absolute() {
+        return Err(mutation_denied("mutation path must be absolute"));
+    }
+    let metadata = match fs::symlink_metadata(&requested) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(FsMutationReply::error(
+                FsMutationErrorCode::NotFound,
+                "mutation target was not found",
+            ));
+        }
+        Err(_) => return Err(mutation_io("mutation target metadata failed")),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(mutation_denied("mutation target cannot be a symlink"));
+    }
+    if !metadata.is_file() {
+        return Err(FsMutationReply::error(
+            FsMutationErrorCode::NotFile,
+            "mutation target is not a regular file",
+        ));
+    }
+    let path = fs::canonicalize(&requested)
+        .map_err(|_| mutation_io("mutation target canonicalization failed"))?;
+    ensure_allowed_path(policy, &path)?;
+    if metadata.len() > HARD_MAX_WRITE_TEXT_BYTES as u64 {
+        return Err(FsMutationReply::error(
+            FsMutationErrorCode::ContentLimit,
+            "existing file exceeds the small-text mutation hard bound",
+        ));
+    }
+    let mut file = File::open(&path).map_err(|_| mutation_io("mutation target open failed"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+    std::io::Read::by_ref(&mut file)
+        .take((HARD_MAX_WRITE_TEXT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| mutation_io("mutation target read failed"))?;
+    if bytes.len() > HARD_MAX_WRITE_TEXT_BYTES {
+        return Err(FsMutationReply::error(
+            FsMutationErrorCode::ContentLimit,
+            "existing file exceeded the small-text mutation hard bound while reading",
+        ));
+    }
+    let sha256 = sha256_hex(&bytes);
+    Ok(ExistingMutationTarget {
+        path,
+        metadata,
+        bytes,
+        sha256,
+    })
+}
+
+fn prepare_create_target(policy: &ReadPolicy, requested: &str) -> Result<PathBuf, FsMutationReply> {
+    let requested = PathBuf::from(requested);
+    if !requested.is_absolute() {
+        return Err(mutation_denied("mutation path must be absolute"));
+    }
+    let Some(Component::Normal(file_name)) = requested.components().next_back() else {
+        return Err(FsMutationReply::error(
+            FsMutationErrorCode::InvalidRequest,
+            "create target must end in a normal filename",
+        ));
+    };
+    let Some(parent) = requested.parent() else {
+        return Err(FsMutationReply::error(
+            FsMutationErrorCode::InvalidRequest,
+            "create target parent is invalid",
+        ));
+    };
+    let parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(FsMutationReply::error(
+                FsMutationErrorCode::NotFound,
+                "create target parent was not found",
+            ));
+        }
+        Err(_) => return Err(mutation_io("create target parent canonicalization failed")),
+    };
+    ensure_allowed_path(policy, &parent)?;
+    let target = parent.join(file_name);
+    match fs::symlink_metadata(&target) {
+        Ok(_) => Err(FsMutationReply::error(
+            FsMutationErrorCode::AlreadyExists,
+            "create-only target already exists",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(target),
+        Err(_) => Err(mutation_io("create target metadata failed")),
+    }
+}
+
+fn ensure_allowed_path(policy: &ReadPolicy, path: &Path) -> Result<(), FsMutationReply> {
+    for root in &policy.roots {
+        let Ok(root) = fs::canonicalize(root) else {
+            continue;
+        };
+        if path.starts_with(root) {
+            return Ok(());
+        }
+    }
+    Err(mutation_denied("mutation target is outside allowed roots"))
+}
+
+fn persist_mutation(
+    target: &Path,
+    contents: &[u8],
+    permissions: Option<Permissions>,
+    create_only: bool,
+) -> Result<(), FsMutationReply> {
+    let parent = target.parent().ok_or_else(|| {
+        FsMutationReply::error(
+            FsMutationErrorCode::InvalidRequest,
+            "mutation target parent is invalid",
+        )
+    })?;
+    let mut temp = NamedTempFile::new_in(parent)
+        .map_err(|_| mutation_io("secure mutation temp file creation failed"))?;
+    temp.as_file_mut()
+        .write_all(contents)
+        .map_err(|_| mutation_io("mutation temp write failed"))?;
+    temp.as_file_mut()
+        .flush()
+        .map_err(|_| mutation_io("mutation temp flush failed"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|_| mutation_io("mutation temp sync failed"))?;
+    if let Some(permissions) = permissions {
+        temp.as_file()
+            .set_permissions(permissions)
+            .map_err(|_| mutation_io("mutation temp permission copy failed"))?;
+    }
+    let persisted = if create_only {
+        match temp.persist_noclobber(target) {
+            Ok(file) => file,
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(FsMutationReply::error(
+                    FsMutationErrorCode::AlreadyExists,
+                    "create-only target already exists",
+                ));
+            }
+            Err(_) => return Err(mutation_io("atomic create persist failed")),
+        }
+    } else {
+        match temp.persist(target) {
+            Ok(file) => file,
+            Err(_) => return Err(mutation_io("atomic replace persist failed")),
+        }
+    };
+    persisted
+        .sync_all()
+        .map_err(|_| mutation_io("persisted mutation sync failed"))?;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| mutation_io("mutation parent directory sync failed"))?;
+    Ok(())
+}
+
+fn unique_text_occurrence(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let mut found = None;
+    for index in 0..=haystack.len() - needle.len() {
+        if &haystack[index..index + needle.len()] == needle {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index);
+        }
+    }
+    found
+}
+
+fn mutation_result(contents: &[u8], created: bool) -> FsMutationReply {
+    FsMutationReply::Result(FsMutationResult {
+        sha256: sha256_hex(contents),
+        size: contents.len() as u64,
+        created,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn mutation_denied(message: &'static str) -> FsMutationReply {
+    FsMutationReply::error(FsMutationErrorCode::Denied, message)
+}
+
+fn mutation_io(message: &'static str) -> FsMutationReply {
+    FsMutationReply::error(FsMutationErrorCode::Io, message)
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PathAccessError {
     NotAbsolute,
@@ -1001,6 +1378,132 @@ mod tests {
             line_limited,
             FsQueryReply::Error(error) if error.code == FsQueryErrorCode::ContentLimit
         ));
+    }
+
+    #[tokio::test]
+    async fn mutations_require_write_authority_roots_and_exact_preconditions() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        fs::create_dir_all(&root).unwrap();
+        let service = HostReadService::new(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 4_096, 5_000).unwrap(),
+        )
+        .unwrap();
+        let target = root.join("edit.txt");
+        let outside = temp.path().join("outside.txt");
+
+        let denied = service
+            .execute_fs_mutation(
+                FsMutationRequest::write(
+                    target.to_string_lossy(),
+                    "alpha old omega\n",
+                    FsWritePrecondition::CreateOnly,
+                )
+                .unwrap(),
+                false,
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            FsMutationReply::Error(error) if error.code == FsMutationErrorCode::Denied
+        ));
+        assert!(!target.exists());
+
+        let escaped = service
+            .execute_fs_mutation(
+                FsMutationRequest::write(
+                    outside.to_string_lossy(),
+                    "nope",
+                    FsWritePrecondition::CreateOnly,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            escaped,
+            FsMutationReply::Error(error) if error.code == FsMutationErrorCode::Denied
+        ));
+        assert!(!outside.exists());
+
+        let created = service
+            .execute_fs_mutation(
+                FsMutationRequest::write(
+                    target.to_string_lossy(),
+                    "alpha old omega\n",
+                    FsWritePrecondition::CreateOnly,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        let FsMutationReply::Result(created) = created else {
+            panic!("expected create-only mutation result");
+        };
+        assert!(created.created);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha old omega\n");
+
+        let duplicate_create = service
+            .execute_fs_mutation(
+                FsMutationRequest::write(
+                    target.to_string_lossy(),
+                    "overwrite",
+                    FsWritePrecondition::CreateOnly,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            duplicate_create,
+            FsMutationReply::Error(error) if error.code == FsMutationErrorCode::AlreadyExists
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha old omega\n");
+
+        let stale = service
+            .execute_fs_mutation(
+                FsMutationRequest::write(
+                    target.to_string_lossy(),
+                    "stale overwrite",
+                    FsWritePrecondition::MatchSha256("00".repeat(32)),
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            stale,
+            FsMutationReply::Error(error) if error.code == FsMutationErrorCode::Conflict
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha old omega\n");
+
+        let edited = service
+            .execute_fs_mutation(
+                FsMutationRequest::edit(target.to_string_lossy(), created.sha256, "old", "new")
+                    .unwrap(),
+                true,
+            )
+            .await;
+        let FsMutationReply::Result(edited) = edited else {
+            panic!("expected Edit mutation result");
+        };
+        assert!(!edited.created);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha new omega\n");
+
+        fs::write(&target, "old + old\n").unwrap();
+        let current_hash = sha256_hex(fs::read(&target).unwrap().as_slice());
+        let ambiguous = service
+            .execute_fs_mutation(
+                FsMutationRequest::edit(target.to_string_lossy(), current_hash, "old", "new")
+                    .unwrap(),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            ambiguous,
+            FsMutationReply::Error(error) if error.code == FsMutationErrorCode::Conflict
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old + old\n");
     }
 
     #[tokio::test]
