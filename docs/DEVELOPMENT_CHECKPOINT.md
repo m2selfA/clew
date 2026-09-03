@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a–e DONE；三机产品路径 PASS；只剩 physical no-public multi-machine gate）**
+**Status：DONE（2026-09-03；V1.5a–e + formal three-physical-machine no-public gate PASS）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -733,7 +733,21 @@ V1.5 final multi-machine acceptance 已推进到真实三机产品路径；2026-
 
 本轮代码 gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**。所有 mzd/gamma/witand0/cap00 临时 `Clew-V15-*` firewall rule、测试目录与 cap00 isolated state/job 均已清理；gamma Private firewall 已明确恢复 `Enabled=True`。
 
-因此下一步不重新打开协议，也不再把 Windows firewall 当当前根因：只需准备一个**可稳定 peer-UDP direct 的受控物理/实验室拓扑**，先证明 Target→Helper UDP，再证明隔离公网后这条 LAN path 仍在，随后复跑同一 Site Kit 首次 enrollment + bounded Read；通过后即可封 V1.5。Windows installer 后续仍应考虑明确申请/说明 Helper UDP inbound permission，但那是 packaging ergonomics，不是本轮未闭合 gate 的根因。
+2026-09-03 formal three-physical-machine no-public acceptance（exact HEAD `7f01cb8`）最终闭合：
+
+- exact tracked source archive SHA-256 `6f4d5af752f2eeef60f763505b3dbfe760e16457ed7a588be00aec41b012cbdb`（1,372,160 bytes）；在 `3dv0` 原生构建一次 Linux x86_64 binary，随后只分发同一 ELF 到三机，`delta` / `dnk` / `3dv0` 三边 SHA-256 均为 `eb464aedc2946abe9fafac8d4bb326c9b29e048ca959f85cb2ace5b00ecbb4b6`；
+- 三个真实物理角色固定为 `delta = Controller`、`dnk = Helper`、`3dv0 = Target`。delta 使用该 exact Linux binary 启动 Controller（ControllerId `06e6d4b0-4883-8d87-b097-1bcfe37f6058`），并签出 Linux `V15-LINUX-PHYSICAL` Site Kit；三机使用同一 `site.clew`，SHA-256 `58fb5df9062566ca0c50fb120b32ed003f083577f57e64b67674c4ca82061e9b`（7904 bytes）；
+- dnk 用同一普通 Site Kit 的 production `host --connector-only` enrollment，Controller 明确返回 `online=true / executable=false / connector=true`；production Nearby export 真正落盘并包含 dnk 私网 direct hints `10.100.8.141` / `172.26.54.44`。同时显式等到 30 秒 renewal margin，lease 从旧的 5-minute interval 自动刷新到新的 authenticated 5-minute interval，证明 long-lived Helper renewal 也在真实机器上工作；
+- Target 不修改整机 firewall。3dv0 使用 rootless `pasta` 创建**仅该 Clew Target 进程**可见的独立 user+network namespace，并在 namespace 内用 nft output policy 只允许 loopback，以及 UDP→dnk 两个 production Helper private IP；其余 IPv4/IPv6/TCP/UDP 全部 `reject`。`1.1.1.1:443` public TCP probe 在 Host 启动前明确失败；宿主 WebCodex/SSH 不受影响。该规则也不允许 dnk 的 public hint、Controller delta 或任何 relay/public endpoint，因此不是“假装 no-public”；
+- **negative control**：同一 namespace policy 下移走 `nearby-connection.clew`，fresh Target state 运行 26 秒只生成 pending DeviceKey，不产生 membership/device record，Controller catalog 仍只有 dnk Helper；nft 记录 **433 packets / 71,860 bytes rejected**。这证明 Target 自己不存在可偷偷使用的 Controller/public path；
+- **positive control**：恢复 Helper 的 fresh production canonical `nearby-connection.clew`（Target-side SHA-256 `dcf8db01a3bb43b72fcd5cc14c30d840bcfd0279f63f87d5f92eec0de38d31b8`），其余 namespace policy 完全不变，fresh Target 在约 8 秒内完成 sealed first enrollment，DeviceId `b28cdf65-0c09-4a6c-9d9f-721f4dc458fd`，Controller 返回 `online=true / executable=true / connector=true`；随后真实 bounded Read 精确返回 `CLEW-V15-LINUX-PHYSICAL-NOPUBLIC`；
+- active stability 不是瞬时成功：约 51 秒内每 10 秒采样一次，共 **6/6 `online=true` + 6/6 bounded Read PASS**；positive run 约 125 秒后主动终止，最终 nft 记录仍有 **951 packets / 88,334 bytes rejected**，Host stdout 只经历 `waiting for Controller enrollment → host ready`。因此首次 bootstrap 与长期 DeviceKey InnerSession/Read 均是在 public path 被实际阻断时经 Helper 闭合；
+- 第一轮 positive smoke 曾出现“刚 online 随后 offline / Read unavailable”，最终确认不是产品 bug：当时 dnk Helper 的 WebCodex test job 恰好到达 300 秒硬 timeout 被测试框架终止。把 Controller/Helper 都改为 1800 秒 job 后，同一正式 binary/协议立即稳定通过上述 6/6 Read；没有为该假故障修改源码；
+- 另做纯 mDNS 物理诊断：移走 Nearby file，并在同一 no-public namespace 额外只放行 `224.0.0.251:5353` / `ff02::fb:5353`，65 秒仍 pending。该结果只说明当前 campus/`pasta` physical path 不提供可用 multicast，不被伪称为 mDNS 产品回归；mDNS 零输入、delayed-order 与 Helper failover 继续由既有 real-mDNS integrations 覆盖，mDNS-blocked physical 环境则由 production Nearby fallback 覆盖。
+
+Final closeout validation：`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**。3dv0/dnk/delta 的 `.clew-v15-7f01cb8` acceptance 目录全部删除，dnk Helper job 已停止，delta Controller 通过 authenticated `shutdown` 正常退出，cap00 的 source archive/Linux binary/Site/Nearby 临时 artifact 也已删除。
+
+因此 V1.5 不再有协议或 formal no-public blocker。Windows installer 后续仍应明确处理/说明 Helper UDP inbound permission，但属于 V6 packaging ergonomics，不再阻塞 V1.5。
 
 计划：
 
@@ -754,7 +768,7 @@ V1.5 final multi-machine acceptance 已推进到真实三机产品路径；2026-
 - helper 日志/协议 payload 中不得出现 Read path、Shell command、file bytes；
 - 如果只能靠 helper 终止两条业务会话实现，本块视为失败，不提供明文降级模式。
 
-Acceptance：完全无公网 Target 与一台联网 helper 各双击一次、顺序任意、无 IP/端口/code/route 输入，即可首次 enrollment 并完成 Read；关闭当前 helper 后可自动切换另一健康 helper。
+Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中，Target/Helper 使用同一 Site Kit、顺序任意且无 IP/端口/code/route 输入即可首次 enrollment + active Read；该零输入路径、delayed-order 与 Helper-A→B failover 已由 real-mDNS integrations 覆盖。mDNS 不可用/受限网络中，使用 bounded Controller-signed `nearby-connection.clew` fallback，真实三物理机 no-public gate 已完成首次 enrollment + 稳定 active Read；两种路径最终都必须现场验证 fresh Controller-signed Helper lease，Helper 都只转发既有 InnerSession ciphertext。
 
 ## 9. V2 — Agent Minimum
 
@@ -874,13 +888,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.5 — Zero-config Site Connector（IN PROGRESS；V1.5a–e DONE，三机产品路径 PASS）**
+**Current block：V1.5 — Zero-config Site Connector（DONE，2026-09-03）**
 
-**Next block：V1.5 final controlled peer-UDP physical no-public multi-machine acceptance**
+**Next block：V2 — Agent Minimum**
 
-协议/产品实现已收口：discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序、Nearby fallback、bounded concurrent Helper selection、Helper-A→B session rebuild、LAN presence refresh、GUI invite 与 same-Site-Kit helper-only entry 均已有 focused / Windows / macOS 证据。2026-09-03 的真实机器测试又修复了 fresh Connector lease 的 bounded not-before clock-skew 缺陷；gamma 在约 6 秒负偏差下已从“永久 NotYetValid”恢复为正常 promotion 并生成 production Nearby export。唯一未闭合的是 formal physical no-public gate：当前 mzd↔imini/gamma/witand0/cap00 网络都不能提供稳定 peer UDP，即使 gamma host firewall 完全关闭也收不到，因此 blocker 属于测试网络 ACL/隔离，而非 Clew protocol 或当前 Windows Defender 配置。V1.5 保持 IN PROGRESS，等待一个受控、先验验证 UDP-direct 可达且公网隔离后仍保留 Helper LAN path 的物理拓扑。
+V1.5 协议、产品入口与 formal release evidence 已全部收口：mDNS discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序、Nearby fallback、bounded concurrent Helper selection、Helper-A→B session rebuild、LAN presence refresh、GUI invite、same-Site-Kit helper-only entry、bounded 30 秒 lease not-before clock-skew，以及最终 `delta Controller + dnk Helper + 3dv0 Target` 三物理机 no-public fallback gate 均已有明确证据。最终 Target 在 rootless process-scoped nft 隔离下只允许 UDP→Helper private IP，public/Controller/relay 全拒绝，仍完成 fresh enrollment 并在约 51 秒内 **6/6 online + 6/6 bounded Read PASS**；negative control 无 Nearby file 时保持 pending。V1.5 现在正式 DONE，后续开发进入 V2 Agent Minimum；V3 reliability 与 V6 packaging 不提前回灌。
 
 ### Change log
+
+- **2026-09-03** — V1.5 DONE / formal physical no-public gate closed：exact `7f01cb8` tracked source 在 3dv0 构建 Linux binary `eb464aed...bb4b6`，同一 ELF 部署到 delta/dnk/3dv0；delta Linux Controller 签同一 `site.clew`，dnk helper-only production enrollment/export/lease-renewal PASS。3dv0 Target 放入 rootless `pasta` + nft process-scoped no-public namespace，只允许 UDP→dnk private Helper IP；无 Nearby negative 26s 保持 pending、433 packets rejected；fresh Nearby positive 约 8s Active，约 51s 内 **6/6 online + 6/6 Read PASS**，最终 951 packets rejected。纯 mDNS physical diagnostic 仍受当前 multicast 环境限制，因此 zero-input mDNS 证据继续由已有 real-mDNS integration 承担，不把 fallback gate 冒充 mDNS。V1.5 正式封板，下一块 V2 Agent Minimum。
 
 - **2026-09-03** — V1.5 final physical sweep / clock-skew hardening：真实 gamma Helper 揭示 Controller/Helper 约 6 秒系统时差会让 fresh Connector lease 永久 `NotYetValid`；增加 bounded **30s not-before-only skew**，expiry/signature/Site/Endpoint/Device/max-lifetime 均保持 fail closed。真实 candidate 在 gamma 约 4 秒生成 production Nearby export；workspace **143/0/6**。同时通过 imini/gamma/witand0/cap00 物理探针确认当前剩余 gate 是上游 peer-UDP ACL/隔离；gamma host firewall 完全关闭仍 UDP timeout。下一步只换受控 UDP-direct 拓扑，不重开协议。
 - **2026-09-03** — V1.5c-3 nearby fallback DONE：commit `c4fbae6` 增加 bounded/versioned `nearby-connection.clew`、Controller-signed historical route binding、per-Site import/export、direct+mDNS+fallback race 与 Host drag/drop/export UI；cap00 workspace **134/0/4**，两条 explicit multicast 与 Windows GUI 分别 1/1 PASS。exact source 在已知 mDNS 不可用的 `macos-3dv0` 上 no-mDNS enrollment+Read **1/1 PASS**、workspace **135/0/3**、Aqua Host/tray >15s + second-launch wake PASS。下一块 V1.5d multiple-helper failover/resume。
