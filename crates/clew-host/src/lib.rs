@@ -8,6 +8,7 @@ mod outfit;
 mod read;
 mod remote;
 mod runtime;
+mod shell;
 mod site;
 mod ui;
 
@@ -43,6 +44,7 @@ pub use runtime::{
     MissingInviteView, cached_outfit_asset_path, detect_archive_temp_launch, resolve_host_launch,
     resolve_host_launch_with_mode,
 };
+pub use shell::HostShellService;
 pub use site::{
     ClientFlavor, ClientFlavorId, HostRoleHint, SignedSiteClew, SiteClewError, SiteKitContract,
     TargetPlatform,

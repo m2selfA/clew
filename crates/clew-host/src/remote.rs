@@ -13,16 +13,18 @@ use clew_transport::{
     FsMutationErrorCode, FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply,
     FsQueryRequest, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
     NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext,
-    SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease, SiteDiscoveryTag,
-    forward_opaque_bidirectional, read_bootstrap, read_connector_open, read_connector_ready,
-    write_bootstrap, write_connector_open, write_connector_ready,
+    SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply,
+    ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional,
+    read_bootstrap, read_connector_open, read_connector_ready, write_bootstrap,
+    write_connector_open, write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{
-    HostLaunchState, HostMembership, HostMembershipStore, HostReadService, NearbyConnectorStore,
+    HostLaunchState, HostMembership, HostMembershipStore, HostReadService, HostShellService,
+    NearbyConnectorStore,
 };
 
 const MAX_CONNECTOR_TUNNELS: usize = 64;
@@ -780,6 +782,10 @@ async fn serve_networked_membership_with_outer_timing(
         DeviceSessionIdentity::from_active(&membership.identity),
     )
     .await?;
+    let shell_service = service
+        .as_ref()
+        .map(|read_service| HostShellService::new(read_service.policy().clone()))
+        .transpose()?;
 
     let connector =
         membership.device.capabilities.connector && outer_path == MemberOuterPath::Direct;
@@ -827,6 +833,11 @@ async fn serve_networked_membership_with_outer_timing(
         .effective_grant
         .as_ref()
         .is_some_and(|grant| grant.write);
+    let shell_allowed = membership
+        .marker
+        .effective_grant
+        .as_ref()
+        .is_some_and(|grant| grant.shell);
     loop {
         tokio::select! {
             message = inner.recv(&mut stream) => {
@@ -870,6 +881,24 @@ async fn serve_networked_membership_with_outer_timing(
                             (_, _, Err(_)) => FsMutationReply::error(
                                 FsMutationErrorCode::InvalidRequest,
                                 "malformed bounded filesystem mutation",
+                            ),
+                        };
+                        reply.into_message()?
+                    }
+                    "shell_task" => {
+                        let reply = match (
+                            shell_service.as_ref(),
+                            shell_allowed,
+                            ShellTaskRequest::from_message(&message),
+                        ) {
+                            (Some(service), true, Ok(request)) => service.execute(request, true).await,
+                            (_, false, Ok(_)) | (None, true, Ok(_)) => ShellTaskReply::error(
+                                ShellTaskErrorCode::Denied,
+                                "Shell task is not permitted by this device grant",
+                            ),
+                            (_, _, Err(_)) => ShellTaskReply::error(
+                                ShellTaskErrorCode::InvalidRequest,
+                                "malformed bounded Shell task request",
                             ),
                         };
                         reply.into_message()?
@@ -1093,6 +1122,8 @@ pub enum HostRemoteError {
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    ShellTask(#[from] clew_transport::ShellTaskProtocolError),
     #[error(transparent)]
     Read(#[from] clew_transport::ReadProtocolError),
     #[error(transparent)]
@@ -1948,7 +1979,7 @@ mod tests {
 
         let mut registry = EnrollmentRegistry::new(
             controller.controller_id(),
-            PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR,
+            PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR,
         );
         let bootstrap = registry
             .issue_bootstrap(
@@ -1957,7 +1988,7 @@ mod tests {
                     site_id,
                     invite_id,
                     site_name: "Connector Lab".into(),
-                    grant: PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR,
+                    grant: PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR,
                     not_before_unix_ms: now.saturating_sub(1_000),
                     expires_unix_ms: now + 60_000,
                     deployment_window_ms: 60_000,
@@ -2024,7 +2055,7 @@ mod tests {
                 };
                 let ceiling = match mode {
                     BootstrapMemberMode::ExecutePreferred => {
-                        PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
+                        PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR
                     }
                     BootstrapMemberMode::ConnectorOnly => PermissionGrant::CONNECTOR_ONLY,
                 };
@@ -2216,7 +2247,7 @@ mod tests {
                     .marker
                     .effective_grant
                     .as_ref()
-                    .is_some_and(|grant| grant.read && grant.write && !grant.shell)
+                    .is_some_and(|grant| grant.read && grant.write && grant.shell)
             );
         }
         assert_eq!(
@@ -2445,6 +2476,83 @@ mod tests {
                 assert_eq!(
                     ReadReply::from_message(&mutated_reply).unwrap(),
                     ReadReply::Data(b"alpha NEW omega\n".to_vec())
+                );
+
+                let shell_command = if cfg!(windows) {
+                    "echo CLEW-SHELL-CONNECTOR"
+                } else {
+                    "printf CLEW-SHELL-CONNECTOR"
+                };
+                inner
+                    .send(
+                        &mut stream,
+                        &ShellTaskRequest::start(
+                            shell_command,
+                            share_path,
+                            std::collections::BTreeMap::new(),
+                            5_000,
+                        )
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let started_reply = inner.recv(&mut stream).await.unwrap();
+                let ShellTaskReply::Started { task_id } =
+                    ShellTaskReply::from_message(&started_reply).unwrap()
+                else {
+                    panic!("expected Shell start reply over Connector InnerSession");
+                };
+                let status = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        inner
+                            .send(
+                                &mut stream,
+                                &ShellTaskRequest::Status { task_id }.into_message().unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let status_reply = inner.recv(&mut stream).await.unwrap();
+                        let ShellTaskReply::Status(status) =
+                            ShellTaskReply::from_message(&status_reply).unwrap()
+                        else {
+                            panic!("expected Shell status reply over Connector InnerSession");
+                        };
+                        if status.phase.terminal() {
+                            break status;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("Shell task did not finish over Connector InnerSession");
+                assert_eq!(status.phase, clew_transport::ShellTaskPhase::Exited);
+                assert_eq!(status.exit_code, Some(0));
+
+                inner
+                    .send(
+                        &mut stream,
+                        &ShellTaskRequest::Attach {
+                            task_id,
+                            stdout_offset: 0,
+                            stderr_offset: 0,
+                            max_bytes_per_stream: 4_096,
+                        }
+                        .into_message()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let output_reply = inner.recv(&mut stream).await.unwrap();
+                let ShellTaskReply::Output(output) =
+                    ShellTaskReply::from_message(&output_reply).unwrap()
+                else {
+                    panic!("expected Shell output reply over Connector InnerSession");
+                };
+                assert!(
+                    String::from_utf8_lossy(&output.stdout.decode().unwrap())
+                        .contains("CLEW-SHELL-CONNECTOR")
                 );
             }
         });

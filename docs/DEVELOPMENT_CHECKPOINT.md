@@ -57,7 +57,7 @@
 | V1.4 | Bounded Read + v1 control plane | DONE | Windows/Linux/macOS release gate、live revoke、Read/Activity/backup 全闭合 |
 | V1.25 | Distribution Studio foundation | DONE | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
-| V2 | Agent minimum | IN PROGRESS | V2a shared selector + bounded Read adapter DONE；继续 Glob/Grep/Edit/Write/Shell + MCP |
+| V2 | Agent minimum | IN PROGRESS | filesystem surface + Shell authority/wire/Host live-session core DONE；继续 Controller Shell projection + MCP |
 | V3 | Reliability | TODO | reconnect/replay/reattach/resume/version negotiation |
 | V4 | Dynamic networking | TODO | TCP forward / SOCKS5 TCP / HTTP CONNECT，listener 归 Controller |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
@@ -772,7 +772,7 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 
 ## 9. V2 — Agent Minimum
 
-**Status：IN PROGRESS（V2a + V2b read-only surface DONE）**
+**Status：IN PROGRESS（filesystem surface + V2d-0/1a/1b Shell core DONE）**
 
 ### V2a — Shared device selection + selector-aware bounded Read
 
@@ -863,6 +863,22 @@ V2 filesystem agent surface（Devices/selector + Read/PathInfo/Glob/Grep/Write/E
 - focused validation：Shell protocol roundtrip/bounds/Base64/cursor **1/1 PASS**；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **155 passed / 0 failed / 6 ignored**。
 
 下一块 V2d-1b：Host-owned task/process store。必须 `env_clear` 后只投影最小 host baseline + bounded explicit env；初始 cwd 必须 canonicalize 到 signed roots；stdout/stderr reader 必须持续 drain 且 ring bounded；timeout/cancel 必须终止 child；live InnerSession drop 必须触发全部 task cancel，V3 才允许跨 session reattach。
+
+### V2d-1b — Host-owned live-session Shell task/process store
+
+**Status：DONE（2026-09-03）**
+
+- 新增 `HostShellService`，生命周期严格绑定一次 active Target↔Controller `InnerSession`：Host 持有 child/task store，`Start/Status/Attach/Cancel` 全通过 V2d-1a 的 `shell_task` 短 RPC；service/InnerSession drop 会对该 session 的全部 live task 发 cancel，V2 不把 task 跨 reconnect 持久化，V3 才增加 reattach/replay；
+- Shell authority 继续三层 fail closed：Host dispatcher 必须看到 persisted `effective_grant.shell=true`，service 还要求显式 `allow_shell=true`；legacy membership `effective_grant=None` 与 helper-only 都不能启动 Shell。shell-capable signed Site Kit 改用 `--connector-only` 时仍由 `CONNECTOR_ONLY` ceiling 剥离 read/write/shell；
+- `Start` 只允许 absolute cwd，并把**初始 cwd** canonicalize 后要求位于 signed roots 内且为目录；这不是 filesystem sandbox：owner 一旦显式签 `shell=true`，command 仍按 Host OS user 的正常权限执行，命令自身可访问该用户原本能访问的资源。V2 不偷偷引入容器/沙箱，也不把 cwd containment 误称为完整 Shell filesystem isolation；
+- process env 先 `env_clear()`，再只投影最小 host baseline（Windows：PATH/PATHEXT/SystemRoot/WINDIR/ComSpec/TEMP/TMP/USERPROFILE；Unix：PATH/HOME/TMPDIR/LANG/LC_ALL/LC_CTYPE）和 V2d-1a 已 hard-bound 的显式 env；stdin 固定 null，stdout/stderr pipe 持续 drain；
+- stdout/stderr 各自进入 **32 KiB** absolute-offset ring；Attach 最多 **12 KiB/stream**，旧 cursor 被淘汰时明确 `lost_prefix=true`。正常退出只有在 stdout/stderr drain 都成功后才标 `Exited`；否则 fail closed 为 `Failed`；
+- independent review 发现最初实现是“先 spawn child、后检查 64-task store capacity”，并发 Start 可能产生短暂超额 process。现已改成 **spawn 前 semaphore reservation**，64 个 permit 是真实 process admission hard bound，permit 与 task entry 生命周期绑定；terminal task prune 后才释放 capacity；
+- timeout/cancel 会终止当前 shell child；service drop 也触发 cancel。V2 当前不额外宣称 descendant process-tree/job-object 级 kill，也不承诺 connection-loss 后 reattach；这些语义不能从 `kill child` 夸大；
+- focused Host 回归 **3/3 PASS**：ring cursor/lost-prefix；grant/root/stdout+stderr/exit/timeout/cancel；spawn-before-capacity reservation + explicit env + service-drop cancel；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **158 passed / 0 failed / 6 ignored**；
+- 真实 no-public NearbyFile Connector 回归在同一 Helper-opaque InnerSession 中连续 `Read → PathInfo → Glob → Grep → Write → Edit → Read verify → Shell Start → Status → Attach` **1/1 PASS（3.51s）**；shell-capable 同一 signed Site Kit 的 `--connector-only` 降权 **1/1 PASS（2.97s）**，证明 Helper 没有得到 Shell 明文或执行能力。
+
+下一块 V2d-1c：Controller-owned live Shell task projection + DeviceId-only Local API/CLI。Controller 必须把 `TaskId` 绑定启动它的 DeviceId/current live session，Status/Attach/Cancel 不能拿任意 TaskId 去另一设备；Activity 只记录 command 摘要/结果/字节数，不保存 stdout/stderr 全文或 env。V3 继续独占 reconnect 后 reattach/replay。
 
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
@@ -978,13 +994,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem + Shell authority + V2d-1a wire DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem + Shell Host live-session core DONE）**
 
-**Next block：V2d-1b — Host-owned live-session Shell task/process store**
+**Next block：V2d-1c — Controller live Shell projection + Local API/CLI**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 filesystem surface 和 Shell signed authority 已闭合；Shell wire 现在也有稳定 TaskId、严格 request/output bounds 与 cursor contract。下一步实现 Host task/process store，并把生命周期严格绑定当前 Target↔Controller live InnerSession；Controller projection/CLI/MCP 仍在后续子块，connection-loss reattach/replay 仍属于 V3。
+V1.5 已在 `3a20cd2` 正式封板。V2 filesystem surface、Shell signed authority、wire contract 与 Host live-session process/task store 均已闭合；下一步让 Controller 持有当前 live-session task projection，并提供 DeviceId-only Local API/CLI。MCP 仍在后续 V2 子块，connection-loss reattach/replay 仍属于 V3。
 
 ### Change log
+
+- **2026-09-03** — V2d-1b Host live-session Shell core DONE：`HostShellService` 按 active InnerSession 持有 process/task store；cwd canonical-root 仅约束初始目录（明确不是 filesystem sandbox），`env_clear` + minimal baseline + bounded explicit env，stdout/stderr 32KiB rings，timeout/cancel/session-drop cancellation。independent review 将 64-task capacity 从 post-spawn store check 收紧为 **pre-spawn semaphore admission**。Host focused **3/3 PASS**；no-public Connector 同一 InnerSession 扩展到 Shell Start/Status/Attach **1/1 PASS（3.51s）**；shell-capable same-kit connector-only 降权 **1/1 PASS（2.97s）**。下一块 V2d-1c Controller projection + Local API/CLI。
 
 - **2026-09-03** — V2d-1a bounded Shell wire DONE：新增 stable `TaskId` 与 `shell_task Start/Status/Attach/Cancel` 短 RPC；command/cwd/env/timeout 全 hard-bound，stdout/stderr 设计为 32KiB ring + 12KiB/stream Base64 page，绝对 cursor + `lost_prefix` 明示丢前缀；phase 不包含任何 V3 reconnect/replay 语义。protocol **1/1 PASS**，workspace **155/0/6**。下一块 V2d-1b Host process/task store。
 
