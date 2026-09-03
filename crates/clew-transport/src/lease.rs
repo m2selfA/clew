@@ -8,6 +8,7 @@ use crate::{InnerMessage, InnerSessionError};
 
 pub const CONNECTOR_LEASE_VERSION: u32 = 1;
 pub const MAX_CONNECTOR_LEASE_LIFETIME_MS: u64 = 10 * 60 * 1000;
+pub const MAX_CONNECTOR_LEASE_NOT_BEFORE_SKEW_MS: u64 = 30 * 1000;
 pub const MAX_CONNECTOR_LEASE_ENCODED_BYTES: usize = 8 * 1024;
 pub const CONNECTOR_LEASE_MESSAGE_KIND: &str = "connector_lease";
 
@@ -94,7 +95,9 @@ impl SignedConnectorLease {
             expected_site_id,
             expected_endpoint_id,
         )?;
-        if now_unix_ms < self.payload.issued_unix_ms {
+        if now_unix_ms.saturating_add(MAX_CONNECTOR_LEASE_NOT_BEFORE_SKEW_MS)
+            < self.payload.issued_unix_ms
+        {
             return Err(ConnectorLeaseError::NotYetValid);
         }
         if now_unix_ms >= self.payload.expires_unix_ms {
@@ -244,8 +247,22 @@ mod tests {
                 .unwrap(),
             device
         );
+        assert_eq!(
+            signed
+                .verify_for_candidate(&controller.public_identity(), site, ep, 0)
+                .unwrap(),
+            device
+        );
+        let future =
+            SignedConnectorLease::issue(&controller, site, device, ep, 100_000, 160_000).unwrap();
+        assert_eq!(
+            future
+                .verify_for_candidate(&controller.public_identity(), site, ep, 70_000)
+                .unwrap(),
+            device
+        );
         assert!(matches!(
-            signed.verify_for_candidate(&controller.public_identity(), site, ep, 999),
+            future.verify_for_candidate(&controller.public_identity(), site, ep, 69_999),
             Err(ConnectorLeaseError::NotYetValid)
         ));
     }

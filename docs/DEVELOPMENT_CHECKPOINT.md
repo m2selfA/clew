@@ -711,23 +711,29 @@ macOS exact-commit acceptance：implementation commit `84b99c7` 的 tracked arch
 
 Aqua product gate：exact binary 的 Controller GUI 持续 >15 秒 stderr 为空并自动拉起 `ready=true` Controller；该 Controller 又在 **442 ms** 内真实签出 macOS 当前 ClientFlavor 的 `site.clew`。同一普通 `execute_preferred` sidecar 以 `host --connector-only` 启动后，Host Aqua GUI 持续 >15 秒 stderr 为空，Controller `devices` 明确返回 `online=true / executable=false / connector=true`；second launch **112 ms** 返回 `already running; requested the existing window to show`。Host/Controller job 与 smoke state/kit 均已清理。
 
-V1.5 final multi-machine acceptance 已推进到真实三机产品路径；2026-09-03 后续网络诊断推翻了“mzd↔imini 不具备 nearby LAN reachability”的初步判断。当前剩余 blocker 更准确地收窄为：**Windows Public-profile 入站策略是否允许 Helper 的 iroh UDP/QUIC direct ingress**。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
+V1.5 final multi-machine acceptance 已推进到真实三机产品路径；2026-09-03 的连续物理诊断又把 blocker 从“LAN 拓扑”与“Windows GPO/Defender”两种过早归因中进一步收窄：**当前测试网络对普通终端之间的 peer UDP/QUIC direct ingress 存在上游 ACL / isolation，无法作为稳定的 physical Connector acceptance 拓扑**。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
 
-2026-09-03 三机 acceptance（原测试 HEAD `7d5fed9`，Windows binary SHA-256 `d3a373ed2a186bfd3ca0dafcd1db0c5610d697e4c022056cee74b1a224cbe971`）：
+2026-09-03 三机 acceptance 与后续物理诊断：
 
-- cap00 = isolated Controller，imini = Helper，mzd = Target；三机使用同一精确 binary 与同一真实 Controller-signed `site.clew`；
-- imini 通过生产 `host --foreground --connector-only` 完成 enrollment，Controller `devices` 返回 `online=true / executable=false / connector=true`；
-- mzd 通过普通 `host --foreground` 完成 enrollment，Controller 返回 `online=true / executable=true / connector=true`；Controller 真实 bounded Read 读取 mzd 的 `D:\\tmp\\clew-v15-final-7d5fed9\\share\\acceptance.txt`，精确返回 `CLEW-V15-FINAL-MULTIMACHINE`；
-- 为避免把 direct/relay 成功误报成 Connector 成功，额外检查 mzd 状态发现 `nearby-connector.export.json`，证明该轮至少建立过 direct Controller uplink，因此这条三机证据**只证明真实机器/产品入口/权限/Read**，不冒充 no-public gate；
-- 随后从 imini 的 production per-Site export 取出 1881-byte `nearby-connection.clew`，在 mzd 对**仅本次测试 binary**临时添加 Windows Firewall `RemoteAddress=Internet` outbound block，保留 LAN，再用全新 `target-nopublic-state` 尝试首次 enrollment。Target 正确导入 fallback 并停在 `device-key.pending.json + nearby-connector.import.json`，没有错误变成 Active；当时据此初判 helper direct hints 不可达，但后续诊断证明该归因不准确；
-- **后续 network diagnosis**：imini 的 direct hints `10.100.9.235` / `10.100.10.199` 就是其两块真实 `/22` LAN 地址；mzd 对两者都能解析到 imini 的真实 MAC，且直接 TCP/22 到两个地址均成功（source `10.100.11.93`），因此二层/三层 nearby path 实际可达；ICMP 与任意 UDP probe 则均被丢弃；
-- mzd/imini 相关接口全部处于 Windows **Public** network profile，Windows Firewall 为 `BlockInbound,AllowOutbound`。imini 没有 Clew inbound allow rule；更关键的是 `netsh advfirewall show currentprofile` 显示 `LocalFirewallRules N/A (GPO-store only)`。临时创建的 UDP/45678 Local Allow rule 虽在 ActiveStore 为 `PrimaryStatus=OK`，但 A/B probe 前后都收不到 mzd 的 UDP packet，符合“本地规则不参与 GPO 最终策略”的表现；
-- 因此当前最强证据指向 **host/GPO UDP ingress filtering，而不是 LAN 拓扑隔离**。临时 UDP diagnostic rule 已删除；不在未授权情况下关闭整机 Firewall 或修改组织 GPO；
+- 原测试 HEAD `7d5fed9`、Windows binary SHA-256 `d3a373ed2a186bfd3ca0dafcd1db0c5610d697e4c022056cee74b1a224cbe971`：cap00 = isolated Controller，imini = Helper，mzd = Target；三机使用同一精确 binary 与同一真实 Controller-signed `site.clew`；Helper 返回 `online=true / executable=false / connector=true`，Target 返回 `online=true / executable=true / connector=true`，Controller 真实 bounded Read 精确读回 `CLEW-V15-FINAL-MULTIMACHINE`。该轮 mzd 自己建立过 direct Controller uplink，因此只证明真实机器/产品入口/权限/Read，不冒充 no-public Connector gate；
+- imini 的 `10.100.9.235/22` / `10.100.10.199/22` 与 mzd `10.100.11.93/22` 实际具备 L2/L3 与 TCP management reachability：mzd 能解析真实 MAC，两个地址 TCP/22 都直接 CONNECTED。故“二者不在 nearby LAN”初判已撤回；
+- 随后又撤回“主要是 Defender/GPO”这一过强归因：即使在 imini 临时关闭实际 Public firewall，任意 peer TCP 端口仍不能进入；在 gamma 上更做了 `try/finally` 的 Private firewall 完全关闭 A/B，mzd→gamma UDP 仍 timeout，且 firewall 已恢复。因此阻断发生在 host firewall 之外；
+- 为寻找稳定物理 Helper，先后筛了 gamma `10.100.9.77/22`、witand0 `10.100.10.10/22`、cap00 `10.100.9.59/22`。gamma 曾有一次真实 UDP probe 收到 mzd `10.100.11.93` 的 `CLEW-GAMMA-UDP`，但后续复验包括“gamma Private firewall 完全关闭”均 timeout；witand0 与 cap00 的同子网 UDP probe 也 timeout。当前网络环境的 peer UDP 可达性因此不稳定/被上游 ACL 隔离，不能拿来封 formal physical gate；
+- 先前用 `RemoteAddress=Internet` 对 Target 测试 binary 做 outbound block 的构造也不再被当作“必然保留 LAN”的证明。后续 formal no-public gate 必须先独立证明 Target→Helper LAN UDP 真可达，再使用一个**经实测不会切断该 Helper path**的公网隔离方法；不能仅凭 Windows `Internet` keyword 假设地址分类。
+
+这轮物理测试同时暴露并修复了一个真实的 V1.5 Connector bug：**fresh Controller-signed Connector lease 对 Helper 本机时钟零容忍**。
+
+- cap00 Controller 与 gamma Helper 的 UTC 实测相差约 **6 秒**；gamma 已成功 enrollment、Controller 显示 `connector=true`，但 active direct session 每次收到 fresh lease 后都重复失败 `connector lease is not yet valid`，所以永远无法进入 Connector serving / 写出 Nearby export；
+- 根因是 `SignedConnectorLease::verify_for_candidate` 原先要求 `now_unix_ms >= issued_unix_ms`，而 Controller 每次重试都按自己的当前时间重新签一张 lease；落后约 6 秒的 Helper 因而形成稳定死循环；
+- 修复增加 `MAX_CONNECTOR_LEASE_NOT_BEFORE_SKEW_MS = 30s`，**只**给 `issued_unix_ms` / not-before 检查一个 bounded skew：`now + 30s < issued` 才判 `NotYetValid`。expiration 仍按 `now >= expires` 严格拒绝；Controller signature、Site、EndpointId、DeviceId 与 10 分钟最大 lifetime 边界完全不放宽；
+- focused regression 冻结边界：恰好落后 30s PASS，落后 30s+1ms 仍 `NotYetValid`，到达 `expires` 仍 `Expired`；
+- 命名收紧前但语义完全相同的真实 candidate binary SHA-256 `0ae4d3a54964dbd44b87d8f598bf3adc5d609aa448ce93b0b0f88d012055b6c4` 在 gamma 上复验：同一 Controller / 同一 membership 下约 **4 秒**生成 fresh production `nearby-connector.export.json`；最终一次 export 为 1984 bytes，EndpointId `11f4ca730dad6e5801c0384ace1785348795be6f049a968b7eb8763176453549`，包含真实 LAN hint `10.100.9.77:63514`。这证明 clock-skew 修复直接消除了 Helper promotion/export 死循环；
+- mzd 随后正确导入该 canonical `nearby-connection.clew`，但因当前 mzd→gamma peer UDP 已被上游网络阻断而仍停在 pending；这条失败不再归因于 Clew lease/fallback/Helper promotion。
 - macOS 已知 mDNS-blocked 环境中的 no-mDNS enrollment+active Read 证据仍由 V1.5c-3 exact `c4fbae6` 保持 PASS。
 
-- 上一轮文档收口统一 gate：`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**。
+本轮代码 gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**。所有 mzd/gamma/witand0/cap00 临时 `Clew-V15-*` firewall rule、测试目录与 cap00 isolated state/job 均已清理；gamma Private firewall 已明确恢复 `Enabled=True`。
 
-因此下一步不再寻找“同 LAN 新机器”作为第一反应，而应先在一个**允许 Helper UDP/QUIC inbound**的 Windows policy 环境复跑同一 no-public gate；若仅放行 Clew/iroh UDP 后即闭环，则 V1.5 需要把 Windows firewall/OS permission 要求纳入产品与 V6 packaging contract，而不是把它当测试拓扑问题。
+因此下一步不重新打开协议，也不再把 Windows firewall 当当前根因：只需准备一个**可稳定 peer-UDP direct 的受控物理/实验室拓扑**，先证明 Target→Helper UDP，再证明隔离公网后这条 LAN path 仍在，随后复跑同一 Site Kit 首次 enrollment + bounded Read；通过后即可封 V1.5。Windows installer 后续仍应考虑明确申请/说明 Helper UDP inbound permission，但那是 packaging ergonomics，不是本轮未闭合 gate 的根因。
 
 计划：
 
@@ -870,12 +876,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current block：V1.5 — Zero-config Site Connector（IN PROGRESS；V1.5a–e DONE，三机产品路径 PASS）**
 
-**Next block：V1.5 final Windows UDP/QUIC policy + physical no-public multi-machine acceptance**
+**Next block：V1.5 final controlled peer-UDP physical no-public multi-machine acceptance**
 
-协议/产品实现已收口：discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序、Nearby fallback、bounded concurrent Helper selection、Helper-A→B session rebuild、LAN presence refresh、GUI invite 与 same-Site-Kit helper-only entry 均已有 focused / Windows / macOS 证据。2026-09-03 又完成 cap00 Controller + imini Helper + mzd Target 的真实三机 enrollment/权限/Read。后续诊断确认 mzd↔imini 的 LAN/TCP direct path 实际可达；未闭合的是 Windows Public-profile/GPO 环境下 Helper 的 UDP/QUIC inbound gate：本机临时 Allow rule不会进入 GPO-only 最终策略。V1.5 继续保持 IN PROGRESS，但 blocker 已从“物理拓扑”修正为“Windows host policy / packaging permission”。
+协议/产品实现已收口：discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序、Nearby fallback、bounded concurrent Helper selection、Helper-A→B session rebuild、LAN presence refresh、GUI invite 与 same-Site-Kit helper-only entry 均已有 focused / Windows / macOS 证据。2026-09-03 的真实机器测试又修复了 fresh Connector lease 的 bounded not-before clock-skew 缺陷；gamma 在约 6 秒负偏差下已从“永久 NotYetValid”恢复为正常 promotion 并生成 production Nearby export。唯一未闭合的是 formal physical no-public gate：当前 mzd↔imini/gamma/witand0/cap00 网络都不能提供稳定 peer UDP，即使 gamma host firewall 完全关闭也收不到，因此 blocker 属于测试网络 ACL/隔离，而非 Clew protocol 或当前 Windows Defender 配置。V1.5 保持 IN PROGRESS，等待一个受控、先验验证 UDP-direct 可达且公网隔离后仍保留 Helper LAN path 的物理拓扑。
 
 ### Change log
 
+- **2026-09-03** — V1.5 final physical sweep / clock-skew hardening：真实 gamma Helper 揭示 Controller/Helper 约 6 秒系统时差会让 fresh Connector lease 永久 `NotYetValid`；增加 bounded **30s not-before-only skew**，expiry/signature/Site/Endpoint/Device/max-lifetime 均保持 fail closed。真实 candidate 在 gamma 约 4 秒生成 production Nearby export；workspace **143/0/6**。同时通过 imini/gamma/witand0/cap00 物理探针确认当前剩余 gate 是上游 peer-UDP ACL/隔离；gamma host firewall 完全关闭仍 UDP timeout。下一步只换受控 UDP-direct 拓扑，不重开协议。
 - **2026-09-03** — V1.5c-3 nearby fallback DONE：commit `c4fbae6` 增加 bounded/versioned `nearby-connection.clew`、Controller-signed historical route binding、per-Site import/export、direct+mDNS+fallback race 与 Host drag/drop/export UI；cap00 workspace **134/0/4**，两条 explicit multicast 与 Windows GUI 分别 1/1 PASS。exact source 在已知 mDNS 不可用的 `macos-3dv0` 上 no-mDNS enrollment+Read **1/1 PASS**、workspace **135/0/3**、Aqua Host/tray >15s + second-launch wake PASS。下一块 V1.5d multiple-helper failover/resume。
 
 - **2026-09-02** — V1.5a discovery/opaque-transport spike DONE：确认 iroh 1.1 的 mDNS 已拆到 `iroh-mdns-address-lookup 0.5.0`；落地 same-Site bounded candidate tag、direct-IP-only mDNS、Controller-signed 10-min ConnectorLease、16 KiB outer preface 与 `clew/connector/1` opaque pump。real mDNS wrong-Site filter + EndpointAddr connect PASS，real Target→Helper→Controller Noise/Read plaintext-negative tap PASS；workspace 121/0/2。Controller Connector runtime 继续 fail closed，下一块 V1.5b sealed bootstrap/runtime integration。
