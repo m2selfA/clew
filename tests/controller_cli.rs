@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clew_core::TaskId;
 use tempfile::tempdir;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,6 +105,30 @@ fn run_edit(state_dir: &Path, operands: &[&str]) -> Output {
         .arg("old")
         .arg("--new")
         .arg("new")
+        .arg("--state-dir")
+        .arg(state_dir)
+        .output()
+        .unwrap()
+}
+
+fn run_shell_start(state_dir: &Path, operands: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("shell").arg("start");
+    command.args(operands);
+    command
+        .arg("--cwd")
+        .arg(state_dir)
+        .arg("--state-dir")
+        .arg(state_dir)
+        .output()
+        .unwrap()
+}
+
+fn run_shell_followup(state_dir: &Path, operation: &str, task_id: TaskId) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_clew"))
+        .arg("shell")
+        .arg(operation)
+        .arg(task_id.to_string())
         .arg("--state-dir")
         .arg(state_dir)
         .output()
@@ -307,6 +332,46 @@ fn write_and_edit_cli_reuse_shared_device_selection_and_require_preconditions() 
         "{}",
         String::from_utf8_lossy(&edit.stderr)
     );
+}
+
+#[test]
+fn shell_cli_uses_selector_only_for_start_and_task_projection_for_followups() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path();
+    let _controller = spawn_controller(state_dir);
+    wait_until_ready(state_dir);
+
+    let automatic = run_shell_start(state_dir, &["echo automatic"]);
+    assert!(!automatic.status.success());
+    assert!(
+        String::from_utf8_lossy(&automatic.stderr)
+            .contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
+    );
+
+    let named = run_shell_start(state_dir, &["GPU-01", "echo named"]);
+    assert!(!named.status.success());
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+
+    let unknown = TaskId::new();
+    for operation in ["status", "attach", "cancel"] {
+        let output = run_shell_followup(state_dir, operation, unknown);
+        assert!(
+            !output.status.success(),
+            "{operation} unexpectedly succeeded"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Shell task is not available in the current live session"),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

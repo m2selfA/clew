@@ -1,4 +1,4 @@
-use std::{io::Write, path::PathBuf, process::ExitCode};
+use std::{collections::BTreeMap, io::Write, path::PathBuf, process::ExitCode};
 
 #[cfg(any(windows, target_os = "macos"))]
 mod gui;
@@ -9,7 +9,7 @@ mod invite_io;
 mod studio;
 
 use clap::{Args, Parser, Subcommand};
-use clew_core::{DeviceId, InviteId, select_executable_device};
+use clew_core::{DeviceId, InviteId, TaskId, select_executable_device};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
     acquire_host_instance, resolve_host_launch_with_mode,
@@ -22,7 +22,8 @@ use clew_runtime::{
     InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitCloneRequest,
     OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteEditRequest,
     RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteWriteRequest, restore_controller_backup, start_controller,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
+    restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -183,6 +184,11 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
+    /// Manage one bounded live-session Shell task through the Controller.
+    Shell {
+        #[command(subcommand)]
+        command: ShellCommand,
+    },
     /// Rename an enrolled device in the Controller catalog.
     Rename {
         device_id: DeviceId,
@@ -246,6 +252,47 @@ enum Command {
     },
     /// List devices known to the running Controller.
     Devices {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShellCommand {
+    /// Start one Shell task. The optional first operand is a shared device selector.
+    Start {
+        #[arg(value_name = "DEVICE_OR_COMMAND", num_args = 1..=2)]
+        operands: Vec<String>,
+        #[arg(long, value_name = "DIR")]
+        cwd: String,
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        #[arg(long, default_value_t = 300_000)]
+        timeout_ms: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show current state for a Controller-projected live Shell task.
+    Status {
+        task_id: TaskId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Fetch bounded stdout/stderr chunks using absolute byte cursors.
+    Attach {
+        task_id: TaskId,
+        #[arg(long, default_value_t = 0)]
+        stdout_offset: u64,
+        #[arg(long, default_value_t = 0)]
+        stderr_offset: u64,
+        #[arg(long, default_value_t = 12_288)]
+        max_bytes_per_stream: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Request cancellation of a live Shell task.
+    Cancel {
+        task_id: TaskId,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -601,6 +648,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Command::Shell { command } => run_shell_command(command).await?,
         Command::Rename {
             device_id,
             display_name,
@@ -680,6 +728,86 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+async fn run_shell_command(command: ShellCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ShellCommand::Start {
+            operands,
+            cwd,
+            env,
+            timeout_ms,
+            state_dir,
+        } => {
+            let (selector, command) = match operands.as_slice() {
+                [command] => (None, command.clone()),
+                [selector, command] => (Some(selector.as_str()), command.clone()),
+                _ => unreachable!("clap enforces one or two shell start operands"),
+            };
+            let config = controller_config(state_dir)?;
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let task_id = client
+                .shell_start(RemoteShellStartRequest {
+                    device_id,
+                    command,
+                    cwd,
+                    env: parse_shell_env(env)?,
+                    timeout_ms,
+                })
+                .await?;
+            println!("{task_id}");
+        }
+        ShellCommand::Status { task_id, state_dir } => {
+            let status = LocalApiClient::new(controller_config(state_dir)?)
+                .shell_status(task_id)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ShellCommand::Attach {
+            task_id,
+            stdout_offset,
+            stderr_offset,
+            max_bytes_per_stream,
+            state_dir,
+        } => {
+            let output = LocalApiClient::new(controller_config(state_dir)?)
+                .shell_attach(RemoteShellAttachRequest {
+                    task_id,
+                    stdout_offset,
+                    stderr_offset,
+                    max_bytes_per_stream,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        ShellCommand::Cancel { task_id, state_dir } => {
+            LocalApiClient::new(controller_config(state_dir)?)
+                .shell_cancel(task_id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_shell_env(entries: Vec<String>) -> Result<BTreeMap<String, String>, std::io::Error> {
+    let mut env = BTreeMap::new();
+    for entry in entries {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--env must use KEY=VALUE",
+            ));
+        };
+        if env.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("duplicate --env key: {key}"),
+            ));
+        }
+    }
+    Ok(env)
 }
 
 async fn run_outfit_command(command: OutfitCommand) -> Result<(), Box<dyn std::error::Error>> {

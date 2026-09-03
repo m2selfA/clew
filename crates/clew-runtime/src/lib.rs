@@ -12,7 +12,7 @@ mod remote;
 mod transport;
 
 pub use backup::{ControllerBackupIoError, export_controller_backup, restore_controller_backup};
-pub use clew_transport::{FsMutationResult, FsWritePrecondition};
+pub use clew_transport::{FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus};
 pub use config::{ControllerConfig, ControllerConfigError, LocalEndpoint, default_state_root};
 pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerControlStore};
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
@@ -23,7 +23,8 @@ pub use local_api::{
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
     OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest,
-    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteWriteRequest,
+    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteShellAttachRequest,
+    RemoteShellStartRequest, RemoteWriteRequest,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,

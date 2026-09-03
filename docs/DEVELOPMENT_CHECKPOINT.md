@@ -1,8 +1,8 @@
 # Clew Development Checkpoint
 
-状态：**正式开发前基线**
+状态：**正式开发 / V2 Agent Minimum IN PROGRESS**
 架构基线：**Architecture v1.5**
-更新时间：**2026-09-01**
+更新时间：**2026-09-03**
 
 本文是 Clew 开始实现后的**唯一开发进度台账**。`00`–`06` 文档定义产品、架构和已经裁定的边界；本文负责回答四个问题：**现在做到哪一块、这一块怎样算完成、验证过什么、下一块是什么。**
 
@@ -57,7 +57,7 @@
 | V1.4 | Bounded Read + v1 control plane | DONE | Windows/Linux/macOS release gate、live revoke、Read/Activity/backup 全闭合 |
 | V1.25 | Distribution Studio foundation | DONE | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
-| V2 | Agent minimum | IN PROGRESS | filesystem surface + Shell authority/wire/Host live-session core DONE；继续 Controller Shell projection + MCP |
+| V2 | Agent minimum | IN PROGRESS | filesystem + live-session Shell CLI/Local API DONE；继续 MCP stdio + Streamable HTTP |
 | V3 | Reliability | TODO | reconnect/replay/reattach/resume/version negotiation |
 | V4 | Dynamic networking | TODO | TCP forward / SOCKS5 TCP / HTTP CONNECT，listener 归 Controller |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
@@ -880,6 +880,21 @@ V2 filesystem agent surface（Devices/selector + Read/PathInfo/Glob/Grep/Write/E
 
 下一块 V2d-1c：Controller-owned live Shell task projection + DeviceId-only Local API/CLI。Controller 必须把 `TaskId` 绑定启动它的 DeviceId/current live session，Status/Attach/Cancel 不能拿任意 TaskId 去另一设备；Activity 只记录 command 摘要/结果/字节数，不保存 stdout/stderr 全文或 env。V3 继续独占 reconnect 后 reattach/replay。
 
+### V2d-1c — Controller live Shell projection + Local API/CLI
+
+**Status：DONE（2026-09-03）**
+
+- `RemoteHub` 新增纯内存 live projection：`TaskId → {DeviceId, current session token}`；Start 仍由 DeviceId 定位 live device，Status/Attach/Cancel 只接受 TaskId 并由 Controller projection解析，caller 不能自带另一个 DeviceId 把 task 路由到别的设备；同 Device 新 session register、unregister、disconnect 都清理旧 token projection，所以 V2 明确不支持 reconnect 后 reattach；
+- Controller live projection hard cap固定为 `128 remote connections × 64 Host tasks = 8192`，Start 在发命令前 reservation；independent review 又发现 Local API timeout/drop Start future 可能让 Host 已 spawn 但 Controller未登记 TaskId，现将 Host reply/projection completion 移进 `RemoteHub` 内部 completion task：caller消失后仍先拿到 Started 并建立关联，然后自动发送 Cancel并清 projection，避免 orphan command；reservation 使用 RAII，所有错误/cancel路径都会释放；
+- reply correlation fail closed：Status 必须返回同 TaskId status，Attach 必须返回同 TaskId output，CancelAccepted 必须返回同 TaskId；Host wrong-kind/wrong-id直接拒绝。focused projection回归 **2/2 PASS**：A/B 两设备不串路、wrong TaskId reply拒绝、session replacement使旧 TaskId失效；caller abort后 Host晚到 Started会被自动 Cancel且 projection/reservation 清零；
+- Local API 新增 `ShellStart / ShellStatus / ShellAttach / ShellCancel`。Start Controller-side再次检查 catalog/site revoke、`EXECUTE`、enrollment active 与 `effective_grant.shell=true`；follow-up先由 TaskId projection解析 DeviceId，再做同一授权检查；Host V2d-1b仍独立检查 persisted shell grant，形成 Controller+Host 双端 fail closed；
+- CLI 新增 `clew shell start/status/attach/cancel`：只有 Start 支持 shared selector / unique single-device auto-selection；follow-up只接受 TaskId，不重新要求或接受 Device selector。`--env KEY=VALUE` 重复 key 本地拒绝，再由 shell wire contract做 key/value/count/total hard-bound验证；CLI focused **1/1 PASS**；
+- Activity 隐私边界：`shell_start` 只记录 command**首 token（最多64 chars）+ command总字节数**，不记录 command args、explicit env、stdout/stderr；Status/Attach/Cancel只记录 `task:<TaskId>`，Attach仅记录实际返回字节数。真实 Windows product smoke使用 command `echo ...` + private explicit env，Start→Status→Attach PASS，42-byte stdout proof正确，Activity summary=`echo (50 bytes)`且完整 Activity JSON不含 stdout proof或 env value；
+- 默认 Site Kit（无 `--allow-shell`）真实 enrollment 后 `clew shell start` 在 Controller Local API 精确 `Denied: Shell is not permitted for this device`；shell-capable正向 product smoke在 orphan-cancel hardening后再次 PASS；所有 smoke Controller/Host/state均清理；
+- final validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **161 passed / 0 failed / 6 ignored**。
+
+V2d Shell minimum 至此 DONE：这是**live-session persistent task**，不是 reconnect-persistent task。connection loss 后 task reattach/replay 仍严格属于 V3。下一块 V2e：MCP stdio + Streamable HTTP，只做 Controller Local API adapter，不在 MCP 内复制选机/权限/文件/Shell状态。
+
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
 - MCP stdio + Streamable HTTP；
@@ -994,13 +1009,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem + Shell Host live-session core DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem + live-session Shell Local API/CLI DONE）**
 
-**Next block：V2d-1c — Controller live Shell projection + Local API/CLI**
+**Next block：V2e — MCP stdio + Streamable HTTP minimum**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 filesystem surface、Shell signed authority、wire contract 与 Host live-session process/task store 均已闭合；下一步让 Controller 持有当前 live-session task projection，并提供 DeviceId-only Local API/CLI。MCP 仍在后续 V2 子块，connection-loss reattach/replay 仍属于 V3。
+V1.5 已在 `3a20cd2` 正式封板。V2 filesystem 与 live-session Shell 从 signed authority → InnerSession → Host → Controller projection → Local API/CLI 已闭合。下一块 MCP 只能作为 Controller Local API adapter，复用 shared selector 与所有既有 bounds/authority；connection-loss Shell reattach/replay仍属于 V3。
 
 ### Change log
+
+- **2026-09-03** — V2d-1c Controller live Shell projection + Local API/CLI DONE：TaskId绑定 DeviceId+live session token，follow-up无 Device参数；global projection hard cap 8192。independent review修复 Start caller timeout/drop导致 orphan task的风险：RemoteHub internal completion继续接收 Started，caller已消失时自动 Cancel并清 projection，RAII reservation确保无 slot leak。projection/cancellation **2/2 PASS**，CLI **1/1 PASS**；Windows shell-capable product Start→Status→Attach + Activity plaintext-negative PASS，default Site Kit Controller-side Denied PASS；workspace **161/0/6**。V2d DONE，下一块 V2e MCP。
 
 - **2026-09-03** — V2d-1b Host live-session Shell core DONE：`HostShellService` 按 active InnerSession 持有 process/task store；cwd canonical-root 仅约束初始目录（明确不是 filesystem sandbox），`env_clear` + minimal baseline + bounded explicit env，stdout/stderr 32KiB rings，timeout/cancel/session-drop cancellation。independent review 将 64-task capacity 从 post-spawn store check 收紧为 **pre-spawn semaphore admission**。Host focused **3/3 PASS**；no-public Connector 同一 InnerSession 扩展到 Shell Start/Status/Attach **1/1 PASS（3.51s）**；shell-capable same-kit connector-only 降权 **1/1 PASS（2.97s）**。下一块 V2d-1c Controller projection + Local API/CLI。
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::Path,
@@ -10,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use clew_core::{
     ActivityEvent, ActivityResult, ControllerId, ControllerSiteRecord, DeviceId, DeviceRecord,
-    DeviceSummary, InviteId, ReadPolicy, SiteId, StateLayout,
+    DeviceSummary, InviteId, ReadPolicy, SiteId, StateLayout, TaskId,
 };
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
@@ -18,7 +19,8 @@ use clew_transport::{
     FsGlobPage, FsGrepPage, FsMutationErrorBody, FsMutationErrorCode, FsMutationReply,
     FsMutationRequest, FsMutationResult, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode,
     FsQueryReply, FsQueryRequest, FsWritePrecondition, IrohOuter, ReadErrorCode, ReadReply,
-    ReadRequest, noise_static_public,
+    ReadRequest, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase, ShellTaskReply,
+    ShellTaskRequest, ShellTaskStatus, noise_static_public,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -146,6 +148,26 @@ pub struct RemoteEditRequest {
     pub expected_sha256: String,
     pub old: String,
     pub new: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteShellStartRequest {
+    pub device_id: DeviceId,
+    pub command: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteShellAttachRequest {
+    pub task_id: TaskId,
+    #[serde(default)]
+    pub stdout_offset: u64,
+    #[serde(default)]
+    pub stderr_offset: u64,
+    pub max_bytes_per_stream: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -368,6 +390,14 @@ enum LocalMethod {
     Grep(RemoteGrepRequest),
     Write(RemoteWriteRequest),
     Edit(RemoteEditRequest),
+    ShellStart(RemoteShellStartRequest),
+    ShellStatus {
+        task_id: TaskId,
+    },
+    ShellAttach(RemoteShellAttachRequest),
+    ShellCancel {
+        task_id: TaskId,
+    },
     ActivityList {
         limit: u32,
     },
@@ -414,6 +444,7 @@ enum LocalResponse {
     FsQueryError(FsQueryErrorBody),
     FsMutationResult(FsMutationResult),
     FsMutationError(FsMutationErrorBody),
+    ShellTask(ShellTaskReply),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -543,6 +574,31 @@ async fn dispatch(
         LocalMethod::Grep(request) => (grep_response(state, request).await, false),
         LocalMethod::Write(request) => (write_response(state, request).await, false),
         LocalMethod::Edit(request) => (edit_response(state, request).await, false),
+        LocalMethod::ShellStart(request) => (shell_start_response(state, request).await, false),
+        LocalMethod::ShellStatus { task_id } => (
+            shell_followup_response(state, ShellTaskRequest::Status { task_id }, "shell_status")
+                .await,
+            false,
+        ),
+        LocalMethod::ShellAttach(request) => (
+            shell_followup_response(
+                state,
+                ShellTaskRequest::Attach {
+                    task_id: request.task_id,
+                    stdout_offset: request.stdout_offset,
+                    stderr_offset: request.stderr_offset,
+                    max_bytes_per_stream: request.max_bytes_per_stream,
+                },
+                "shell_attach",
+            )
+            .await,
+            false,
+        ),
+        LocalMethod::ShellCancel { task_id } => (
+            shell_followup_response(state, ShellTaskRequest::Cancel { task_id }, "shell_cancel")
+                .await,
+            false,
+        ),
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
                 return (
@@ -985,6 +1041,275 @@ async fn edit_response(state: &LocalApiState, request: RemoteEditRequest) -> Loc
         Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
     };
     fs_mutation_response(state, request.device_id, wire_request, "edit", request.path).await
+}
+
+async fn shell_start_response(
+    state: &LocalApiState,
+    request: RemoteShellStartRequest,
+) -> LocalResponse {
+    let command_summary = shell_command_activity_summary(&request.command);
+    let wire_request = match ShellTaskRequest::start(
+        request.command,
+        request.cwd,
+        request.env,
+        request.timeout_ms,
+    ) {
+        Ok(request) => request,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
+    let (site_id, policy_timeout_ms) = match authorize_shell_device(state, request.device_id) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let started = Instant::now();
+    let remote_timeout = Duration::from_millis(u64::from(policy_timeout_ms).saturating_add(2_000));
+    let remote_result = timeout(
+        remote_timeout,
+        state.remote.shell_start(request.device_id, wire_request),
+    )
+    .await;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let (response, activity_result) = match remote_result {
+        Err(_) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "remote Shell start timed out",
+            ),
+            ActivityResult::TimedOut,
+        ),
+        Ok(Err(_)) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "device is offline or reconnecting",
+            ),
+            ActivityResult::Failed,
+        ),
+        Ok(Ok(ShellTaskReply::Started { task_id })) => (
+            LocalResponse::ShellTask(ShellTaskReply::Started { task_id }),
+            ActivityResult::Succeeded,
+        ),
+        Ok(Ok(ShellTaskReply::Error(error))) => {
+            let result = shell_error_activity_result(error.code);
+            (
+                LocalResponse::ShellTask(ShellTaskReply::Error(error)),
+                result,
+            )
+        }
+        Ok(Ok(_)) => (
+            local_error(
+                LocalApiErrorCode::Internal,
+                "device returned the wrong Shell start result kind",
+            ),
+            ActivityResult::Failed,
+        ),
+    };
+    record_shell_activity(
+        state,
+        site_id,
+        request.device_id,
+        "shell_start",
+        Some(command_summary),
+        activity_result,
+        duration_ms,
+        0,
+    );
+    response
+}
+
+async fn shell_followup_response(
+    state: &LocalApiState,
+    request: ShellTaskRequest,
+    operation: &'static str,
+) -> LocalResponse {
+    let task_id = match &request {
+        ShellTaskRequest::Status { task_id }
+        | ShellTaskRequest::Attach { task_id, .. }
+        | ShellTaskRequest::Cancel { task_id } => *task_id,
+        ShellTaskRequest::Start { .. } => {
+            return local_error(
+                LocalApiErrorCode::InvalidRequest,
+                "Shell follow-up must reference an existing task",
+            );
+        }
+    };
+    if let Err(error) = request.validate() {
+        return local_error(LocalApiErrorCode::InvalidRequest, error.to_string());
+    }
+    let device_id = match state.remote.shell_task_device(task_id) {
+        Ok(device_id) => device_id,
+        Err(_) => {
+            return local_error(
+                LocalApiErrorCode::Unavailable,
+                "Shell task is not available in the current live session",
+            );
+        }
+    };
+    let (site_id, policy_timeout_ms) = match authorize_shell_device(state, device_id) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let started = Instant::now();
+    let remote_timeout = Duration::from_millis(u64::from(policy_timeout_ms).saturating_add(2_000));
+    let remote_result = timeout(remote_timeout, state.remote.shell_task(request)).await;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let (response, activity_result, transferred_bytes) = match remote_result {
+        Err(_) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "remote Shell task request timed out",
+            ),
+            ActivityResult::TimedOut,
+            0,
+        ),
+        Ok(Err(_)) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "Shell task is not available in the current live session",
+            ),
+            ActivityResult::Failed,
+            0,
+        ),
+        Ok(Ok((resolved_device, reply))) if resolved_device == device_id => {
+            let (result, bytes) = shell_reply_activity(&reply);
+            (LocalResponse::ShellTask(reply), result, bytes)
+        }
+        Ok(Ok(_)) => (
+            local_error(
+                LocalApiErrorCode::Internal,
+                "Shell task projection resolved to the wrong device",
+            ),
+            ActivityResult::Failed,
+            0,
+        ),
+    };
+    record_shell_activity(
+        state,
+        site_id,
+        device_id,
+        operation,
+        Some(format!("task:{task_id}")),
+        activity_result,
+        duration_ms,
+        transferred_bytes,
+    );
+    response
+}
+
+fn authorize_shell_device(
+    state: &LocalApiState,
+    device_id: DeviceId,
+) -> Result<(SiteId, u32), LocalResponse> {
+    let store = state.control.lock().map_err(|_| {
+        local_error(
+            LocalApiErrorCode::Internal,
+            "controller state is unavailable",
+        )
+    })?;
+    let Some(device) = store.snapshot().catalog.device(device_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    let Some(enrollment) = store.snapshot().registry.device(device_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    if device.revoked
+        || site.revoked
+        || !device.device.capabilities.execute
+        || !enrollment.effective_grant.shell
+        || !store.snapshot().registry.is_device_active(device_id)
+    {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "Shell is not permitted for this device",
+        ));
+    }
+    Ok((site.site_id, site.read_policy.timeout_ms))
+}
+
+fn shell_command_activity_summary(command: &str) -> String {
+    let token = command.split_whitespace().next().unwrap_or("command");
+    let mut prefix: String = token.chars().take(64).collect();
+    if token.chars().count() > 64 {
+        prefix.push('…');
+    }
+    format!("{prefix} ({} bytes)", command.len())
+}
+
+fn shell_error_activity_result(code: ShellTaskErrorCode) -> ActivityResult {
+    match code {
+        ShellTaskErrorCode::Denied => ActivityResult::Denied,
+        ShellTaskErrorCode::Timeout => ActivityResult::TimedOut,
+        _ => ActivityResult::Failed,
+    }
+}
+
+fn shell_phase_activity_result(phase: ShellTaskPhase) -> ActivityResult {
+    match phase {
+        ShellTaskPhase::Running | ShellTaskPhase::Exited => ActivityResult::Succeeded,
+        ShellTaskPhase::TimedOut => ActivityResult::TimedOut,
+        ShellTaskPhase::Cancelled => ActivityResult::Cancelled,
+        ShellTaskPhase::Failed => ActivityResult::Failed,
+    }
+}
+
+fn shell_reply_activity(reply: &ShellTaskReply) -> (ActivityResult, u64) {
+    match reply {
+        ShellTaskReply::Started { .. } => (ActivityResult::Succeeded, 0),
+        ShellTaskReply::Status(status) => (shell_phase_activity_result(status.phase), 0),
+        ShellTaskReply::Output(output) => {
+            let stdout = output
+                .stdout
+                .decode()
+                .map_or(0_u64, |bytes| bytes.len() as u64);
+            let stderr = output
+                .stderr
+                .decode()
+                .map_or(0_u64, |bytes| bytes.len() as u64);
+            (
+                shell_phase_activity_result(output.status.phase),
+                stdout.saturating_add(stderr),
+            )
+        }
+        ShellTaskReply::CancelAccepted { .. } => (ActivityResult::Cancelled, 0),
+        ShellTaskReply::Error(error) => (shell_error_activity_result(error.code), 0),
+    }
+}
+
+fn record_shell_activity(
+    state: &LocalApiState,
+    site_id: SiteId,
+    device_id: DeviceId,
+    operation: &'static str,
+    summary: Option<String>,
+    result: ActivityResult,
+    duration_ms: u64,
+    transferred_bytes: u64,
+) {
+    if let Ok(now) = unix_ms_value()
+        && let Ok(mut store) = state.control.lock()
+    {
+        let _ = store.record_activity(
+            now,
+            site_id,
+            device_id,
+            operation,
+            summary,
+            result,
+            duration_ms,
+            transferred_bytes,
+        );
+    }
 }
 
 async fn fs_mutation_response(
@@ -1592,6 +1917,84 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn shell_start(
+        &self,
+        request: RemoteShellStartRequest,
+    ) -> Result<TaskId, LocalApiClientError> {
+        match self.request(LocalMethod::ShellStart(request)).await? {
+            LocalResponse::ShellTask(ShellTaskReply::Started { task_id }) => Ok(task_id),
+            LocalResponse::ShellTask(ShellTaskReply::Error(error)) => {
+                Err(LocalApiClientError::ShellTaskRemote {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn shell_status(
+        &self,
+        task_id: TaskId,
+    ) -> Result<ShellTaskStatus, LocalApiClientError> {
+        match self.request(LocalMethod::ShellStatus { task_id }).await? {
+            LocalResponse::ShellTask(ShellTaskReply::Status(status))
+                if status.task_id == task_id =>
+            {
+                Ok(status)
+            }
+            LocalResponse::ShellTask(ShellTaskReply::Error(error)) => {
+                Err(LocalApiClientError::ShellTaskRemote {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn shell_attach(
+        &self,
+        request: RemoteShellAttachRequest,
+    ) -> Result<ShellTaskOutput, LocalApiClientError> {
+        let task_id = request.task_id;
+        match self.request(LocalMethod::ShellAttach(request)).await? {
+            LocalResponse::ShellTask(ShellTaskReply::Output(output))
+                if output.status.task_id == task_id =>
+            {
+                Ok(output)
+            }
+            LocalResponse::ShellTask(ShellTaskReply::Error(error)) => {
+                Err(LocalApiClientError::ShellTaskRemote {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn shell_cancel(&self, task_id: TaskId) -> Result<(), LocalApiClientError> {
+        match self.request(LocalMethod::ShellCancel { task_id }).await? {
+            LocalResponse::ShellTask(ShellTaskReply::CancelAccepted { task_id: actual })
+                if actual == task_id =>
+            {
+                Ok(())
+            }
+            LocalResponse::ShellTask(ShellTaskReply::Error(error)) => {
+                Err(LocalApiClientError::ShellTaskRemote {
+                    code: error.code,
+                    message: error.message,
+                })
+            }
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn activity_list(&self, limit: u32) -> Result<ActivityList, LocalApiClientError> {
         match self.request(LocalMethod::ActivityList { limit }).await? {
             LocalResponse::ActivityList(result) => Ok(result),
@@ -1878,6 +2281,11 @@ pub enum LocalApiClientError {
     #[error("remote filesystem mutation failed ({code:?}): {message}")]
     FsMutationRemote {
         code: FsMutationErrorCode,
+        message: String,
+    },
+    #[error("remote Shell task failed ({code:?}): {message}")]
+    ShellTaskRemote {
+        code: ShellTaskErrorCode,
         message: String,
     },
     #[error("local API request timed out")]

@@ -4,15 +4,16 @@ use std::{
     time::Duration,
 };
 
-use clew_core::{DeviceId, DeviceNameOrigin, DeviceRecord, SiteId};
+use clew_core::{DeviceId, DeviceNameOrigin, DeviceRecord, SiteId, TaskId};
 use clew_host::normalize_hostname;
 use clew_identity::{EnrollmentError, StoredControllerIdentity};
 use clew_transport::{
     BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest,
     BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
     ControllerSessionAuthority, FsMutationReply, FsMutationRequest, FsQueryReply, FsQueryRequest,
-    InnerSession, IrohProtocol, IrohStream, ReadReply, ReadRequest, SealedBootstrapContext,
-    SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease, SiteDiscoveryTag,
+    HARD_MAX_SHELL_TASKS_PER_SESSION, InnerSession, IrohProtocol, IrohStream, ReadReply,
+    ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
+    ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
     read_bootstrap, read_connector_open, write_bootstrap,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -23,6 +24,8 @@ use crate::{ControlStoreError, ControllerControlStore};
 
 pub const MAX_REMOTE_CONNECTIONS: usize = 128;
 const REMOTE_COMMAND_CAPACITY: usize = 16;
+const MAX_REMOTE_SHELL_TASK_PROJECTIONS: usize =
+    MAX_REMOTE_CONNECTIONS * HARD_MAX_SHELL_TASKS_PER_SESSION;
 const CONNECTOR_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
 const SEALED_ACTIVATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -35,12 +38,46 @@ pub struct RemoteHub {
 struct RemoteHubState {
     next_token: u64,
     sessions: BTreeMap<DeviceId, RemoteSessionSlot>,
+    shell_tasks: BTreeMap<TaskId, RemoteShellTaskProjection>,
+    pending_shell_starts: usize,
 }
 
 #[derive(Debug)]
 struct RemoteSessionSlot {
     token: u64,
     tx: mpsc::Sender<RemoteCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteShellTaskProjection {
+    device_id: DeviceId,
+    token: u64,
+}
+
+struct ShellStartReservation {
+    hub: RemoteHub,
+    active: bool,
+}
+
+impl ShellStartReservation {
+    fn new(hub: RemoteHub) -> Self {
+        Self { hub, active: true }
+    }
+
+    fn release(&mut self) {
+        if self.active {
+            if let Ok(mut state) = self.hub.inner.lock() {
+                state.pending_shell_starts = state.pending_shell_starts.saturating_sub(1);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ShellStartReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 #[derive(Debug)]
@@ -56,6 +93,10 @@ enum RemoteCommand {
     FsMutation {
         request: FsMutationRequest,
         reply: oneshot::Sender<Result<FsMutationReply, RemoteHubError>>,
+    },
+    ShellTask {
+        request: ShellTaskRequest,
+        reply: oneshot::Sender<Result<ShellTaskReply, RemoteHubError>>,
     },
     Stop,
 }
@@ -156,10 +197,185 @@ impl RemoteHub {
             .map_err(|_| RemoteHubError::Offline(device_id))?
     }
 
+    pub async fn shell_start(
+        &self,
+        device_id: DeviceId,
+        request: ShellTaskRequest,
+    ) -> Result<ShellTaskReply, RemoteHubError> {
+        if !matches!(request, ShellTaskRequest::Start { .. }) {
+            return Err(RemoteHubError::InvalidShellProjectionRequest);
+        }
+        request.validate()?;
+        let (token, tx) = {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| RemoteHubError::StatePoisoned)?;
+            let Some(slot) = state.sessions.get(&device_id) else {
+                return Err(RemoteHubError::Offline(device_id));
+            };
+            if state
+                .shell_tasks
+                .len()
+                .saturating_add(state.pending_shell_starts)
+                >= MAX_REMOTE_SHELL_TASK_PROJECTIONS
+            {
+                return Err(RemoteHubError::ShellProjectionCapacity);
+            }
+            let token = slot.token;
+            let tx = slot.tx.clone();
+            state.pending_shell_starts += 1;
+            (token, tx)
+        };
+        let reservation = ShellStartReservation::new(self.clone());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(RemoteCommand::ShellTask {
+            request,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| RemoteHubError::Offline(device_id))?;
+
+        let hub = self.clone();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut reservation = reservation;
+            let completion = async {
+                let reply = reply_rx
+                    .await
+                    .map_err(|_| RemoteHubError::Offline(device_id))??;
+                reservation.release();
+                let mut state = hub
+                    .inner
+                    .lock()
+                    .map_err(|_| RemoteHubError::StatePoisoned)?;
+                if !state
+                    .sessions
+                    .get(&device_id)
+                    .is_some_and(|slot| slot.token == token)
+                {
+                    return Err(RemoteHubError::Offline(device_id));
+                }
+                match reply {
+                    ShellTaskReply::Started { task_id } => {
+                        if state.shell_tasks.contains_key(&task_id) {
+                            return Err(RemoteHubError::ShellTaskIdConflict(task_id));
+                        }
+                        state
+                            .shell_tasks
+                            .insert(task_id, RemoteShellTaskProjection { device_id, token });
+                        Ok(ShellTaskReply::Started { task_id })
+                    }
+                    ShellTaskReply::Error(error) => Ok(ShellTaskReply::Error(error)),
+                    _ => Err(RemoteHubError::ShellReplyMismatch),
+                }
+            }
+            .await;
+            let orphan_task = match &completion {
+                Ok(ShellTaskReply::Started { task_id }) => Some(*task_id),
+                _ => None,
+            };
+            if completion_tx.send(completion).is_err()
+                && let Some(task_id) = orphan_task
+            {
+                let _ = hub.shell_task(ShellTaskRequest::Cancel { task_id }).await;
+                if let Ok(mut state) = hub.inner.lock()
+                    && state.shell_tasks.get(&task_id).is_some_and(|projection| {
+                        projection.device_id == device_id && projection.token == token
+                    })
+                {
+                    state.shell_tasks.remove(&task_id);
+                }
+            }
+        });
+        completion_rx
+            .await
+            .map_err(|_| RemoteHubError::Offline(device_id))?
+    }
+
+    pub fn shell_task_device(&self, task_id: TaskId) -> Result<DeviceId, RemoteHubError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?;
+        let Some(projection) = state.shell_tasks.get(&task_id).copied() else {
+            return Err(RemoteHubError::UnknownShellTask(task_id));
+        };
+        if !state
+            .sessions
+            .get(&projection.device_id)
+            .is_some_and(|slot| slot.token == projection.token)
+        {
+            state.shell_tasks.remove(&task_id);
+            return Err(RemoteHubError::UnknownShellTask(task_id));
+        }
+        Ok(projection.device_id)
+    }
+
+    pub async fn shell_task(
+        &self,
+        request: ShellTaskRequest,
+    ) -> Result<(DeviceId, ShellTaskReply), RemoteHubError> {
+        request.validate()?;
+        let task_id =
+            shell_request_task_id(&request).ok_or(RemoteHubError::InvalidShellProjectionRequest)?;
+        let (device_id, token, tx) = {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| RemoteHubError::StatePoisoned)?;
+            let Some(projection) = state.shell_tasks.get(&task_id).copied() else {
+                return Err(RemoteHubError::UnknownShellTask(task_id));
+            };
+            let Some(slot) = state.sessions.get(&projection.device_id) else {
+                state.shell_tasks.remove(&task_id);
+                return Err(RemoteHubError::UnknownShellTask(task_id));
+            };
+            if slot.token != projection.token {
+                state.shell_tasks.remove(&task_id);
+                return Err(RemoteHubError::UnknownShellTask(task_id));
+            }
+            (projection.device_id, projection.token, slot.tx.clone())
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(RemoteCommand::ShellTask {
+            request: request.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| RemoteHubError::Offline(device_id))?;
+        let reply = reply_rx
+            .await
+            .map_err(|_| RemoteHubError::Offline(device_id))??;
+        validate_shell_reply_correlation(&request, &reply)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?;
+        if !state
+            .sessions
+            .get(&device_id)
+            .is_some_and(|slot| slot.token == token)
+        {
+            state.shell_tasks.remove(&task_id);
+            return Err(RemoteHubError::UnknownShellTask(task_id));
+        }
+        if matches!(
+            &reply,
+            ShellTaskReply::Error(error) if error.code == ShellTaskErrorCode::NotFound
+        ) {
+            state.shell_tasks.remove(&task_id);
+        }
+        Ok((device_id, reply))
+    }
+
     pub fn disconnect(&self, device_id: DeviceId) {
         if let Ok(mut state) = self.inner.lock()
             && let Some(slot) = state.sessions.remove(&device_id)
         {
+            state.shell_tasks.retain(|_, projection| {
+                projection.device_id != device_id || projection.token != slot.token
+            });
             let _ = slot.tx.try_send(RemoteCommand::Stop);
         }
     }
@@ -178,6 +394,9 @@ impl RemoteHub {
             .checked_add(1)
             .ok_or(RemoteHubError::TokenOverflow)?;
         let token = state.next_token;
+        state
+            .shell_tasks
+            .retain(|_, projection| projection.device_id != device_id);
         if let Some(previous) = state
             .sessions
             .insert(device_id, RemoteSessionSlot { token, tx })
@@ -195,6 +414,9 @@ impl RemoteHub {
                 .is_some_and(|slot| slot.token == token)
         {
             state.sessions.remove(&device_id);
+            state.shell_tasks.retain(|_, projection| {
+                projection.device_id != device_id || projection.token != token
+            });
         }
     }
 }
@@ -660,6 +882,19 @@ async fn handle_member(
                     break;
                 }
             }
+            RemoteCommand::ShellTask { request, reply } => {
+                let result = async {
+                    inner.send(stream, &request.into_message()?).await?;
+                    let message = inner.recv(stream).await?;
+                    Ok(ShellTaskReply::from_message(&message)?)
+                }
+                .await;
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
             RemoteCommand::Stop => break,
         }
     }
@@ -710,6 +945,44 @@ fn unix_ms() -> Result<u64, RemoteConnectionError> {
         .map_err(|_| RemoteConnectionError::ClockOverflow)
 }
 
+fn shell_request_task_id(request: &ShellTaskRequest) -> Option<TaskId> {
+    match request {
+        ShellTaskRequest::Start { .. } => None,
+        ShellTaskRequest::Status { task_id }
+        | ShellTaskRequest::Attach { task_id, .. }
+        | ShellTaskRequest::Cancel { task_id } => Some(*task_id),
+    }
+}
+
+fn validate_shell_reply_correlation(
+    request: &ShellTaskRequest,
+    reply: &ShellTaskReply,
+) -> Result<(), RemoteHubError> {
+    let expected = shell_request_task_id(request);
+    let matches = match (request, reply) {
+        (ShellTaskRequest::Start { .. }, ShellTaskReply::Started { .. }) => true,
+        (_, ShellTaskReply::Error(_)) => true,
+        (ShellTaskRequest::Status { task_id }, ShellTaskReply::Status(status)) => {
+            status.task_id == *task_id
+        }
+        (ShellTaskRequest::Attach { task_id, .. }, ShellTaskReply::Output(output)) => {
+            output.status.task_id == *task_id
+        }
+        (
+            ShellTaskRequest::Cancel { task_id },
+            ShellTaskReply::CancelAccepted { task_id: actual },
+        ) => actual == task_id,
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else if let Some(task_id) = expected {
+        Err(RemoteHubError::ShellReplyTaskMismatch(task_id))
+    } else {
+        Err(RemoteHubError::ShellReplyMismatch)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RemoteHubError {
     #[error("device {0} is offline")]
@@ -718,12 +991,26 @@ pub enum RemoteHubError {
     StatePoisoned,
     #[error("remote session token overflow")]
     TokenOverflow,
+    #[error("Controller live Shell task projection capacity is exhausted")]
+    ShellProjectionCapacity,
+    #[error("Shell follow-up referenced unknown or stale task {0}")]
+    UnknownShellTask(TaskId),
+    #[error("Shell Host returned duplicate task id {0}")]
+    ShellTaskIdConflict(TaskId),
+    #[error("Shell Host returned the wrong result kind")]
+    ShellReplyMismatch,
+    #[error("Shell Host returned a result for the wrong task; expected {0}")]
+    ShellReplyTaskMismatch(TaskId),
+    #[error("Shell projection request used the wrong Start/follow-up shape")]
+    InvalidShellProjectionRequest,
     #[error(transparent)]
     Inner(#[from] clew_transport::InnerSessionError),
     #[error(transparent)]
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    ShellTask(#[from] clew_transport::ShellTaskProtocolError),
     #[error(transparent)]
     Read(#[from] clew_transport::ReadProtocolError),
 }
@@ -1011,6 +1298,160 @@ mod tests {
         drop(stream);
         connector_outer.close().await;
         controller_outer.close().await;
+    }
+
+    #[tokio::test]
+    async fn shell_projection_binds_task_to_live_device_session_and_reconnect_invalidates_it() {
+        let hub = RemoteHub::default();
+        let device_a = DeviceId::new();
+        let device_b = DeviceId::new();
+        let (_token_a, mut commands_a) = hub.register(device_a).unwrap();
+        let (_token_b, mut commands_b) = hub.register(device_b).unwrap();
+        let task_id = TaskId::new();
+
+        let start_hub = hub.clone();
+        let start = tokio::spawn(async move {
+            start_hub
+                .shell_start(
+                    device_a,
+                    ShellTaskRequest::start(
+                        "echo projection",
+                        "/projection",
+                        BTreeMap::new(),
+                        5_000,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let RemoteCommand::ShellTask { request, reply } = commands_a.recv().await.unwrap() else {
+            panic!("expected Shell Start on Device-A session");
+        };
+        assert!(matches!(request, ShellTaskRequest::Start { .. }));
+        reply.send(Ok(ShellTaskReply::Started { task_id })).unwrap();
+        assert_eq!(
+            start.await.unwrap().unwrap(),
+            ShellTaskReply::Started { task_id }
+        );
+        assert_eq!(hub.shell_task_device(task_id).unwrap(), device_a);
+        assert!(commands_b.try_recv().is_err());
+
+        let status_hub = hub.clone();
+        let status_call = tokio::spawn(async move {
+            status_hub
+                .shell_task(ShellTaskRequest::Status { task_id })
+                .await
+        });
+        let RemoteCommand::ShellTask { request, reply } = commands_a.recv().await.unwrap() else {
+            panic!("expected Shell Status on Device-A session");
+        };
+        assert_eq!(request, ShellTaskRequest::Status { task_id });
+        reply
+            .send(Ok(ShellTaskReply::Status(
+                clew_transport::ShellTaskStatus {
+                    task_id,
+                    phase: clew_transport::ShellTaskPhase::Running,
+                    exit_code: None,
+                    stdout_base_offset: 0,
+                    stdout_next_offset: 0,
+                    stderr_base_offset: 0,
+                    stderr_next_offset: 0,
+                },
+            )))
+            .unwrap();
+        let (resolved_device, status_reply) = status_call.await.unwrap().unwrap();
+        assert_eq!(resolved_device, device_a);
+        assert!(
+            matches!(status_reply, ShellTaskReply::Status(status) if status.task_id == task_id)
+        );
+        assert!(commands_b.try_recv().is_err());
+
+        let mismatch_hub = hub.clone();
+        let mismatch_call = tokio::spawn(async move {
+            mismatch_hub
+                .shell_task(ShellTaskRequest::Status { task_id })
+                .await
+        });
+        let RemoteCommand::ShellTask { reply, .. } = commands_a.recv().await.unwrap() else {
+            panic!("expected second Shell Status on Device-A session");
+        };
+        reply
+            .send(Ok(ShellTaskReply::Status(
+                clew_transport::ShellTaskStatus {
+                    task_id: TaskId::new(),
+                    phase: clew_transport::ShellTaskPhase::Running,
+                    exit_code: None,
+                    stdout_base_offset: 0,
+                    stdout_next_offset: 0,
+                    stderr_base_offset: 0,
+                    stderr_next_offset: 0,
+                },
+            )))
+            .unwrap();
+        assert!(matches!(
+            mismatch_call.await.unwrap(),
+            Err(RemoteHubError::ShellReplyTaskMismatch(actual)) if actual == task_id
+        ));
+
+        let (_replacement_token, _replacement_commands) = hub.register(device_a).unwrap();
+        assert!(matches!(
+            hub.shell_task_device(task_id),
+            Err(RemoteHubError::UnknownShellTask(actual)) if actual == task_id
+        ));
+        assert!(matches!(commands_a.recv().await, Some(RemoteCommand::Stop)));
+    }
+
+    #[tokio::test]
+    async fn aborted_shell_start_is_completed_and_orphan_task_is_cancelled() {
+        let hub = RemoteHub::default();
+        let device_id = DeviceId::new();
+        let (_token, mut commands) = hub.register(device_id).unwrap();
+        let call_hub = hub.clone();
+        let call = tokio::spawn(async move {
+            call_hub
+                .shell_start(
+                    device_id,
+                    ShellTaskRequest::start("echo pending", "/projection", BTreeMap::new(), 5_000)
+                        .unwrap(),
+                )
+                .await
+        });
+        let RemoteCommand::ShellTask { request, reply } = commands.recv().await.unwrap() else {
+            panic!("expected pending Shell Start command");
+        };
+        assert!(matches!(request, ShellTaskRequest::Start { .. }));
+        assert_eq!(hub.inner.lock().unwrap().pending_shell_starts, 1);
+        call.abort();
+        let _ = call.await;
+        let task_id = TaskId::new();
+        reply.send(Ok(ShellTaskReply::Started { task_id })).unwrap();
+
+        let RemoteCommand::ShellTask { request, reply } =
+            tokio::time::timeout(Duration::from_secs(2), commands.recv())
+                .await
+                .expect("orphan Shell task was not cancelled")
+                .unwrap()
+        else {
+            panic!("expected automatic Shell Cancel command");
+        };
+        assert_eq!(request, ShellTaskRequest::Cancel { task_id });
+        reply
+            .send(Ok(ShellTaskReply::CancelAccepted { task_id }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let clean = {
+                    let state = hub.inner.lock().unwrap();
+                    state.pending_shell_starts == 0 && !state.shell_tasks.contains_key(&task_id)
+                };
+                if clean {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("orphan Shell projection was not cleaned up");
     }
 
     #[test]
