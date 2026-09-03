@@ -5,6 +5,7 @@ mod config;
 mod control;
 mod controller;
 mod forward;
+mod http_connect;
 mod local_api;
 mod lock;
 mod outfit;
@@ -21,16 +22,21 @@ pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_
 pub use forward::{
     ForwardInfo, HARD_MAX_FORWARD_LISTENERS, TcpForwardManager, TcpForwardManagerError,
 };
+pub use http_connect::{
+    HARD_MAX_HTTP_CONNECT_HEADER_BYTES, HARD_MAX_HTTP_CONNECT_LISTENERS, HttpConnectInfo,
+    HttpConnectProxyManager, HttpConnectProxyManagerError,
+};
 pub use local_api::{
     ActivityList, BackupExportRequest, ControllerStatus, DeviceList, ForwardAddRequest,
-    ForwardList, InviteIssueRequest, InviteIssueResult, LOCAL_API_VERSION, LocalApiClient,
-    LocalApiClientError, LocalApiErrorCode, MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE,
-    OutfitAssetDataResponse, OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse,
-    OutfitCloneRequest, OutfitCreateRequest, OutfitList, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest,
-    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
-    RemoteWriteRequest, Socks5AddRequest, Socks5List,
+    ForwardList, HttpConnectAddRequest, HttpConnectList, InviteIssueRequest, InviteIssueResult,
+    LOCAL_API_VERSION, LocalApiClient, LocalApiClientError, LocalApiErrorCode,
+    MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
+    OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
+    OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
+    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest,
+    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
+    Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,

@@ -20,11 +20,11 @@ use clew_host::{
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, ForwardAddRequest, FsWritePrecondition,
-    InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitCloneRequest,
-    OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteEditRequest,
-    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
-    restore_controller_backup, start_controller,
+    HttpConnectAddRequest, InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest,
+    OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest,
+    RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
+    RemoteReadRequest, RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
+    Socks5AddRequest, restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -331,6 +331,11 @@ enum ProxyCommand {
         #[command(subcommand)]
         command: Socks5Command,
     },
+    /// Manage a loopback HTTP CONNECT tunnel proxy.
+    HttpConnect {
+        #[command(subcommand)]
+        command: HttpConnectCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -356,6 +361,30 @@ enum Socks5Command {
         state_dir: Option<PathBuf>,
     },
 }
+#[derive(Debug, Subcommand)]
+enum HttpConnectCommand {
+    /// Add a persistent Controller-owned HTTP CONNECT loopback listener.
+    Add {
+        #[arg(value_name = "DEVICE")]
+        device: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        listen_port: u16,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// List Controller-owned HTTP CONNECT listeners.
+    List {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Remove one Controller-owned HTTP CONNECT listener.
+    Remove {
+        proxy_id: ProxyId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum ShellCommand {
     /// Start one Shell task. The optional first operand is a shared device selector.
@@ -817,6 +846,39 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     let info = LocalApiClient::new(controller_config(state_dir)?)
                         .socks5_remove(proxy_id)
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
+            },
+            ProxyCommand::HttpConnect { command } => match command {
+                HttpConnectCommand::Add {
+                    device,
+                    listen_port,
+                    state_dir,
+                } => {
+                    let client = LocalApiClient::new(controller_config(state_dir)?);
+                    let devices = client.device_list().await?;
+                    let device_id = select_executable_device(&devices.devices, device.as_deref())?;
+                    let info = client
+                        .http_connect_add(HttpConnectAddRequest {
+                            device_id,
+                            listen_port,
+                        })
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
+                HttpConnectCommand::List { state_dir } => {
+                    let result = LocalApiClient::new(controller_config(state_dir)?)
+                        .http_connect_list()
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                HttpConnectCommand::Remove {
+                    proxy_id,
+                    state_dir,
+                } => {
+                    let info = LocalApiClient::new(controller_config(state_dir)?)
+                        .http_connect_remove(proxy_id)
                         .await?;
                     println!("{}", serde_json::to_string_pretty(&info)?);
                 }

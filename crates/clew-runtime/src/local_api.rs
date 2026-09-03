@@ -31,10 +31,10 @@ use tokio::{
 };
 
 use crate::{
-    ControllerConfig, ControllerControlStore, ForwardInfo, LocalEndpoint, OutfitAssetInfo,
-    OutfitAssetStore, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub,
-    RemoteSessionInfo, RemoteSessionState, Socks5Info, Socks5ProxyManager, TcpForwardManager,
-    export_controller_backup, transport,
+    ControllerConfig, ControllerControlStore, ForwardInfo, HttpConnectInfo,
+    HttpConnectProxyManager, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore, OutfitEditPatch,
+    OutfitLibrary, OutfitLibraryEntry, RemoteHub, RemoteSessionInfo, RemoteSessionState,
+    Socks5Info, Socks5ProxyManager, TcpForwardManager, export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -197,6 +197,18 @@ pub struct Socks5AddRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Socks5List {
     pub proxies: Vec<Socks5Info>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HttpConnectAddRequest {
+    pub device_id: DeviceId,
+    #[serde(default)]
+    pub listen_port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HttpConnectList {
+    pub proxies: Vec<HttpConnectInfo>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteSessionPathInfo {
@@ -395,6 +407,7 @@ pub(crate) struct LocalApiState {
     pub remote: RemoteHub,
     pub forwards: TcpForwardManager,
     pub socks5: Socks5ProxyManager,
+    pub http_connect: HttpConnectProxyManager,
     pub shutdown_tx: watch::Sender<bool>,
 }
 
@@ -446,6 +459,11 @@ enum LocalMethod {
     Socks5Add(Socks5AddRequest),
     Socks5List,
     Socks5Remove {
+        proxy_id: ProxyId,
+    },
+    HttpConnectAdd(HttpConnectAddRequest),
+    HttpConnectList,
+    HttpConnectRemove {
         proxy_id: ProxyId,
     },
     ActivityList {
@@ -500,6 +518,8 @@ enum LocalResponse {
     ForwardList(ForwardList),
     Socks5Info(Socks5Info),
     Socks5List(Socks5List),
+    HttpConnectInfo(HttpConnectInfo),
+    HttpConnectList(HttpConnectList),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -666,6 +686,13 @@ async fn dispatch(
         LocalMethod::Socks5List => (socks5_list_response(state), false),
         LocalMethod::Socks5Remove { proxy_id } => {
             (socks5_remove_response(state, proxy_id).await, false)
+        }
+        LocalMethod::HttpConnectAdd(request) => {
+            (http_connect_add_response(state, request).await, false)
+        }
+        LocalMethod::HttpConnectList => (http_connect_list_response(state), false),
+        LocalMethod::HttpConnectRemove { proxy_id } => {
+            (http_connect_remove_response(state, proxy_id).await, false)
         }
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
@@ -1429,6 +1456,69 @@ async fn socks5_remove_response(state: &LocalApiState, proxy_id: ProxyId) -> Loc
         Err(error) => local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
     }
 }
+async fn http_connect_add_response(
+    state: &LocalApiState,
+    request: HttpConnectAddRequest,
+) -> LocalResponse {
+    let site_id = match authorize_tcp_egress_device(state, request.device_id) {
+        Ok(site_id) => site_id,
+        Err(response) => return response,
+    };
+    let started = Instant::now();
+    match state
+        .http_connect
+        .add(request.device_id, request.listen_port)
+        .await
+    {
+        Ok(info) => {
+            record_shell_activity(
+                state,
+                site_id,
+                request.device_id,
+                "http_connect_add",
+                Some(info.listen_addr.to_string()),
+                ActivityResult::Succeeded,
+                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                0,
+            );
+            LocalResponse::HttpConnectInfo(info)
+        }
+        Err(error) => local_error(LocalApiErrorCode::Unavailable, error.to_string()),
+    }
+}
+
+fn http_connect_list_response(state: &LocalApiState) -> LocalResponse {
+    match state.http_connect.list() {
+        Ok(proxies) => LocalResponse::HttpConnectList(HttpConnectList { proxies }),
+        Err(error) => local_error(LocalApiErrorCode::Internal, error.to_string()),
+    }
+}
+
+async fn http_connect_remove_response(state: &LocalApiState, proxy_id: ProxyId) -> LocalResponse {
+    match state.http_connect.remove(proxy_id).await {
+        Ok(info) => {
+            if let Ok(store) = state.control.lock()
+                && let Some(device) = store.snapshot().catalog.device(info.device_id)
+            {
+                let site_id = device.device.site_id;
+                drop(store);
+                record_shell_activity(
+                    state,
+                    site_id,
+                    info.device_id,
+                    "http_connect_remove",
+                    Some(info.listen_addr.to_string()),
+                    ActivityResult::Cancelled,
+                    0,
+                    0,
+                );
+            }
+            LocalResponse::HttpConnectInfo(info)
+        }
+        Err(error) => local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    }
+}
+
 fn authorize_tcp_egress_device(
     state: &LocalApiState,
     device_id: DeviceId,
@@ -2345,6 +2435,39 @@ impl LocalApiClient {
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
     }
+
+    pub async fn http_connect_add(
+        &self,
+        request: HttpConnectAddRequest,
+    ) -> Result<HttpConnectInfo, LocalApiClientError> {
+        match self.request(LocalMethod::HttpConnectAdd(request)).await? {
+            LocalResponse::HttpConnectInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn http_connect_list(&self) -> Result<HttpConnectList, LocalApiClientError> {
+        match self.request(LocalMethod::HttpConnectList).await? {
+            LocalResponse::HttpConnectList(proxies) => Ok(proxies),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn http_connect_remove(
+        &self,
+        proxy_id: ProxyId,
+    ) -> Result<HttpConnectInfo, LocalApiClientError> {
+        match self
+            .request(LocalMethod::HttpConnectRemove { proxy_id })
+            .await?
+        {
+            LocalResponse::HttpConnectInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
     pub async fn activity_list(&self, limit: u32) -> Result<ActivityList, LocalApiClientError> {
         match self.request(LocalMethod::ActivityList { limit }).await? {
             LocalResponse::ActivityList(result) => Ok(result),
@@ -2699,6 +2822,7 @@ mod tests {
             remote: RemoteHub::default(),
             forwards: TcpForwardManager::new(RemoteHub::default()),
             socks5: Socks5ProxyManager::new(RemoteHub::default()),
+            http_connect: HttpConnectProxyManager::new(RemoteHub::default()),
             shutdown_tx: watch::channel(false).0,
         }
     }

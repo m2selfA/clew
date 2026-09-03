@@ -269,13 +269,42 @@ pub(crate) async fn pump_forward_connection(
     generation: u64,
     connection_id: ForwardConnectionId,
     local: &mut TcpStream,
+    shutdown: watch::Receiver<bool>,
+) {
+    pump_forward_connection_with_initial(
+        remote,
+        device_id,
+        generation,
+        connection_id,
+        local,
+        shutdown,
+        &[],
+    )
+    .await;
+}
+
+pub(crate) async fn pump_forward_connection_with_initial(
+    remote: RemoteHub,
+    device_id: DeviceId,
+    generation: u64,
+    connection_id: ForwardConnectionId,
+    local: &mut TcpStream,
     mut shutdown: watch::Receiver<bool>,
+    initial_write: &[u8],
 ) {
     let _ = local.set_nodelay(true);
+    let mut initial_offset = 0_usize;
     let mut local_eof_sent = false;
     let mut local_buffer = vec![0_u8; HARD_MAX_TCP_FORWARD_CHUNK_BYTES as usize];
     loop {
-        let (write, write_eof) = if local_eof_sent {
+        let (write, write_eof) = if initial_offset < initial_write.len() {
+            let end = initial_offset
+                .saturating_add(HARD_MAX_TCP_FORWARD_CHUNK_BYTES as usize)
+                .min(initial_write.len());
+            let write = initial_write[initial_offset..end].to_vec();
+            initial_offset = end;
+            (write, false)
+        } else if local_eof_sent {
             (Vec::new(), false)
         } else {
             match tokio::select! {

@@ -15,6 +15,7 @@ pub const IMPLEMENTED_FEATURES: &[v1::Feature] = &[
     v1::Feature::ShellTask,
     v1::Feature::Forward,
     v1::Feature::Socks5,
+    v1::Feature::HttpConnect,
 ];
 
 pub trait ValidateWire {
@@ -378,19 +379,27 @@ mod tests {
         ];
         peer.features = local.features.clone();
 
-        for feature in [v1::Feature::Forward, v1::Feature::Socks5] {
+        for feature in [
+            v1::Feature::Forward,
+            v1::Feature::Socks5,
+            v1::Feature::HttpConnect,
+        ] {
             assert!(hello_advertises_feature(&local, feature));
             assert!(locally_implements_feature(feature));
             assert!(feature_negotiated(&local, &peer, feature).unwrap());
         }
-        for feature in [v1::Feature::HttpConnect, v1::Feature::FileResume] {
+        for feature in [v1::Feature::FileResume] {
             assert!(hello_advertises_feature(&local, feature));
             assert!(!locally_implements_feature(feature));
             assert!(!feature_negotiated(&local, &peer, feature).unwrap());
         }
         assert_eq!(
             negotiated_implemented_features(&local, &peer).unwrap(),
-            vec![v1::Feature::Forward, v1::Feature::Socks5]
+            vec![
+                v1::Feature::Forward,
+                v1::Feature::Socks5,
+                v1::Feature::HttpConnect,
+            ]
         );
     }
 

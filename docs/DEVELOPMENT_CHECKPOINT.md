@@ -1070,7 +1070,7 @@ V3e至此封板。下一块 V3f：wire/capability compatibility matrix。重点�
 
 ## 11. V4 — Dynamic Networking
 
-**Status：IN PROGRESS（V4a + V4b DONE；TCP forward + SOCKS5 TCP DONE）**
+**Status：DONE（2026-09-04；V4a–V4c 全部封板）**
 
 ### V4a-0 — Signed TCP egress authority projection
 
@@ -1114,6 +1114,22 @@ V4a TCP forward至此封板。下一块 V4b：SOCKS5 TCP egress，必须复用�
 - focused SOCKS5 parser/manager **2/2 PASS**；workspace `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **195 passed / 0 failed / 6 ignored**。
 
 V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 Controller-owned loopback adapter + V4a TCP primitive；只实现 CONNECT tunnel，不实现普通forward-proxy GET/POST，不允许non-loopback listener。
+
+### V4c — Controller-owned HTTP CONNECT adapter
+
+**Status：DONE（2026-09-04）**
+
+- HTTP CONNECT 同样不新增第二套远端TCP data plane：Controller `HttpConnectProxyManager` 只拥有loopback listener与HTTP handshake，成功CONNECT后继续调用V4a `open_forward_connection + pump_forward_connection`；Target仍只通过authenticated InnerSession执行outbound TCP，Helper若在路径中仍只看ciphertext；
+- listener固定 `127.0.0.1:<port>`，port 0可由OS分配；proxy/listener与accepted connection上限继续为 **64**。HTTP header hard cap **16 KiB**、handshake timeout **5s**；只接受HTTP/1.0/1.1 `CONNECT authority`，支持`host:port`与`[IPv6]:port`，最终destination继续复用`TcpForwardDestination`的255-byte ASCII/nonzero-port约束；
+- 普通forward-proxy GET/POST明确不实现：非CONNECT请求返回 **405 Method Not Allowed**。malformed/invalid authority返回400，header过大431，handshake timeout408；Target connect错误按Denied/Timeout/Capacity/ConnectFailed映射为403/504/503/502等明确HTTP失败响应；非loopback listener继续不开放；
+- independent review专门修复CONNECT parser“读过header”的数据丢失风险：parser保留 `\r\n\r\n` 后已预读的tunnel bytes，V4a pump新增`initial_write`入口并按原 **12 KiB** chunk bound先发这批bytes；普通Forward/SOCKS5继续传空initial，不改变原路径；focused test用单write `CONNECT ...\r\n\r\nTLS-TAIL` 精确证明tail保留；
+- `ProxyId`继续作为Controller-owned listener identity；Local API/CLI新增 `proxy http-connect add/list/remove`，add复用与Forward/SOCKS5相同的`authorize_tcp_egress_device`，默认/legacy/helper-only fail closed。`Feature::HttpConnect`从V3f reserved提升进当前`IMPLEMENTED_FEATURES`；当前V4 `Forward + Socks5 + HttpConnect`显式可协商，FileResume仍不能；
+- exact Windows binary SHA-256 `9254535817e340deab79c7649b88a319f1543f42076bf62be5d23c4d6ac31835`（96,984,576 bytes），cap00/Gamma hash与size一致。真实 cap00 Controller + Gamma Target：positive DeviceId `ac522bc0-c501-4069-ad68-55e9c948d9b0`、Gamma echo `127.0.0.1:45692`；`proxy http-connect add`返回后CLI退出，Controller持续持有`127.0.0.1:58228`；
+- 核心真实gate使用**单次TCP write**发送`CONNECT 127.0.0.1:45692 HTTP/1.1 + headers + CLEW-V4C-PIPELINED`，独立client随后精确得到`HTTP/1.1 200 Connection Established`且紧随的tunnel echo为`CLEW-V4C-PIPELINED`，证明预读tail没有被parser吞掉；同listener普通GET精确返回405；
+- 同Controller默认未签tcp_egress的第二Site DeviceId `adba8872-cda9-4330-80f6-6dae52b8b050`对`proxy http-connect add`精确Controller-side `Denied: TCP egress is not permitted for this device`；正向proxy `52db2b13-aa4a-4a16-b4bb-33e120730689` remove后`127.0.0.1:58228`不再accept且list为空；两台Host/echo/Controller与本地/远端fixture均已清理；
+- focused HTTP parser/manager **2/2 PASS**，feature matrix **1/1 PASS**；final `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **197 passed / 0 failed / 6 ignored**。
+
+**V4 Dynamic Networking 至此 DONE。** 当前完成local TCP forward、SOCKS5 TCP CONNECT、HTTP CONNECT，以及Controller listener ownership与TCP non-migration语义；SOCKS5 UDP、普通HTTP forward proxy、remote/non-loopback listener继续明确后置。下一阶段进入V5 File Plane。
 
 - TCP forward；
 - SOCKS5 TCP egress；
@@ -1202,13 +1218,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V4 — Dynamic Networking（IN PROGRESS；V4a TCP forward + V4b SOCKS5 TCP DONE）**
+**Current block：V4 — Dynamic Networking（DONE，2026-09-04）**
 
-**Next block：V4c — HTTP CONNECT**
+**Next block：V5a — File Plane single-file manifest/chunk foundation**
 
-V3 已在 `524ba88` 完整封板。V4现在已有一个authoritative TCP egress primitive：owner显式签 `tcp_egress`，Controller只持有loopback listener，Target通过同一InnerSession执行bounded outbound TCP，已建立stream严格绑定generation且不迁移。V4b SOCKS5只作为该primitive的协议adapter，真实raw SOCKS5 CONNECT/echo、默认授权negative、UDP ASSOCIATE拒绝与CLI-exit listener ownership均已PASS。下一块只增加HTTP CONNECT adapter；普通forward-proxy GET/POST、remote/non-loopback listener继续后置。
+V3已在`524ba88`封板，V4也已完整闭合：signed `tcp_egress` owner opt-in、Controller-owned loopback TCP listener、generation-bound non-migrating TCP primitive、SOCKS5 TCP CONNECT与HTTP CONNECT都复用同一Target↔Controller InnerSession数据面。V4c真实单-write CONNECT+payload gate证明HTTP parser不会吞首批tunnel bytes；默认未授权Site、UDP ASSOCIATE、普通HTTP GET、remove/port-close等负面边界均fail closed。下一阶段进入V5 File Plane；先做单文件manifest/chunk/hash/control contract，不提前混入directory tree或大并发调度。
 
 ### Change log
+
+- **2026-09-04** — V4c HTTP CONNECT DONE / **V4 Dynamic Networking DONE**：Controller-owned loopback CONNECT adapter复用V4a TCP primitive；16KiB header/5s handshake，只CONNECT，GET=405，支持`host:port`/`[IPv6]:port`。independent review增加initial-tail pump，真实single-write `CONNECT+CLEW-V4C-PIPELINED`经Gamma echo返回200+exact proof；default Site add Denied，remove后port-close。exact binary `92545358...31835`，workspace **197/0/6**。下一阶段V5 File Plane。
 
 - **2026-09-04** — V4b SOCKS5 TCP CONNECT DONE：Controller-owned loopback SOCKS5 v5/no-auth adapter复用V4a `open+pump` primitive，不复制TCP data plane；仅CONNECT，UDP ASSOCIATE明确拒绝。exact binary `4cf27090...e139` cap00→Gamma raw `METHOD=5,0 / REP=0` + echo `CLEW-V4B-SOCKS5-PROOF` PASS，default Site add Controller-side Denied，remove后port-close；workspace **195/0/6**。下一块V4c HTTP CONNECT。
 
