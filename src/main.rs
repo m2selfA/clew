@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::Write, path::PathBuf, process::ExitCode};
+use std::{collections::BTreeMap, io::Write, net::SocketAddr, path::PathBuf, process::ExitCode};
 
 #[cfg(any(windows, target_os = "macos"))]
 mod gui;
@@ -267,6 +267,13 @@ enum Command {
 enum McpCommand {
     /// Serve MCP over stdin/stdout. The Controller remains the only state owner.
     Stdio {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Serve MCP Streamable HTTP on a loopback-only listener.
+    Http {
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:4877")]
+        listen: SocketAddr,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -667,6 +674,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Mcp { command } => match command {
             McpCommand::Stdio { state_dir } => {
                 mcp::serve_stdio(controller_config(state_dir)?).await?;
+            }
+            McpCommand::Http { listen, state_dir } => {
+                mcp::serve_http(controller_config(state_dir)?, listen).await?;
             }
         },
         Command::Rename {

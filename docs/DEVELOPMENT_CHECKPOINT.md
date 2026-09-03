@@ -57,7 +57,7 @@
 | V1.4 | Bounded Read + v1 control plane | DONE | Windows/Linux/macOS release gate、live revoke、Read/Activity/backup 全闭合 |
 | V1.25 | Distribution Studio foundation | DONE | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
-| V2 | Agent minimum | IN PROGRESS | filesystem + live-session Shell CLI/Local API DONE；继续 MCP stdio + Streamable HTTP |
+| V2 | Agent minimum | DONE | selector + bounded filesystem + live-session Shell + MCP stdio/Streamable HTTP 全闭合 |
 | V3 | Reliability | TODO | reconnect/replay/reattach/resume/version negotiation |
 | V4 | Dynamic networking | TODO | TCP forward / SOCKS5 TCP / HTTP CONNECT，listener 归 Controller |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
@@ -772,7 +772,7 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 
 ## 9. V2 — Agent Minimum
 
-**Status：IN PROGRESS（filesystem surface + V2d-0/1a/1b Shell core DONE）**
+**Status：DONE（2026-09-03）**
 
 ### V2a — Shared device selection + selector-aware bounded Read
 
@@ -908,7 +908,19 @@ V2d Shell minimum 至此 DONE：这是**live-session persistent task**，不是 
 - 真实 Windows Host product smoke：默认 read Site Kit下 MCP `read`真实返回19-byte `CLEW-MCP-STDIO-READ`；另一个 `--allow-write --allow-shell` Site Kit通过 MCP wire连续 `PathInfo → Glob → Grep → Write(create-only) → Edit(expected SHA) → Read verify → Shell Start → Status → Attach` 全 PASS；所有 smoke state/process均清理；
 - focused MCP unit **2/2 PASS**（exact V2 tool surface + UTF-8-safe bounded error）；final `cargo fmt -- --check` PASS，`cargo check --workspace --all-targets` PASS / 0 warnings，`cargo test --workspace --all-targets` **163 passed / 0 failed / 6 ignored**。
 
-下一块 V2e-2：Streamable HTTP。继续复用同一个 `ClewMcpServer`/LocalApiClient tool router，只新增 localhost HTTP transport；HTTP listener不得绑定非-loopback默认地址，也不把 MCP session语义拿来实现 V3 Shell reconnect/reattach。
+### V2e-2 — MCP Streamable HTTP Local API adapter
+
+**Status：DONE（2026-09-03）**
+
+- `clew mcp http` 继续复用 V2e-1 的同一个 `ClewMcpServer` / `LocalApiClient` / shared selector / 11-tool router，只新增官方 `rmcp 3.2.0` Streamable HTTP server transport；MCP HTTP 不拥有 Controller state、Host、iroh 或 InnerSession；
+- 默认 listener 为 `127.0.0.1:4877`，`--listen` 只接受 IPv4/IPv6 loopback，非 loopback 地址在启动 Controller/bind listener 前直接拒绝；endpoint 仅挂载 `/mcp`；HTTP request body hard cap **128 KiB**；
+- independent security review 补齐本机浏览器/DNS-rebinding 边界：保留 rmcp 的 loopback `Host` validation，并在 listener **实际 bind 后**按真实 port 显式配置 Origin allowlist，仅允许 `http://<bound-loopback>:<port>` 与 `http://localhost:<port>`；无 `Origin` 的原生 MCP client 仍可用，恶意 Host/Origin fail closed；
+- 真实 Windows HTTP product smoke 使用独立 Controller + 独立 HTTP adapter：MCP `2025-06-18` initialize **200**；`tools/list` **200** 且仍精确 11 tools；同端口 loopback Origin **200**；`Host: evil.example` **403**；`Origin: https://evil.example` **403**；约 140 KiB request **413**；
+- HTTP adapter 停止后独立 Controller 仍 `ready=true`，随后通过 authenticated Local API `shutdown` 正常退出；临时 state 全部清理，证明 HTTP adapter 生命周期不成为 Controller owner；
+- focused MCP unit **4/4 PASS**（loopback listener、exact Origin allowlist、tool surface、UTF-8-safe bounded error）；final `cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **165 passed / 0 failed / 6 ignored**；
+- V2 不使用 MCP HTTP session 实现 Shell reconnect/reattach/replay；这些恢复语义仍严格属于 V3。
+
+V2 Agent Minimum 至此 DONE：coding agent 已可通过 CLI、MCP stdio 或 loopback Streamable HTTP，以同一 authoritative selector/Local API 完成 Devices + bounded Read/PathInfo/Glob/Grep + atomic Write/Edit + live-session Shell task。下一阶段进入 V3 Reliability。
 
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
@@ -1024,13 +1036,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；MCP stdio DONE）**
+**Current block：V2 — Agent Minimum（DONE）**
 
-**Next block：V2e-2 — MCP Streamable HTTP minimum**
+**Next block：V3 — Reliability**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 filesystem/live-session Shell与 MCP stdio Local API adapter均已闭合。下一块只增加 localhost Streamable HTTP transport，并复用完全相同的 MCP tool router；connection-loss Shell reattach/replay仍属于 V3。
+V1.5 已在 `3a20cd2` 正式封板；V2 的 selector、bounded filesystem、live-session Shell、MCP stdio 与 loopback Streamable HTTP 现在全部闭合。下一阶段开始 V3 的 reconnect / replay matrix / Shell reattach / sleep-resume / compatibility，不回填到 V2。
 
 ### Change log
+
+- **2026-09-03** — V2e-2 MCP Streamable HTTP DONE / V2 Agent Minimum DONE：`clew mcp http` 复用同一 LocalApiClient/11-tool router，仅增加 loopback HTTP transport；非-loopback bind拒绝，128KiB body hard cap。independent review补显式 same-port Origin allowlist，结合 rmcp loopback Host validation抵御浏览器 cross-origin/DNS-rebinding；真实 HTTP initialize/tools/list PASS，allowed Origin 200、bad Host 403、bad Origin 403、140KiB body 413；HTTP adapter退出后 Controller仍存活并可 authenticated shutdown。workspace **165/0/6**。下一阶段 V3 Reliability。
 
 - **2026-09-03** — V2e-1 MCP stdio DONE：接入官方 `rmcp 3.2.0`，`clew mcp stdio`只持有 LocalApiClient/shared selector，11个 typed tools覆盖 Devices + filesystem + live Shell；MCP可在 Controller缺席时拉起同一个 single-owner Controller且自身退出不拆 Controller。raw initialize/tools/list/devices smoke、real Host MCP Read、write+shell full surface sweep均 PASS；workspace **163/0/6**。下一块 V2e-2 Streamable HTTP。
 

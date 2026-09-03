@@ -8,6 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 argon2 = "0.6.0"
+axum = "0.8.9"
 base64 = "0.22.1"
 chacha20poly1305 = "0.11.0"
 ed25519-dalek = "3.0.0"
@@ -23,7 +24,7 @@ prost-build = "0.14.4"
 resvg = "0.48.1"
 protoc-bin-vendored = "3.2.0"
 regex = "1.13"
-rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "schemars"] }
+rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
@@ -41,6 +42,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 clew-core = { path = "crates/clew-core" }

@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
     error::Error,
+    net::SocketAddr,
     process::{Command, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,7 +20,12 @@ use rmcp::{
     model::{CallToolResult, ContentBlock},
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
-    transport::stdio,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
+    },
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -31,6 +38,7 @@ const MCP_DEFAULT_SHELL_TIMEOUT_MS: u32 = 300_000;
 const MCP_DEFAULT_SHELL_ATTACH_BYTES: u32 = 12_288;
 const MCP_ERROR_TEXT_BYTES: usize = 2_048;
 const MCP_CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(8);
+const MCP_HTTP_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug)]
 struct ClewMcpServer {
@@ -482,6 +490,54 @@ pub async fn serve_stdio(config: ControllerConfig) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+pub async fn serve_http(
+    config: ControllerConfig,
+    listen: SocketAddr,
+) -> Result<(), Box<dyn Error>> {
+    validate_http_listen(listen)?;
+    ensure_controller(&config).await?;
+
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let actual = listener.local_addr()?;
+    let server = ClewMcpServer::new(config);
+    let http_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_allowed_origins(http_allowed_origins(actual))
+        .with_max_request_body_bytes(MCP_HTTP_MAX_REQUEST_BODY_BYTES);
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        http_config,
+    );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    println!("Clew MCP Streamable HTTP ready at http://{actual}/mcp");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
+
+fn validate_http_listen(listen: SocketAddr) -> Result<(), Box<dyn Error>> {
+    if !listen.ip().is_loopback() {
+        return Err(
+            format!("Clew V2 MCP HTTP requires a loopback listener; refused {listen}").into(),
+        );
+    }
+    Ok(())
+}
+
+fn http_allowed_origins(listen: SocketAddr) -> Vec<String> {
+    let port = listen.port();
+    let direct = match listen.ip() {
+        std::net::IpAddr::V4(ip) => format!("http://{ip}:{port}"),
+        std::net::IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
+    };
+    vec![direct, format!("http://localhost:{port}")]
+}
+
 async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn Error>> {
     let client = LocalApiClient::new(config.clone());
     if client.controller_status().await.is_ok() {
@@ -548,6 +604,32 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamable_http_listen_is_loopback_only() {
+        assert!(validate_http_listen("127.0.0.1:0".parse().unwrap()).is_ok());
+        assert!(validate_http_listen("[::1]:0".parse().unwrap()).is_ok());
+        assert!(validate_http_listen("0.0.0.0:4877".parse().unwrap()).is_err());
+        assert!(validate_http_listen("192.0.2.1:4877".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn streamable_http_origin_allowlist_is_exact_to_the_bound_loopback_port() {
+        assert_eq!(
+            http_allowed_origins("127.0.0.1:4877".parse().unwrap()),
+            vec![
+                "http://127.0.0.1:4877".to_owned(),
+                "http://localhost:4877".to_owned(),
+            ]
+        );
+        assert_eq!(
+            http_allowed_origins("[::1]:4878".parse().unwrap()),
+            vec![
+                "http://[::1]:4878".to_owned(),
+                "http://localhost:4878".to_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn mcp_error_text_is_utf8_safe_and_bounded() {
