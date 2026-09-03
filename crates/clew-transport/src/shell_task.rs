@@ -16,6 +16,7 @@ pub const HARD_MAX_SHELL_TIMEOUT_MS: u32 = 30 * 60 * 1_000;
 pub const HARD_MAX_SHELL_TASKS_PER_SESSION: usize = 64;
 pub const HARD_MAX_SHELL_RETAINED_BYTES_PER_STREAM: usize = 32 * 1024;
 pub const HARD_MAX_SHELL_ATTACH_BYTES_PER_STREAM: u32 = 12 * 1024;
+pub const SHELL_RECONNECT_GRACE_MS: u64 = 30_000;
 const MAX_SHELL_ERROR_MESSAGE_BYTES: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

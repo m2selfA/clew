@@ -2,15 +2,18 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use clew_core::{ReadPolicy, TaskId};
 use clew_transport::{
-    HARD_MAX_SHELL_RETAINED_BYTES_PER_STREAM, HARD_MAX_SHELL_TASKS_PER_SESSION, ShellOutputChunk,
-    ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase, ShellTaskReply, ShellTaskRequest,
-    ShellTaskStatus,
+    HARD_MAX_SHELL_RETAINED_BYTES_PER_STREAM, HARD_MAX_SHELL_TASKS_PER_SESSION,
+    SHELL_RECONNECT_GRACE_MS, ShellOutputChunk, ShellTaskErrorCode, ShellTaskOutput,
+    ShellTaskPhase, ShellTaskReply, ShellTaskRequest, ShellTaskStatus,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -29,15 +32,34 @@ pub struct HostShellService {
 struct HostShellServiceInner {
     tasks: Mutex<HostShellTaskStore>,
     capacity: Arc<Semaphore>,
+    session_epoch: AtomicU64,
+    session_attached: AtomicBool,
+    reconnect_grace: Duration,
 }
 
 impl Drop for HostShellServiceInner {
     fn drop(&mut self) {
         if let Ok(tasks) = self.tasks.get_mut() {
-            for entry in tasks.tasks.values() {
-                let _ = entry.cancel.send(true);
-            }
+            cancel_all_tasks(tasks);
         }
+    }
+}
+
+pub(crate) struct HostShellSessionGuard {
+    inner: Weak<HostShellServiceInner>,
+    epoch: u64,
+}
+
+impl Drop for HostShellSessionGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.session_epoch.load(Ordering::SeqCst) != self.epoch {
+            return;
+        }
+        inner.session_attached.store(false, Ordering::SeqCst);
+        schedule_reconnect_grace(&inner, self.epoch);
     }
 }
 
@@ -123,14 +145,37 @@ impl RetainedBytes {
 
 impl HostShellService {
     pub fn new(policy: ReadPolicy) -> Result<Self, clew_core::ControlModelError> {
+        Self::new_with_reconnect_grace(policy, Duration::from_millis(SHELL_RECONNECT_GRACE_MS))
+    }
+
+    fn new_with_reconnect_grace(
+        policy: ReadPolicy,
+        reconnect_grace: Duration,
+    ) -> Result<Self, clew_core::ControlModelError> {
         policy.validate()?;
         Ok(Self {
             policy,
             inner: Arc::new(HostShellServiceInner {
                 tasks: Mutex::new(HostShellTaskStore::default()),
                 capacity: Arc::new(Semaphore::new(HARD_MAX_SHELL_TASKS_PER_SESSION)),
+                session_epoch: AtomicU64::new(0),
+                session_attached: AtomicBool::new(false),
+                reconnect_grace,
             }),
         })
+    }
+
+    pub(crate) fn attach_session(&self) -> HostShellSessionGuard {
+        let epoch = self
+            .inner
+            .session_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        self.inner.session_attached.store(true, Ordering::SeqCst);
+        HostShellSessionGuard {
+            inner: Arc::downgrade(&self.inner),
+            epoch,
+        }
     }
 
     pub async fn execute(&self, request: ShellTaskRequest, allow_shell: bool) -> ShellTaskReply {
@@ -373,6 +418,37 @@ impl HostShellService {
         }
         Err(())
     }
+}
+
+fn cancel_all_tasks(tasks: &HostShellTaskStore) {
+    for entry in tasks.tasks.values() {
+        let _ = entry.cancel.send(true);
+    }
+}
+
+fn schedule_reconnect_grace(inner: &Arc<HostShellServiceInner>, epoch: u64) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if let Ok(tasks) = inner.tasks.lock() {
+            cancel_all_tasks(&tasks);
+        }
+        return;
+    };
+    let weak = Arc::downgrade(inner);
+    let grace = inner.reconnect_grace;
+    handle.spawn(async move {
+        tokio::time::sleep(grace).await;
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        if inner.session_attached.load(Ordering::SeqCst)
+            || inner.session_epoch.load(Ordering::SeqCst) != epoch
+        {
+            return;
+        }
+        if let Ok(tasks) = inner.tasks.lock() {
+            cancel_all_tasks(&tasks);
+        }
+    });
 }
 
 fn prune_terminal_tasks(store: &mut HostShellTaskStore) {
@@ -791,6 +867,52 @@ mod tests {
         .await
         .expect("dropping the live-session Shell service should cancel its child");
         assert_eq!(phase, ShellTaskPhase::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn live_shell_task_survives_reconnect_grace_and_cancels_after_expiry() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        std::fs::create_dir_all(&root).unwrap();
+        let service = HostShellService::new_with_reconnect_grace(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 49_152, 5_000).unwrap(),
+            Duration::from_millis(80),
+        )
+        .unwrap();
+
+        let first_session = service.attach_session();
+        let started = service
+            .execute(
+                ShellTaskRequest::start(
+                    wait_command(),
+                    root.to_string_lossy(),
+                    BTreeMap::new(),
+                    5_000,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        let ShellTaskReply::Started { task_id } = started else {
+            panic!("expected Shell task before reconnect grace");
+        };
+        drop(first_session);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second_session = service.attach_session();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ShellTaskReply::Status(status) = service
+            .execute(ShellTaskRequest::Status { task_id }, true)
+            .await
+        else {
+            panic!("expected Shell status after reconnect within grace");
+        };
+        assert_eq!(status.phase, ShellTaskPhase::Running);
+
+        drop(second_session);
+        assert_eq!(
+            wait_terminal(&service, task_id).await.phase,
+            ShellTaskPhase::Cancelled
+        );
     }
 
     async fn wait_terminal(service: &HostShellService, task_id: TaskId) -> ShellTaskStatus {

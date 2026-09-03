@@ -313,7 +313,7 @@ async fn serve_networked_membership_until_inner<F>(
 where
     F: Future<Output = ()>,
 {
-    let (endpoint, service) = member_remote_config(membership)?;
+    let (endpoint, service, shell_service) = member_remote_config(membership)?;
     tokio::pin!(shutdown);
     let outer = tokio::select! {
         _ = &mut shutdown => return Ok(()),
@@ -327,6 +327,7 @@ where
                 &outer,
                 endpoint.clone(),
                 &service,
+                &shell_service,
                 layout,
             ) => result,
         };
@@ -346,24 +347,46 @@ where
 pub async fn serve_networked_membership_once(
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
-    let (endpoint, service) = member_remote_config(membership)?;
+    let (endpoint, service, shell_service) = member_remote_config(membership)?;
     let outer = IrohOuter::bind().await?;
-    serve_networked_membership_with_outer(membership, &outer, endpoint, &service, None).await
+    serve_networked_membership_with_outer(
+        membership,
+        &outer,
+        endpoint,
+        &service,
+        &shell_service,
+        None,
+    )
+    .await
 }
 
 pub async fn serve_networked_membership_once_with_layout(
     layout: &StateLayout,
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
-    let (endpoint, service) = member_remote_config(membership)?;
+    let (endpoint, service, shell_service) = member_remote_config(membership)?;
     let outer = IrohOuter::bind().await?;
-    serve_networked_membership_with_outer(membership, &outer, endpoint, &service, Some(layout))
-        .await
+    serve_networked_membership_with_outer(
+        membership,
+        &outer,
+        endpoint,
+        &service,
+        &shell_service,
+        Some(layout),
+    )
+    .await
 }
 
 fn member_remote_config(
     membership: &HostMembership,
-) -> Result<(EndpointAddr, Option<HostReadService>), HostRemoteError> {
+) -> Result<
+    (
+        EndpointAddr,
+        Option<HostReadService>,
+        Option<HostShellService>,
+    ),
+    HostRemoteError,
+> {
     if !membership.device.capabilities.execute && !membership.device.capabilities.connector {
         return Err(HostRemoteError::ExecutionDisabled);
     }
@@ -372,17 +395,24 @@ fn member_remote_config(
         .controller_endpoint
         .clone()
         .ok_or(HostRemoteError::MissingNetworkConfig)?;
-    let service = if membership.device.capabilities.execute {
+    let (service, shell_service) = if membership.device.capabilities.execute {
         let policy = membership
             .marker
             .read_policy
             .clone()
             .ok_or(HostRemoteError::MissingNetworkConfig)?;
-        Some(HostReadService::new(policy)?)
+        let shell_service = membership
+            .marker
+            .effective_grant
+            .as_ref()
+            .is_some_and(|grant| grant.shell)
+            .then(|| HostShellService::new(policy.clone()))
+            .transpose()?;
+        (Some(HostReadService::new(policy)?), shell_service)
     } else {
-        None
+        (None, None)
     };
-    Ok((endpoint, service))
+    Ok((endpoint, service, shell_service))
 }
 
 enum HostBootstrapChannel {
@@ -749,6 +779,7 @@ async fn serve_networked_membership_with_outer(
     outer: &IrohOuter,
     endpoint: EndpointAddr,
     service: &Option<HostReadService>,
+    shell_service: &Option<HostShellService>,
     layout: Option<&StateLayout>,
 ) -> Result<(), HostRemoteError> {
     serve_networked_membership_with_outer_timing(
@@ -756,6 +787,7 @@ async fn serve_networked_membership_with_outer(
         outer,
         endpoint,
         service,
+        shell_service,
         layout,
         CONNECTOR_PRESENCE_REFRESH_INTERVAL,
     )
@@ -790,6 +822,7 @@ async fn serve_networked_membership_with_outer_timing(
     outer: &IrohOuter,
     endpoint: EndpointAddr,
     service: &Option<HostReadService>,
+    shell_service: &Option<HostShellService>,
     layout: Option<&StateLayout>,
     presence_refresh_interval: Duration,
 ) -> Result<(), HostRemoteError> {
@@ -806,10 +839,7 @@ async fn serve_networked_membership_with_outer_timing(
         DeviceSessionIdentity::from_active(&membership.identity),
     )
     .await?;
-    let shell_service = service
-        .as_ref()
-        .map(|read_service| HostShellService::new(read_service.policy().clone()))
-        .transpose()?;
+    let _shell_session = shell_service.as_ref().map(HostShellService::attach_session);
 
     let connector =
         membership.device.capabilities.connector && outer_path == MemberOuterPath::Direct;
@@ -1429,6 +1459,7 @@ mod tests {
                     &membership,
                     &host_outer,
                     controller_addr,
+                    &None,
                     &None,
                     Some(&layout),
                     Duration::from_millis(100),

@@ -67,7 +67,7 @@ pub use shell_task::{
     HARD_MAX_SHELL_ATTACH_BYTES_PER_STREAM, HARD_MAX_SHELL_COMMAND_BYTES,
     HARD_MAX_SHELL_ENV_ENTRIES, HARD_MAX_SHELL_ENV_KEY_BYTES, HARD_MAX_SHELL_ENV_TOTAL_BYTES,
     HARD_MAX_SHELL_ENV_VALUE_BYTES, HARD_MAX_SHELL_RETAINED_BYTES_PER_STREAM,
-    HARD_MAX_SHELL_TASKS_PER_SESSION, HARD_MAX_SHELL_TIMEOUT_MS, ShellOutputChunk,
-    ShellTaskErrorBody, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase,
+    HARD_MAX_SHELL_TASKS_PER_SESSION, HARD_MAX_SHELL_TIMEOUT_MS, SHELL_RECONNECT_GRACE_MS,
+    ShellOutputChunk, ShellTaskErrorBody, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase,
     ShellTaskProtocolError, ShellTaskReply, ShellTaskRequest, ShellTaskStatus,
 };

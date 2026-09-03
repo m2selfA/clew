@@ -991,6 +991,19 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 V3b request replay matrix至此封板。下一块 V3c：Shell task reattach。目标是 Host task在 active InnerSession断开时不再按 V2语义立刻取消，而是进入有界 reconnect grace；Controller用 stable TaskId在新 generation重新证明 device/session后恢复 projection。必须保持 explicit timeout/cancel，不能把断线 grace升级成永久 orphan process。
 
+### V3c-1 — Host membership-owned Shell reconnect grace
+
+**Status：DONE（2026-09-03）**
+
+- 将 `HostShellService` 生命周期从单次 active `InnerSession` 提升到 `serve_networked_membership_until_inner` 的 Host membership reconnect runtime，与已跨 reconnect 持有的 `HostReadService` 同层；只有 signed `effective_grant.shell=true` 的 executable membership才创建 Shell service，helper-only/legacy grant=None仍无 Shell owner；
+- 新增共享 `SHELL_RECONNECT_GRACE_MS = 30_000`。每条成功认证的 Target↔Controller InnerSession只取得一个 session guard：detach时不再立即 cancel live task，而是进入 **30s** reconnect grace；同一 Host membership在 grace内重新建立 authenticated InnerSession会推进 epoch并取消旧 timer的取消资格，因此 TaskId/process/output ring继续存活；
+- grace timer只持有 `Weak<HostShellServiceInner>`，不会为了“等待重连”反向延长 Host runtime寿命。真正 Host membership/service drop仍走既有 Drop并立即 cancel所有 live child；如果 guard析构时 Tokio runtime已不可用，也直接 fail-safe cancel，不因启动 grace timer而 panic；
+- grace只改变断线期间的 task owner生命周期，不改变 Shell权限、command/cwd/env、stdout/stderr ring、task timeout或 explicit Cancel。task自身 timeout仍优先生效；30s内无人重连且 task仍 live时统一 cancel。Host进程重启仍丢失 task，V3c不把 task写入磁盘或升级成系统后台服务；
+- focused grace **1/1 PASS**：测试用80ms grace，第一次detach后20ms重连并跨越旧grace仍保持 `Running`，第二次detach不重连后进入 `Cancelled`；既有 service-drop立即取消 **1/1 PASS**；no-public NearbyFile Connector full business chain **1/1 PASS（3.57s）**；
+- final gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **172 passed / 0 failed / 6 ignored**。
+
+下一块 V3c-2：Controller保留 `TaskId → DeviceId` projection跨 generation，但把旧 generation标为 detached并设同一30s deadline。新 generation不能自动信任旧 projection；第一次 Status/Attach/Cancel必须先在**同一 authenticated DeviceId**上用 `Status {task_id}`证明 Host仍持有 task，再更新 projection generation。过 grace或 Host返回 NotFound时清 projection；Shell Start仍不 blind replay。
+
 - connection reconnect；
 - request idempotency/replay matrix；
 - Shell task reattach；
@@ -1090,13 +1103,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c-1 DONE）**
 
-**Next block：V3c — Shell task reconnect / reattach**
+**Next block：V3c-2 — Controller TaskId reattach projection**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b现已把短 RPC的 stable RequestId correlation、Host mutation dedupe、Controller cross-generation replay和 active-RPC liveness全部闭合；Read/FsQuery/FsMutation能在同一 Local API deadline内恢复，Shell明确没有 blind replay。下一块单独定义 TaskId reattach与断线 grace，不把 Host task变成永久后台进程。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b已闭合短 RPC跨 generation replay；V3c-1现在把 Host Shell task owner提升到 membership reconnect runtime并加入30s有界 grace，Host task终于能跨 InnerSession断线存活但不会成为永久 orphan。下一块让 Controller在同一 DeviceId新 generation上以 TaskId Status proof恢复 projection。
 
 ### Change log
+
+- **2026-09-03** — V3c-1 Host Shell reconnect grace DONE：HostShellService从per-InnerSession提升到membership reconnect runtime；共享30s grace，session guard用epoch使grace内authenticated reconnect保留task，超grace取消；timer只持Weak，Host runtime/service drop仍立即cancel。focused grace **1/1**、service-drop **1/1**、no-public Connector **1/1（3.57s）**、workspace **172/0/6**。下一块 V3c-2 Controller TaskId reattach projection。
 
 - **2026-09-03** — V3b-2b cross-generation replay + active-RPC liveness DONE / V3b closed：RemoteHub用 session-change watch等新 generation，Read/FsQuery/FsMutation跨 generation保持同 RequestId；mutation Host Timeout先同 generation查询 in-flight cache，session loss后继续同 ID，Shell Start零 blind replay。真实50k Glob hard-kill发现并修复 active RPC遮住 idle heartbeat：新增2s RequestId-only `rpc_progress`，Controller 5s progress deadline；修复后 hard-kill **6073ms** offline、generation **1→2**，原始同一 Glob进程无需重发即 exit 0并返回完整空 page。RPC progress **3/3**、synthetic replay **1/1**、no-public Connector **1/1（3.33s）**、workspace **171/0/6**。下一块 V3c Shell reattach。
 
