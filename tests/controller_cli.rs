@@ -367,7 +367,7 @@ fn shell_cli_uses_selector_only_for_start_and_task_projection_for_followups() {
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("Shell task is not available in the current live session"),
+                .contains("Shell task is unavailable, unknown, or its reconnect grace expired"),
             "{operation}: {}",
             String::from_utf8_lossy(&output.stderr)
         );

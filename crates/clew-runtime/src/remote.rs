@@ -12,10 +12,10 @@ use clew_transport::{
     BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
     ControllerSessionAuthority, FsMutationReply, FsMutationRequest, FsQueryReply, FsQueryRequest,
     HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
-    ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
-    ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
-    is_rpc_progress, read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request,
-    write_bootstrap,
+    ReadReply, ReadRequest, SHELL_RECONNECT_GRACE_MS, SealedBootstrapContext, SealedBootstrapError,
+    SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest,
+    SignedConnectorLease, SiteDiscoveryTag, is_rpc_progress, read_bootstrap, read_connector_open,
+    unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -103,6 +103,7 @@ struct RemoteSessionSlot {
 struct RemoteShellTaskProjection {
     device_id: DeviceId,
     generation: u64,
+    reattach_deadline_unix_ms: Option<u64>,
 }
 
 struct ShellStartReservation {
@@ -357,6 +358,7 @@ impl RemoteHub {
                 .inner
                 .lock()
                 .map_err(|_| RemoteHubError::StatePoisoned)?;
+            prune_expired_shell_projections(&mut state, unix_ms().ok().unwrap_or(u64::MAX));
             let Some(slot) = state.sessions.get(&device_id) else {
                 return Err(RemoteHubError::Offline(device_id));
             };
@@ -388,53 +390,77 @@ impl RemoteHub {
         let (completion_tx, completion_rx) = oneshot::channel();
         tokio::spawn(async move {
             let mut reservation = reservation;
-            let completion = async {
-                let reply = reply_rx
-                    .await
-                    .map_err(|_| RemoteHubError::Offline(device_id))??;
-                reservation.release();
-                let mut state = hub
-                    .inner
-                    .lock()
-                    .map_err(|_| RemoteHubError::StatePoisoned)?;
-                if !state
-                    .sessions
-                    .get(&device_id)
-                    .is_some_and(|slot| slot.generation == generation)
-                {
-                    return Err(RemoteHubError::Offline(device_id));
-                }
-                match reply {
-                    ShellTaskReply::Started { task_id } => {
-                        if state.shell_tasks.contains_key(&task_id) {
-                            return Err(RemoteHubError::ShellTaskIdConflict(task_id));
+            let reply = reply_rx
+                .await
+                .map_err(|_| RemoteHubError::Offline(device_id))
+                .and_then(|reply| reply);
+            reservation.release();
+
+            let mut known_task_id = None;
+            let completion = match reply {
+                Ok(ShellTaskReply::Started { task_id }) => {
+                    known_task_id = Some(task_id);
+                    let projection_ready = {
+                        let mut state = hub.inner.lock().map_err(|_| RemoteHubError::StatePoisoned);
+                        match &mut state {
+                            Ok(state)
+                                if state
+                                    .sessions
+                                    .get(&device_id)
+                                    .is_some_and(|slot| slot.generation == generation) =>
+                            {
+                                if state.shell_tasks.contains_key(&task_id) {
+                                    Err(RemoteHubError::ShellTaskIdConflict(task_id))
+                                } else {
+                                    state.shell_tasks.insert(
+                                        task_id,
+                                        RemoteShellTaskProjection {
+                                            device_id,
+                                            generation,
+                                            reattach_deadline_unix_ms: None,
+                                        },
+                                    );
+                                    Ok(())
+                                }
+                            }
+                            Ok(_) => Err(RemoteHubError::Offline(device_id)),
+                            Err(_) => Err(RemoteHubError::StatePoisoned),
                         }
-                        state.shell_tasks.insert(
-                            task_id,
-                            RemoteShellTaskProjection {
-                                device_id,
-                                generation,
-                            },
-                        );
-                        Ok(ShellTaskReply::Started { task_id })
+                    };
+                    match projection_ready {
+                        Err(error) => Err(error),
+                        Ok(()) => {
+                            match hub.shell_task(ShellTaskRequest::Status { task_id }).await {
+                                Ok((resolved_device, ShellTaskReply::Status(_)))
+                                    if resolved_device == device_id =>
+                                {
+                                    Ok(ShellTaskReply::Started { task_id })
+                                }
+                                Ok((_, ShellTaskReply::Error(error))) => {
+                                    Ok(ShellTaskReply::Error(error))
+                                }
+                                Ok(_) => Err(RemoteHubError::ShellReplyMismatch),
+                                Err(error) => Err(error),
+                            }
+                        }
                     }
-                    ShellTaskReply::Error(error) => Ok(ShellTaskReply::Error(error)),
-                    _ => Err(RemoteHubError::ShellReplyMismatch),
                 }
-            }
-            .await;
-            let orphan_task = match &completion {
-                Ok(ShellTaskReply::Started { task_id }) => Some(*task_id),
-                _ => None,
+                Ok(ShellTaskReply::Error(error)) => Ok(ShellTaskReply::Error(error)),
+                Ok(_) => Err(RemoteHubError::ShellReplyMismatch),
+                Err(error) => Err(error),
             };
-            if completion_tx.send(completion).is_err()
-                && let Some(task_id) = orphan_task
+
+            let completed_start = matches!(&completion, Ok(ShellTaskReply::Started { .. }));
+            let delivery_failed = completion_tx.send(completion).is_err();
+            if let Some(task_id) = known_task_id
+                && (!completed_start || delivery_failed)
             {
                 let _ = hub.shell_task(ShellTaskRequest::Cancel { task_id }).await;
                 if let Ok(mut state) = hub.inner.lock()
-                    && state.shell_tasks.get(&task_id).is_some_and(|projection| {
-                        projection.device_id == device_id && projection.generation == generation
-                    })
+                    && state
+                        .shell_tasks
+                        .get(&task_id)
+                        .is_some_and(|projection| projection.device_id == device_id)
                 {
                     state.shell_tasks.remove(&task_id);
                 }
@@ -450,18 +476,12 @@ impl RemoteHub {
             .inner
             .lock()
             .map_err(|_| RemoteHubError::StatePoisoned)?;
-        let Some(projection) = state.shell_tasks.get(&task_id).copied() else {
-            return Err(RemoteHubError::UnknownShellTask(task_id));
-        };
-        if !state
-            .sessions
-            .get(&projection.device_id)
-            .is_some_and(|slot| slot.generation == projection.generation)
-        {
-            state.shell_tasks.remove(&task_id);
-            return Err(RemoteHubError::UnknownShellTask(task_id));
-        }
-        Ok(projection.device_id)
+        prune_expired_shell_projections(&mut state, unix_ms().ok().unwrap_or(u64::MAX));
+        state
+            .shell_tasks
+            .get(&task_id)
+            .map(|projection| projection.device_id)
+            .ok_or(RemoteHubError::UnknownShellTask(task_id))
     }
 
     pub async fn shell_task(
@@ -471,36 +491,91 @@ impl RemoteHub {
         request.validate()?;
         let task_id =
             shell_request_task_id(&request).ok_or(RemoteHubError::InvalidShellProjectionRequest)?;
-        let (device_id, generation, tx) = {
+        let now = unix_ms().ok().unwrap_or(u64::MAX);
+        let projection = {
             let mut state = self
                 .inner
                 .lock()
                 .map_err(|_| RemoteHubError::StatePoisoned)?;
-            let Some(projection) = state.shell_tasks.get(&task_id).copied() else {
-                return Err(RemoteHubError::UnknownShellTask(task_id));
-            };
-            let Some(slot) = state.sessions.get(&projection.device_id) else {
-                state.shell_tasks.remove(&task_id);
-                return Err(RemoteHubError::UnknownShellTask(task_id));
-            };
-            if slot.generation != projection.generation {
-                state.shell_tasks.remove(&task_id);
+            prune_expired_shell_projections(&mut state, now);
+            state
+                .shell_tasks
+                .get(&task_id)
+                .copied()
+                .ok_or(RemoteHubError::UnknownShellTask(task_id))?
+        };
+        let device_id = projection.device_id;
+        let wait_for_session = self.replay_session_after(device_id, None);
+        let (generation, tx) = if let Some(deadline) = projection.reattach_deadline_unix_ms {
+            if now > deadline {
+                if let Ok(mut state) = self.inner.lock() {
+                    state.shell_tasks.remove(&task_id);
+                }
                 return Err(RemoteHubError::UnknownShellTask(task_id));
             }
-            (projection.device_id, projection.generation, slot.tx.clone())
-        };
-        let request_id = RequestId::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(RemoteCommand::ShellTask {
-            request_id,
-            request: request.clone(),
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| RemoteHubError::Offline(device_id))?;
-        let reply = reply_rx
+            match tokio::time::timeout(
+                Duration::from_millis(deadline.saturating_sub(now)),
+                wait_for_session,
+            )
             .await
-            .map_err(|_| RemoteHubError::Offline(device_id))??;
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    if let Ok(mut state) = self.inner.lock() {
+                        state.shell_tasks.remove(&task_id);
+                    }
+                    return Err(RemoteHubError::UnknownShellTask(task_id));
+                }
+            }
+        } else {
+            wait_for_session.await?
+        };
+
+        if generation != projection.generation {
+            let proof_request = ShellTaskRequest::Status { task_id };
+            let proof = send_shell_task_command(&tx, device_id, proof_request.clone()).await?;
+            validate_shell_reply_correlation(&proof_request, &proof)?;
+            match &proof {
+                ShellTaskReply::Status(_) => {
+                    let mut state = self
+                        .inner
+                        .lock()
+                        .map_err(|_| RemoteHubError::StatePoisoned)?;
+                    let session_matches = state
+                        .sessions
+                        .get(&device_id)
+                        .is_some_and(|slot| slot.generation == generation);
+                    let projection_matches = state
+                        .shell_tasks
+                        .get(&task_id)
+                        .is_some_and(|current| current.device_id == device_id);
+                    if !session_matches || !projection_matches {
+                        return Err(RemoteHubError::Offline(device_id));
+                    }
+                    state.shell_tasks.insert(
+                        task_id,
+                        RemoteShellTaskProjection {
+                            device_id,
+                            generation,
+                            reattach_deadline_unix_ms: None,
+                        },
+                    );
+                    if matches!(request, ShellTaskRequest::Status { .. }) {
+                        return Ok((device_id, proof));
+                    }
+                }
+                ShellTaskReply::Error(error) if error.code == ShellTaskErrorCode::NotFound => {
+                    if let Ok(mut state) = self.inner.lock() {
+                        state.shell_tasks.remove(&task_id);
+                    }
+                    return Ok((device_id, proof));
+                }
+                ShellTaskReply::Error(_) => return Ok((device_id, proof)),
+                _ => return Err(RemoteHubError::ShellReplyMismatch),
+            }
+        }
+
+        let reply = send_shell_task_command(&tx, device_id, request.clone()).await?;
         validate_shell_reply_correlation(&request, &reply)?;
         let mut state = self
             .inner
@@ -511,8 +586,13 @@ impl RemoteHub {
             .get(&device_id)
             .is_some_and(|slot| slot.generation == generation)
         {
-            state.shell_tasks.remove(&task_id);
-            return Err(RemoteHubError::UnknownShellTask(task_id));
+            mark_shell_projections_detached(
+                &mut state,
+                device_id,
+                generation,
+                unix_ms().ok().unwrap_or(0),
+            );
+            return Err(RemoteHubError::Offline(device_id));
         }
         if matches!(
             &reply,
@@ -528,9 +608,12 @@ impl RemoteHub {
         let changed = if let Ok(mut state) = self.inner.lock()
             && let Some(slot) = state.sessions.remove(&device_id)
         {
-            state.shell_tasks.retain(|_, projection| {
-                projection.device_id != device_id || projection.generation != slot.generation
-            });
+            mark_shell_projections_detached(
+                &mut state,
+                device_id,
+                slot.generation,
+                disconnected_unix_ms.unwrap_or(0),
+            );
             if let Some(info) = state.session_info.get_mut(&device_id)
                 && info.generation == slot.generation
             {
@@ -567,9 +650,7 @@ impl RemoteHub {
                 .checked_add(1)
                 .ok_or(RemoteHubError::GenerationOverflow)?;
             let generation = state.next_generation;
-            state
-                .shell_tasks
-                .retain(|_, projection| projection.device_id != device_id);
+            prune_expired_shell_projections(&mut state, connected_unix_ms);
             state.session_info.insert(
                 device_id,
                 RemoteSessionInfo {
@@ -587,6 +668,12 @@ impl RemoteHub {
                 .sessions
                 .insert(device_id, RemoteSessionSlot { generation, tx })
             {
+                mark_shell_projections_detached(
+                    &mut state,
+                    device_id,
+                    previous.generation,
+                    connected_unix_ms,
+                );
                 let _ = previous.tx.try_send(RemoteCommand::Stop);
             }
             generation
@@ -603,9 +690,12 @@ impl RemoteHub {
                 .is_some_and(|slot| slot.generation == generation)
         {
             state.sessions.remove(&device_id);
-            state.shell_tasks.retain(|_, projection| {
-                projection.device_id != device_id || projection.generation != generation
-            });
+            mark_shell_projections_detached(
+                &mut state,
+                device_id,
+                generation,
+                disconnected_unix_ms.unwrap_or(0),
+            );
             if let Some(info) = state.session_info.get_mut(&device_id)
                 && info.generation == generation
             {
@@ -622,6 +712,47 @@ impl RemoteHub {
             self.signal_session_change();
         }
     }
+}
+
+fn mark_shell_projections_detached(
+    state: &mut RemoteHubState,
+    device_id: DeviceId,
+    generation: u64,
+    disconnected_unix_ms: u64,
+) {
+    let deadline = disconnected_unix_ms.saturating_add(SHELL_RECONNECT_GRACE_MS);
+    for projection in state.shell_tasks.values_mut() {
+        if projection.device_id == device_id && projection.generation == generation {
+            projection.reattach_deadline_unix_ms = Some(deadline);
+        }
+    }
+}
+
+fn prune_expired_shell_projections(state: &mut RemoteHubState, now_unix_ms: u64) {
+    state.shell_tasks.retain(|_, projection| {
+        projection
+            .reattach_deadline_unix_ms
+            .is_none_or(|deadline| now_unix_ms <= deadline)
+    });
+}
+
+async fn send_shell_task_command(
+    tx: &mpsc::Sender<RemoteCommand>,
+    device_id: DeviceId,
+    request: ShellTaskRequest,
+) -> Result<ShellTaskReply, RemoteHubError> {
+    let request_id = RequestId::new();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(RemoteCommand::ShellTask {
+        request_id,
+        request,
+        reply: reply_tx,
+    })
+    .await
+    .map_err(|_| RemoteHubError::Offline(device_id))?;
+    reply_rx
+        .await
+        .map_err(|_| RemoteHubError::Offline(device_id))?
 }
 
 pub async fn handle_remote_connection(
@@ -1925,16 +2056,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_projection_binds_task_to_live_device_session_and_reconnect_invalidates_it() {
+    async fn shell_projection_reattaches_to_same_device_after_status_proof() {
         let hub = RemoteHub::default();
         let device_a = DeviceId::new();
         let device_b = DeviceId::new();
+        let base = unix_ms().unwrap();
         let (_generation_a, mut commands_a) = hub
             .register(
                 device_a,
                 RemoteSessionTopology::Direct,
                 RemotePathState::Direct,
-                1_000,
+                base,
             )
             .unwrap();
         let (_generation_b, mut commands_b) = hub
@@ -1942,7 +2074,7 @@ mod tests {
                 device_b,
                 RemoteSessionTopology::Direct,
                 RemotePathState::Relay,
-                1_100,
+                base.saturating_add(1),
             )
             .unwrap();
         let task_id = TaskId::new();
@@ -1968,22 +2100,10 @@ mod tests {
         };
         assert!(matches!(request, ShellTaskRequest::Start { .. }));
         reply.send(Ok(ShellTaskReply::Started { task_id })).unwrap();
-        assert_eq!(
-            start.await.unwrap().unwrap(),
-            ShellTaskReply::Started { task_id }
-        );
-        assert_eq!(hub.shell_task_device(task_id).unwrap(), device_a);
-        assert!(commands_b.try_recv().is_err());
 
-        let status_hub = hub.clone();
-        let status_call = tokio::spawn(async move {
-            status_hub
-                .shell_task(ShellTaskRequest::Status { task_id })
-                .await
-        });
         let RemoteCommand::ShellTask { request, reply, .. } = commands_a.recv().await.unwrap()
         else {
-            panic!("expected Shell Status on Device-A session");
+            panic!("expected automatic Shell Start receipt Status");
         };
         assert_eq!(request, ShellTaskRequest::Status { task_id });
         reply
@@ -1999,11 +2119,11 @@ mod tests {
                 },
             )))
             .unwrap();
-        let (resolved_device, status_reply) = status_call.await.unwrap().unwrap();
-        assert_eq!(resolved_device, device_a);
-        assert!(
-            matches!(status_reply, ShellTaskReply::Status(status) if status.task_id == task_id)
+        assert_eq!(
+            start.await.unwrap().unwrap(),
+            ShellTaskReply::Started { task_id }
         );
+        assert_eq!(hub.shell_task_device(task_id).unwrap(), device_a);
         assert!(commands_b.try_recv().is_err());
 
         let mismatch_hub = hub.clone();
@@ -2013,7 +2133,7 @@ mod tests {
                 .await
         });
         let RemoteCommand::ShellTask { reply, .. } = commands_a.recv().await.unwrap() else {
-            panic!("expected second Shell Status on Device-A session");
+            panic!("expected Shell Status on Device-A session");
         };
         reply
             .send(Ok(ShellTaskReply::Status(
@@ -2033,19 +2153,96 @@ mod tests {
             Err(RemoteHubError::ShellReplyTaskMismatch(actual)) if actual == task_id
         ));
 
-        let (_replacement_generation, _replacement_commands) = hub
+        let (replacement_generation, mut replacement_commands) = hub
             .register(
                 device_a,
                 RemoteSessionTopology::Connector,
                 RemotePathState::MixedOrUnknown,
-                2_000,
+                base.saturating_add(1_000),
             )
             .unwrap();
-        assert!(matches!(
-            hub.shell_task_device(task_id),
-            Err(RemoteHubError::UnknownShellTask(actual)) if actual == task_id
-        ));
+        assert_eq!(hub.shell_task_device(task_id).unwrap(), device_a);
         assert!(matches!(commands_a.recv().await, Some(RemoteCommand::Stop)));
+        assert!(commands_b.try_recv().is_err());
+
+        let reattach_hub = hub.clone();
+        let reattach = tokio::spawn(async move {
+            reattach_hub
+                .shell_task(ShellTaskRequest::Status { task_id })
+                .await
+        });
+        let RemoteCommand::ShellTask { request, reply, .. } =
+            replacement_commands.recv().await.unwrap()
+        else {
+            panic!("expected reattach Status proof on replacement generation");
+        };
+        assert_eq!(request, ShellTaskRequest::Status { task_id });
+        reply
+            .send(Ok(ShellTaskReply::Status(
+                clew_transport::ShellTaskStatus {
+                    task_id,
+                    phase: clew_transport::ShellTaskPhase::Running,
+                    exit_code: None,
+                    stdout_base_offset: 0,
+                    stdout_next_offset: 0,
+                    stderr_base_offset: 0,
+                    stderr_next_offset: 0,
+                },
+            )))
+            .unwrap();
+        let (resolved_device, status_reply) = reattach.await.unwrap().unwrap();
+        assert_eq!(resolved_device, device_a);
+        assert!(
+            matches!(status_reply, ShellTaskReply::Status(status) if status.task_id == task_id)
+        );
+        {
+            let state = hub.inner.lock().unwrap();
+            let projection = state.shell_tasks.get(&task_id).unwrap();
+            assert_eq!(projection.device_id, device_a);
+            assert_eq!(projection.generation, replacement_generation);
+            assert_eq!(projection.reattach_deadline_unix_ms, None);
+        }
+        assert!(commands_b.try_recv().is_err());
+
+        let cancel_hub = hub.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_hub
+                .shell_task(ShellTaskRequest::Cancel { task_id })
+                .await
+        });
+        let RemoteCommand::ShellTask { request, reply, .. } =
+            replacement_commands.recv().await.unwrap()
+        else {
+            panic!("expected Shell Cancel on reattached generation");
+        };
+        assert_eq!(request, ShellTaskRequest::Cancel { task_id });
+        reply
+            .send(Ok(ShellTaskReply::CancelAccepted { task_id }))
+            .unwrap();
+        let (resolved_device, cancel_reply) = cancel.await.unwrap().unwrap();
+        assert_eq!(resolved_device, device_a);
+        assert_eq!(cancel_reply, ShellTaskReply::CancelAccepted { task_id });
+        assert!(commands_b.try_recv().is_err());
+    }
+
+    #[test]
+    fn detached_shell_projection_expires_at_bounded_grace_deadline() {
+        let task_id = TaskId::new();
+        let device_id = DeviceId::new();
+        let mut state = RemoteHubState::default();
+        state.shell_tasks.insert(
+            task_id,
+            RemoteShellTaskProjection {
+                device_id,
+                generation: 7,
+                reattach_deadline_unix_ms: Some(10_000),
+            },
+        );
+
+        prune_expired_shell_projections(&mut state, 10_000);
+        assert!(state.shell_tasks.contains_key(&task_id));
+        prune_expired_shell_projections(&mut state, 10_001);
+        assert!(!state.shell_tasks.contains_key(&task_id));
     }
 
     #[tokio::test]
@@ -2083,7 +2280,30 @@ mod tests {
         let RemoteCommand::ShellTask { request, reply, .. } =
             tokio::time::timeout(Duration::from_secs(2), commands.recv())
                 .await
-                .expect("orphan Shell task was not cancelled")
+                .expect("orphan Shell task did not receive receipt Status")
+                .unwrap()
+        else {
+            panic!("expected automatic Shell receipt Status command");
+        };
+        assert_eq!(request, ShellTaskRequest::Status { task_id });
+        reply
+            .send(Ok(ShellTaskReply::Status(
+                clew_transport::ShellTaskStatus {
+                    task_id,
+                    phase: clew_transport::ShellTaskPhase::Running,
+                    exit_code: None,
+                    stdout_base_offset: 0,
+                    stdout_next_offset: 0,
+                    stderr_base_offset: 0,
+                    stderr_next_offset: 0,
+                },
+            )))
+            .unwrap();
+
+        let RemoteCommand::ShellTask { request, reply, .. } =
+            tokio::time::timeout(Duration::from_secs(2), commands.recv())
+                .await
+                .expect("orphan Shell task was not cancelled after receipt proof")
                 .unwrap()
         else {
             panic!("expected automatic Shell Cancel command");
@@ -2106,6 +2326,112 @@ mod tests {
         })
         .await
         .expect("orphan Shell projection was not cleaned up");
+    }
+
+    #[tokio::test]
+    async fn lost_shell_start_receipt_reply_is_cancelled_after_reconnect() {
+        let hub = RemoteHub::default();
+        let device_id = DeviceId::new();
+        let base = unix_ms().unwrap();
+        let (generation_one, mut commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                base,
+            )
+            .unwrap();
+        let call_hub = hub.clone();
+        let call = tokio::spawn(async move {
+            call_hub
+                .shell_start(
+                    device_id,
+                    ShellTaskRequest::start(
+                        "echo receipt-loss",
+                        "/projection",
+                        BTreeMap::new(),
+                        5_000,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+
+        let RemoteCommand::ShellTask { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected Shell Start before receipt-loss reconnect");
+        };
+        assert!(matches!(request, ShellTaskRequest::Start { .. }));
+        let task_id = TaskId::new();
+        reply.send(Ok(ShellTaskReply::Started { task_id })).unwrap();
+
+        let RemoteCommand::ShellTask { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected automatic receipt Status before simulated disconnect");
+        };
+        assert_eq!(request, ShellTaskRequest::Status { task_id });
+        hub.unregister(device_id, generation_one, Some(base.saturating_add(10)));
+        drop(reply);
+
+        let (_generation_two, mut commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                base.saturating_add(20),
+            )
+            .unwrap();
+
+        let RemoteCommand::ShellTask { request, reply, .. } =
+            tokio::time::timeout(Duration::from_secs(2), commands_two.recv())
+                .await
+                .expect("known orphan task did not re-prove itself after reconnect")
+                .unwrap()
+        else {
+            panic!("expected reattach Status proof for known orphan task");
+        };
+        assert_eq!(request, ShellTaskRequest::Status { task_id });
+        reply
+            .send(Ok(ShellTaskReply::Status(
+                clew_transport::ShellTaskStatus {
+                    task_id,
+                    phase: clew_transport::ShellTaskPhase::Running,
+                    exit_code: None,
+                    stdout_base_offset: 0,
+                    stdout_next_offset: 0,
+                    stderr_base_offset: 0,
+                    stderr_next_offset: 0,
+                },
+            )))
+            .unwrap();
+
+        let RemoteCommand::ShellTask { request, reply, .. } =
+            tokio::time::timeout(Duration::from_secs(2), commands_two.recv())
+                .await
+                .expect("known orphan task was not cancelled after reconnect proof")
+                .unwrap()
+        else {
+            panic!("expected Cancel after known orphan reattach proof");
+        };
+        assert_eq!(request, ShellTaskRequest::Cancel { task_id });
+        reply
+            .send(Ok(ShellTaskReply::CancelAccepted { task_id }))
+            .unwrap();
+
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RemoteHubError::Offline(actual)) if actual == device_id
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !hub.inner.lock().unwrap().shell_tasks.contains_key(&task_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("known orphan Shell projection was not cleaned after reconnect cancel");
     }
 
     #[test]

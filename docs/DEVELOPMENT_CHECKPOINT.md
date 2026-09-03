@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a + V3b DONE）**
+**Status：IN PROGRESS（V3a + V3b + V3c DONE）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -1003,6 +1003,20 @@ V3b request replay matrix至此封板。下一块 V3c：Shell task reattach。�
 - final gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **172 passed / 0 failed / 6 ignored**。
 
 下一块 V3c-2：Controller保留 `TaskId → DeviceId` projection跨 generation，但把旧 generation标为 detached并设同一30s deadline。新 generation不能自动信任旧 projection；第一次 Status/Attach/Cancel必须先在**同一 authenticated DeviceId**上用 `Status {task_id}`证明 Host仍持有 task，再更新 projection generation。过 grace或 Host返回 NotFound时清 projection；Shell Start仍不 blind replay。
+
+### V3c-2 — Controller TaskId reattach + per-epoch receipt proof
+
+**Status：DONE（2026-09-03）**
+
+- Controller Shell projection扩为 `TaskId → {DeviceId, generation, reattach_deadline}`。session disconnect/unregister/replacement只把匹配旧 generation的 projection标 detached并设共享 **30s** deadline；`shell_task_device`在 grace内仍只解析原 DeviceId供 Local API重新授权，caller始终不能传另一个 DeviceId。新 generation上的第一次 Status/Attach/Cancel必须先向**同一 authenticated DeviceId**发送 `Status {task_id}` proof；TaskId匹配后才重绑 generation，NotFound、wrong TaskId、超 grace均 fail closed并清 projection；Shell Start继续零 blind replay；
+- independent review收紧了 V3c-1 的 Start 半提交窗口：Host新 task默认**没有 reconnect资格**。Controller收到 `Started {task_id}` 后先自动发一次 Status receipt，只有 Host确认该 TaskId且 Controller拿到匹配 reply后才把 Started交给 Local API。receipt前断线时Host立即cancel未确认task；caller abort或receipt reply丢失但Controller已知TaskId时，Controller内部在可用session上重新Status proof后自动Cancel并清projection，避免“Host已经spawn、caller从未拿到TaskId”的长期orphan；
+- 第二轮 independent review由真实跨机时序触发：**网络 session 重连本身不等于 task reattach**。Host task entry现在记录创建 `session_epoch` 与 `confirmed_epoch`；每个新 authenticated epoch都必须由 Status/Attach重新证明同一TaskId。旧epoch grace timer不会因为“网络已经连上”就自动放过任务；如果30s内没有 newer-epoch TaskId proof，Host仍cancel该task。这样 Host task owner与Controller projection共享同一有界恢复条件，避免Controller projection过期而Host task继续运行；
+- focused Host reconnect **4/4 PASS**：未确认Start快速重连仍cancel；已确认task重连但不做new-epoch proof仍在grace后cancel；new-epoch Status proof后跨旧grace保持Running；再次detach不reproof后cancel。Controller focused覆盖 same-device generation reattach、wrong TaskId reply、caller-abort orphan cleanup、receipt-reply-loss后reconnect proof+auto-Cancel、deadline精确边界；`clew-runtime --all-targets` **35/35 PASS**，V3b Shell Start zero-replay回归继续PASS；
+- 真实 no-public NearbyFile Connector full business chain在per-epoch proof语义下 **1/1 PASS（3.49s）**，Helper仍只搬InnerSession密文；Local API/MCP文案同步为V3 bounded reconnect grace，并明确Shell Start never blind-replayed；
+- **真实 Windows cross-machine product gate PASS**：cap00运行Controller/CLI，mzd运行同一构建的独立Host副本与真实 `--allow-shell` signed Site Kit；Windows Firewall只对mzd的Host副本做20s outbound block，Host进程全程不重启。连续监控明确看到原session **generation 3 disconnected → generation 4 connected（13.750s）**；在检测到generation 4的同一循环立刻对原TaskId `236fa14d-4b60-4ff1-a3a5-e2013d48dc64`执行Status，仍为`running`。随后原TaskId Attach返回断线前保留的26-byte stdout，Base64解码为 `CLEW-V3C2-ROUND4-BEFORE \r\n`、`lost_prefix=false`，再用同TaskId Cancel成功，证明是**同一Host task/output ring跨InnerSession generation恢复**而不是重启新task；
+- smoke cleanup完成：临时firewall由远端 `try/finally`自动删除，显式复查时已无匹配规则；mzd Host测试进程终止，cap00隔离Controller authenticated shutdown，远端/本地fixture与state目录全部删除。final gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **176 passed / 0 failed / 6 ignored**。
+
+V3c Shell reattach至此封板。V3c-1中“网络重连即可免除旧grace取消”的初始规则由本块正式收紧为“**newer-epoch TaskId proof才可免除**”。下一块 V3d：File resume 接口预留；只冻结stable transfer identity、offset/hash/precondition/resume capability与reconnect ownership边界，不实现V5的chunk manifest、bulk data plane、directory transfer或并发调度。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1103,13 +1117,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c-1 DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c DONE）**
 
-**Next block：V3c-2 — Controller TaskId reattach projection**
+**Next block：V3d — File resume interface reservation**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b已闭合短 RPC跨 generation replay；V3c-1现在把 Host Shell task owner提升到 membership reconnect runtime并加入30s有界 grace，Host task终于能跨 InnerSession断线存活但不会成为永久 orphan。下一块让 Controller在同一 DeviceId新 generation上以 TaskId Status proof恢复 projection。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b已闭合短 RPC跨generation replay；V3c现在把Shell task恢复收紧为stable TaskId + same authenticated DeviceId + shared 30s grace + newer-epoch Status/Attach proof，并以cap00↔mzd真实generation 3→4同TaskId Status/Attach完成产品验收。下一块只预留File resume的身份/能力/恢复接口，不提前实现V5数据面。
 
 ### Change log
+
+- **2026-09-03** — V3c-2 Controller TaskId reattach + per-epoch proof DONE / V3c closed：Controller projection跨generation保留原DeviceId并在30s内用Status proof重绑；independent review修复Start unknown-result orphan，新增Started→Status receipt后才向caller返回TaskId；真实跨机时序又收紧Host为每个new session epoch都必须重新Status/Attach proof，网络重连本身不再延长task。Host reconnect **4/4**、runtime **35/35**、no-public Connector **1/1（3.49s）**。cap00 Controller + mzd Host真实20s program-scoped firewall gate观测generation **3 disconnected → 4 connected（13.750s）**，原TaskId Status仍Running、Attach保留断线前26-byte stdout且`lost_prefix=false`、Cancel PASS；workspace **176/0/6**。下一块 V3d File resume接口预留。
 
 - **2026-09-03** — V3c-1 Host Shell reconnect grace DONE：HostShellService从per-InnerSession提升到membership reconnect runtime；共享30s grace，session guard用epoch使grace内authenticated reconnect保留task，超grace取消；timer只持Weak，Host runtime/service drop仍立即cancel。focused grace **1/1**、service-drop **1/1**、no-public Connector **1/1（3.57s）**、workspace **172/0/6**。下一块 V3c-2 Controller TaskId reattach projection。
 

@@ -1192,7 +1192,7 @@ async fn shell_followup_response(
         Err(_) => {
             return local_error(
                 LocalApiErrorCode::Unavailable,
-                "Shell task is not available in the current live session",
+                "Shell task is unavailable, unknown, or its reconnect grace expired",
             );
         }
     };
@@ -1216,7 +1216,7 @@ async fn shell_followup_response(
         Ok(Err(_)) => (
             local_error(
                 LocalApiErrorCode::Unavailable,
-                "Shell task is not available in the current live session",
+                "Shell task is unavailable, unknown, or its reconnect grace expired",
             ),
             ActivityResult::Failed,
             0,

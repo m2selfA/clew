@@ -4,7 +4,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -33,7 +33,6 @@ struct HostShellServiceInner {
     tasks: Mutex<HostShellTaskStore>,
     capacity: Arc<Semaphore>,
     session_epoch: AtomicU64,
-    session_attached: AtomicBool,
     reconnect_grace: Duration,
 }
 
@@ -58,7 +57,7 @@ impl Drop for HostShellSessionGuard {
         if inner.session_epoch.load(Ordering::SeqCst) != self.epoch {
             return;
         }
-        inner.session_attached.store(false, Ordering::SeqCst);
+        cancel_unconfirmed_tasks_for_epoch(&inner, self.epoch);
         schedule_reconnect_grace(&inner, self.epoch);
     }
 }
@@ -72,6 +71,8 @@ struct HostShellTaskStore {
 #[derive(Debug)]
 struct HostShellTaskEntry {
     sequence: u64,
+    session_epoch: u64,
+    confirmed_epoch: Option<u64>,
     state: Arc<Mutex<HostShellTaskState>>,
     cancel: watch::Sender<bool>,
     _capacity_permit: OwnedSemaphorePermit,
@@ -159,7 +160,6 @@ impl HostShellService {
                 tasks: Mutex::new(HostShellTaskStore::default()),
                 capacity: Arc::new(Semaphore::new(HARD_MAX_SHELL_TASKS_PER_SESSION)),
                 session_epoch: AtomicU64::new(0),
-                session_attached: AtomicBool::new(false),
                 reconnect_grace,
             }),
         })
@@ -171,7 +171,6 @@ impl HostShellService {
             .session_epoch
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
-        self.inner.session_attached.store(true, Ordering::SeqCst);
         HostShellSessionGuard {
             inner: Arc::downgrade(&self.inner),
             epoch,
@@ -278,6 +277,7 @@ impl HostShellService {
         };
 
         let task_id = TaskId::new();
+        let session_epoch = self.inner.session_epoch.load(Ordering::SeqCst);
         let state = Arc::new(Mutex::new(HostShellTaskState {
             task_id,
             phase: ShellTaskPhase::Running,
@@ -303,6 +303,8 @@ impl HostShellService {
             task_id,
             HostShellTaskEntry {
                 sequence,
+                session_epoch,
+                confirmed_epoch: None,
                 state: Arc::clone(&state),
                 cancel,
                 _capacity_permit: capacity_permit,
@@ -325,7 +327,7 @@ impl HostShellService {
     }
 
     fn status(&self, task_id: TaskId) -> ShellTaskReply {
-        let state = match self.task_state(task_id) {
+        let state = match self.confirmed_task_state(task_id) {
             Ok(state) => state,
             Err(reply) => return reply,
         };
@@ -344,7 +346,7 @@ impl HostShellService {
         stderr_offset: u64,
         max_bytes_per_stream: usize,
     ) -> ShellTaskReply {
-        let state = match self.task_state(task_id) {
+        let state = match self.confirmed_task_state(task_id) {
             Ok(state) => state,
             Err(reply) => return reply,
         };
@@ -383,20 +385,18 @@ impl HostShellService {
         ShellTaskReply::CancelAccepted { task_id }
     }
 
-    fn task_state(
+    fn confirmed_task_state(
         &self,
         task_id: TaskId,
     ) -> Result<Arc<Mutex<HostShellTaskState>>, ShellTaskReply> {
-        let store = self.inner.tasks.lock().map_err(|_| {
+        let mut store = self.inner.tasks.lock().map_err(|_| {
             ShellTaskReply::error(ShellTaskErrorCode::Io, "Shell task store is unavailable")
         })?;
-        store
-            .tasks
-            .get(&task_id)
-            .map(|entry| Arc::clone(&entry.state))
-            .ok_or_else(|| {
-                ShellTaskReply::error(ShellTaskErrorCode::NotFound, "Shell task was not found")
-            })
+        let entry = store.tasks.get_mut(&task_id).ok_or_else(|| {
+            ShellTaskReply::error(ShellTaskErrorCode::NotFound, "Shell task was not found")
+        })?;
+        entry.confirmed_epoch = Some(self.inner.session_epoch.load(Ordering::SeqCst));
+        Ok(Arc::clone(&entry.state))
     }
 
     async fn canonical_allowed_cwd(&self, requested: &Path) -> Result<PathBuf, ()> {
@@ -426,6 +426,16 @@ fn cancel_all_tasks(tasks: &HostShellTaskStore) {
     }
 }
 
+fn cancel_unconfirmed_tasks_for_epoch(inner: &Arc<HostShellServiceInner>, epoch: u64) {
+    if let Ok(tasks) = inner.tasks.lock() {
+        for entry in tasks.tasks.values() {
+            if entry.session_epoch == epoch && entry.confirmed_epoch.is_none() {
+                let _ = entry.cancel.send(true);
+            }
+        }
+    }
+}
+
 fn schedule_reconnect_grace(inner: &Arc<HostShellServiceInner>, epoch: u64) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         if let Ok(tasks) = inner.tasks.lock() {
@@ -440,13 +450,16 @@ fn schedule_reconnect_grace(inner: &Arc<HostShellServiceInner>, epoch: u64) {
         let Some(inner) = weak.upgrade() else {
             return;
         };
-        if inner.session_attached.load(Ordering::SeqCst)
-            || inner.session_epoch.load(Ordering::SeqCst) != epoch
-        {
-            return;
-        }
         if let Ok(tasks) = inner.tasks.lock() {
-            cancel_all_tasks(&tasks);
+            for entry in tasks.tasks.values() {
+                let existed_at_detach = entry.session_epoch <= epoch;
+                let reproved_after_detach = entry
+                    .confirmed_epoch
+                    .is_some_and(|confirmed_epoch| confirmed_epoch > epoch);
+                if existed_at_detach && !reproved_after_detach {
+                    let _ = entry.cancel.send(true);
+                }
+            }
         }
     });
 }
@@ -853,7 +866,10 @@ mod tests {
         else {
             panic!("expected live Shell task before service drop");
         };
-        let running_state = service.task_state(running_id).unwrap();
+        let running_state = {
+            let store = service.inner.tasks.lock().unwrap();
+            Arc::clone(&store.tasks.get(&running_id).unwrap().state)
+        };
         drop(service);
         let phase = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -896,15 +912,29 @@ mod tests {
         let ShellTaskReply::Started { task_id } = started else {
             panic!("expected Shell task before reconnect grace");
         };
+        let ShellTaskReply::Status(confirmed) = service
+            .execute(ShellTaskRequest::Status { task_id }, true)
+            .await
+        else {
+            panic!("expected Controller receipt proof before reconnect grace");
+        };
+        assert_eq!(confirmed.phase, ShellTaskPhase::Running);
         drop(first_session);
         tokio::time::sleep(Duration::from_millis(20)).await;
         let second_session = service.attach_session();
+        let ShellTaskReply::Status(reproved) = service
+            .execute(ShellTaskRequest::Status { task_id }, true)
+            .await
+        else {
+            panic!("expected Shell reattach proof after reconnect within grace");
+        };
+        assert_eq!(reproved.phase, ShellTaskPhase::Running);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let ShellTaskReply::Status(status) = service
             .execute(ShellTaskRequest::Status { task_id }, true)
             .await
         else {
-            panic!("expected Shell status after reconnect within grace");
+            panic!("expected Shell status after re-proved reconnect grace");
         };
         assert_eq!(status.phase, ShellTaskPhase::Running);
 
@@ -913,6 +943,111 @@ mod tests {
             wait_terminal(&service, task_id).await.phase,
             ShellTaskPhase::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_shell_task_is_cancelled_if_reconnect_is_not_reproved() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        std::fs::create_dir_all(&root).unwrap();
+        let service = HostShellService::new_with_reconnect_grace(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 49_152, 5_000).unwrap(),
+            Duration::from_millis(80),
+        )
+        .unwrap();
+
+        let first_session = service.attach_session();
+        let started = service
+            .execute(
+                ShellTaskRequest::start(
+                    wait_command(),
+                    root.to_string_lossy(),
+                    BTreeMap::new(),
+                    5_000,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        let ShellTaskReply::Started { task_id } = started else {
+            panic!("expected Shell task before reconnect proof test");
+        };
+        let ShellTaskReply::Status(confirmed) = service
+            .execute(ShellTaskRequest::Status { task_id }, true)
+            .await
+        else {
+            panic!("expected initial Controller receipt proof");
+        };
+        assert_eq!(confirmed.phase, ShellTaskPhase::Running);
+        let task_state = {
+            let store = service.inner.tasks.lock().unwrap();
+            Arc::clone(&store.tasks.get(&task_id).unwrap().state)
+        };
+
+        drop(first_session);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _second_session = service.attach_session();
+        let phase = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let phase = task_state.lock().unwrap().phase;
+                if phase.terminal() {
+                    break phase;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Shell task survived reconnect grace without a new-epoch TaskId proof");
+        assert_eq!(phase, ShellTaskPhase::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_shell_start_is_cancelled_even_if_session_reconnects_immediately() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        std::fs::create_dir_all(&root).unwrap();
+        let service = HostShellService::new_with_reconnect_grace(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 49_152, 5_000).unwrap(),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+
+        let first_session = service.attach_session();
+        let started = service
+            .execute(
+                ShellTaskRequest::start(
+                    wait_command(),
+                    root.to_string_lossy(),
+                    BTreeMap::new(),
+                    5_000,
+                )
+                .unwrap(),
+                true,
+            )
+            .await;
+        let ShellTaskReply::Started { task_id } = started else {
+            panic!("expected unconfirmed Shell task");
+        };
+        let task_state = {
+            let store = service.inner.tasks.lock().unwrap();
+            Arc::clone(&store.tasks.get(&task_id).unwrap().state)
+        };
+
+        drop(first_session);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _second_session = service.attach_session();
+        let phase = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let phase = task_state.lock().unwrap().phase;
+                if phase.terminal() {
+                    break phase;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unconfirmed Shell task survived reconnect without Controller receipt proof");
+        assert_eq!(phase, ShellTaskPhase::Cancelled);
     }
 
     async fn wait_terminal(service: &HostShellService, task_id: TaskId) -> ShellTaskStatus {

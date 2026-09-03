@@ -444,7 +444,7 @@ impl ClewMcpServer {
     }
 
     #[tool(
-        description = "Get the current state of a Shell TaskId in this live Controller/Target session. Reconnect reattach is intentionally not a V2 capability."
+        description = "Get the current state of a Controller-projected Shell TaskId. During V3's bounded reconnect grace, the Controller may re-prove the same TaskId on a newly authenticated session for the same DeviceId."
     )]
     async fn shell_status(
         &self,
@@ -461,7 +461,7 @@ impl ClewMcpServer {
     }
 
     #[tool(
-        description = "Fetch bounded stdout/stderr chunks for a live Shell TaskId using absolute byte cursors. Output chunks remain hard-bounded by Clew."
+        description = "Fetch bounded stdout/stderr chunks for a Shell TaskId using absolute byte cursors. A confirmed task may reattach only to the same authenticated DeviceId during V3's bounded reconnect grace; output remains hard-bounded."
     )]
     async fn shell_attach(
         &self,
@@ -489,7 +489,7 @@ impl ClewMcpServer {
     }
 
     #[tool(
-        description = "Request cancellation of a live Shell TaskId. The Controller resolves the task to its original live device session; callers cannot supply another device."
+        description = "Request cancellation of a Shell TaskId. The Controller resolves the task to its original DeviceId and may re-prove it after a bounded reconnect; callers cannot supply another device."
     )]
     async fn shell_cancel(
         &self,
@@ -508,7 +508,7 @@ impl ClewMcpServer {
 
 #[tool_handler(
     name = "clew",
-    instructions = "Clew exposes bounded tools through the local Controller. List devices first when selection is ambiguous. Helper-only devices are never executable. Prefer narrow signed roots and bounded reads/searches. Write/Edit/Shell require explicit signed authority. Shell TaskIds are valid only in the current live device session."
+    instructions = "Clew exposes bounded tools through the local Controller. List devices first when selection is ambiguous. Helper-only devices are never executable. Prefer narrow signed roots and bounded reads/searches. Write/Edit/Shell require explicit signed authority. A confirmed Shell TaskId may reattach only to the same authenticated DeviceId during the bounded V3 reconnect grace; Shell Start is never blind-replayed."
 )]
 impl ServerHandler for ClewMcpServer {}
 
