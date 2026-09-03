@@ -839,6 +839,18 @@ V2 的 read-only filesystem surface（Devices/selector + Read/PathInfo/Glob/Grep
 
 V2 filesystem agent surface（Devices/selector + Read/PathInfo/Glob/Grep/Write/Edit）至此封板。下一块 V2d：live-session bounded Shell task；只做明确 command/cwd/env policy、bounded stdout/stderr、timeout/cancel 与同一会话内 task lifecycle，V3 才增加 reconnect 后 reattach/replay。
 
+### V2d-0 — Signed Shell authority + Mint parser hardening
+
+**Status：DONE（2026-09-03）**
+
+- `PermissionGrant.shell` 原本已进入 signed bootstrap / enrollment registry / Host membership，但 execute-preferred claim ceiling 仍固定 `shell=false`；V2d-0 新增 `EXECUTE_READ_WRITE_SHELL_CONNECTOR` 作为**ceiling only**，继续做 `signed grant ∩ ceiling`，所以 ceiling 自身不能给默认/旧 Site Kit 增加 Shell；`CONNECTOR_ONLY` 继续把 read/write/shell 全部剥离；
+- `InviteIssueRequest` 新增 serde-default `allow_shell=false`；owner CLI `mint/invite` 新增显式 `--allow-shell`。Controller GUI 仍明确传 `allow_write=false / allow_shell=false`，朋友侧 invite 流程不新增问题、不默认开放命令执行；write 与 shell 可以独立 opt-in；
+- 真实 Windows mint smoke 用同一 isolated Controller 生成两份 kit：默认 kit grant=`execute+connector/read`、`write=false/shell=false`；仅加 `--allow-shell` 后 grant=`execute+connector/read/shell`、`write=false`。因此 Shell authority 是签名 owner opt-in，不从 capability ceiling 或 GUI 默认获得；smoke Controller authenticated shutdown，临时 state/kit/share 全部清理；
+- 产品 smoke 同时发现并修复一个真实 Windows CLI blocker：在原有字段很多的 `Command::Mint { ... }` 再增加参数后，Clap derive 的单个巨大 enum variant 会让 Windows main-thread parser stack 越界，甚至 `clew mint --help` 直接 stack overflow。将参数等价提取为独立 `#[derive(Args)] MintArgs`，保持 CLI surface 完全兼容，同时缩短 derive/builder stack depth；修复后 `mint --help` 与真实两次 mint 均 PASS；没有通过增大 linker/thread stack 掩盖问题；
+- focused validation：grant intersection **2/2 PASS**，证明 full execute ceiling 不增加 unsigned write/shell，helper-only 仍剥离全部执行工具；Windows `mint --help` PASS；默认/shell-opt-in 真实 signed kit grant 对照 PASS；`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **154 passed / 0 failed / 6 ignored**。
+
+下一块 V2d-1：实现 live-session Shell task core。Host 持有 process/task，Controller 持有 projection；`shell.start/status/attach/cancel` 都是短 InnerSession RPC，stdout/stderr 有 bounded retained buffer + cursor，timeout/cancel 必须终止 child。V2 不承诺 connection loss 后 reattach；该恢复语义仍在 V3。
+
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
 - MCP stdio + Streamable HTTP；
@@ -953,13 +965,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b + V2c filesystem surface DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem surface + V2d-0 Shell authority DONE）**
 
-**Next block：V2d — bounded live-session Shell task**
+**Next block：V2d-1 — bounded live-session Shell task core**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 filesystem agent surface 现在已经完整覆盖 Devices/selector + Read/PathInfo/Glob/Grep/Write/Edit：selector 只在 adapter，wire/Local API 只使用 DeviceId；业务 payload 始终在 Target↔Controller InnerSession 内；read/write grant、signed roots、bounds 都由 Controller 与 Host 双端 fail closed。下一块进入 Shell，但 V2 只建立 live-session task lifecycle、bounded output、timeout/cancel；reconnect 后 reattach/replay 仍严格留在 V3。
+V1.5 已在 `3a20cd2` 正式封板。V2 filesystem agent surface 已完整闭合；Shell 的 signed authority 也已补齐并保持 default-deny。下一步只实现 live-session task core：Host process/task + Controller projection + bounded stdout/stderr cursor + timeout/cancel；MCP/CLI 都只能是 adapter。connection loss 后 reattach/replay 仍严格留在 V3，不能在 V2 偷偷引入 generic recovery。
 
 ### Change log
+
+- **2026-09-03** — V2d-0 signed Shell authority DONE + Windows Mint parser blocker fixed：execute-preferred ceiling 扩为 read/write/shell/connector，但仍与 signed grant 相交；`allow_shell` serde-default false，CLI 仅显式 `--allow-shell` opt-in，GUI 继续 false。真实 signed kit 对照确认默认 `shell=false`、opt-in `shell=true` 且 write 独立。该 smoke 暴露 `Command::Mint` 巨大 variant 在 Windows Clap derive 下 stack overflow，拆为独立 `MintArgs` 后 `mint --help`/真实 mint 恢复 PASS。workspace **154/0/6**。下一块 V2d-1 live-session Shell task core。
 
 - **2026-09-03** — V2c-1 bounded atomic text Write/Edit DONE / filesystem agent surface closed：新增 32KiB small-text `fs_mutation`，Write 强制 create-only 或 expected SHA-256，Edit 强制 expected SHA + unique old text；Host bounded existing-file read、canonical roots、same-directory secure temp + sync + atomic persist、permission preservation，Controller/Host/service 三层 write grant fail closed，legacy grant=None 不可写。真实 no-public Connector 同一 InnerSession `Read→PathInfo→Glob→Grep→Write→Edit→Read` PASS；write-capable same-kit connector-only 降权 PASS；Windows product positive Write/Edit/Read/Activity 与 default-read-only Denied negative 均 PASS；workspace **154/0/6**。下一块 V2d bounded live-session Shell task。
 

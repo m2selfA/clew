@@ -78,6 +78,8 @@ pub struct InviteIssueRequest {
     pub read_timeout_ms: u32,
     #[serde(default)]
     pub allow_write: bool,
+    #[serde(default)]
+    pub allow_shell: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -771,10 +773,11 @@ async fn issue_invite_response(
             site_id,
             invite_id,
             site_name: request.site_name.clone(),
-            grant: if request.allow_write {
-                PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
-            } else {
-                PermissionGrant::EXECUTE_READ_CONNECTOR
+            grant: PermissionGrant {
+                member: clew_core::MemberCapabilities::EXECUTE_AND_CONNECTOR,
+                read: true,
+                write: request.allow_write,
+                shell: request.allow_shell,
             },
             not_before_unix_ms: now,
             expires_unix_ms,

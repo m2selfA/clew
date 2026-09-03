@@ -31,6 +31,13 @@ impl PermissionGrant {
         shell: false,
     };
 
+    pub const EXECUTE_READ_WRITE_SHELL_CONNECTOR: Self = Self {
+        member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
+        read: true,
+        write: true,
+        shell: true,
+    };
+
     pub const CONNECTOR_ONLY: Self = Self {
         member: MemberCapabilities::CONNECTOR_ONLY,
         read: false,
@@ -75,14 +82,20 @@ mod tests {
     }
 
     #[test]
-    fn write_capable_execute_ceiling_never_adds_unsigned_write_or_shell() {
+    fn full_execute_ceiling_never_adds_unsigned_write_or_shell() {
         let read_only = PermissionGrant::EXECUTE_READ_CONNECTOR
-            .intersect(PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR);
+            .intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR);
         assert!(read_only.member.execute);
         assert!(read_only.member.connector);
         assert!(read_only.read);
         assert!(!read_only.write);
         assert!(!read_only.shell);
+
+        let write_only = PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR
+            .intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR);
+        assert!(write_only.read);
+        assert!(write_only.write);
+        assert!(!write_only.shell);
 
         let requested = PermissionGrant {
             member: MemberCapabilities::EXECUTE_AND_CONNECTOR,
@@ -90,8 +103,9 @@ mod tests {
             write: true,
             shell: true,
         };
-        let effective = requested.intersect(PermissionGrant::EXECUTE_READ_WRITE_CONNECTOR);
+        let effective = requested.intersect(PermissionGrant::EXECUTE_READ_WRITE_SHELL_CONNECTOR);
+        assert!(effective.read);
         assert!(effective.write);
-        assert!(!effective.shell);
+        assert!(effective.shell);
     }
 }

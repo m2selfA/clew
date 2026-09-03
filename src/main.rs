@@ -8,7 +8,7 @@ mod invite_io;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use clew_core::{DeviceId, InviteId, select_executable_device};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
@@ -34,6 +34,35 @@ use clew_runtime::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Args)]
+struct MintArgs {
+    site_name: String,
+    #[arg(long, value_name = "OUTFIT_ID")]
+    outfit: Option<String>,
+    #[arg(long = "root", value_name = "DIR", required = true)]
+    roots: Vec<PathBuf>,
+    #[arg(long, value_name = "FILE", default_value = "site.clew")]
+    output: PathBuf,
+    #[arg(long, default_value_t = 8)]
+    max_claims: u32,
+    #[arg(long, default_value_t = 168)]
+    valid_hours: u64,
+    #[arg(long, default_value_t = 24)]
+    deployment_hours: u64,
+    #[arg(long, default_value_t = 49_152)]
+    max_result_bytes: u32,
+    #[arg(long, default_value_t = 5_000)]
+    read_timeout_ms: u32,
+    /// Explicitly grant bounded V2 Edit/Write authority inside the signed roots.
+    #[arg(long)]
+    allow_write: bool,
+    /// Explicitly grant V2 Shell task authority. Disabled by default.
+    #[arg(long)]
+    allow_shell: bool,
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -64,30 +93,7 @@ enum Command {
     },
     #[command(alias = "invite")]
     /// Create a signed networked site.clew invitation for this Controller platform.
-    Mint {
-        site_name: String,
-        #[arg(long, value_name = "OUTFIT_ID")]
-        outfit: Option<String>,
-        #[arg(long = "root", value_name = "DIR", required = true)]
-        roots: Vec<PathBuf>,
-        #[arg(long, value_name = "FILE", default_value = "site.clew")]
-        output: PathBuf,
-        #[arg(long, default_value_t = 8)]
-        max_claims: u32,
-        #[arg(long, default_value_t = 168)]
-        valid_hours: u64,
-        #[arg(long, default_value_t = 24)]
-        deployment_hours: u64,
-        #[arg(long, default_value_t = 49_152)]
-        max_result_bytes: u32,
-        #[arg(long, default_value_t = 5_000)]
-        read_timeout_ms: u32,
-        /// Explicitly grant bounded V2 Edit/Write authority inside the signed roots.
-        #[arg(long)]
-        allow_write: bool,
-        #[arg(long, value_name = "DIR")]
-        state_dir: Option<PathBuf>,
-    },
+    Mint(MintArgs),
     /// Manage reusable Distribution Studio Outfit profiles through the Controller Local API.
     Outfit {
         #[command(subcommand)]
@@ -376,7 +382,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        Command::Mint {
+        Command::Mint(MintArgs {
             site_name,
             outfit,
             roots,
@@ -387,8 +393,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_result_bytes,
             read_timeout_ms,
             allow_write,
+            allow_shell,
             state_dir,
-        } => {
+        }) => {
             let valid_for_ms = valid_hours
                 .checked_mul(60 * 60 * 1_000)
                 .ok_or("invite validity is too large")?;
@@ -411,6 +418,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     max_result_bytes,
                     read_timeout_ms,
                     allow_write,
+                    allow_shell,
                 })
                 .await?;
             invite_io::write_invitation(&client, &result.site_file, &output).await?;

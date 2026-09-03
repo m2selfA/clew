@@ -667,6 +667,7 @@ impl ControllerApp {
                         max_result_bytes: INVITE_MAX_RESULT_BYTES,
                         read_timeout_ms: INVITE_READ_TIMEOUT_MS,
                         allow_write: false,
+                        allow_shell: false,
                     };
                     self.backend.invite_issue(request, folder.join("site.clew"));
                     self.invite_in_flight = true;
