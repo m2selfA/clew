@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use clew_core::{
     ActivityEvent, ActivityResult, ControllerId, ControllerSiteRecord, DeviceId, DeviceRecord,
-    DeviceSummary, ForwardId, InviteId, ReadPolicy, SiteId, StateLayout, TaskId,
+    DeviceSummary, ForwardId, InviteId, ProxyId, ReadPolicy, SiteId, StateLayout, TaskId,
 };
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
@@ -33,7 +33,8 @@ use tokio::{
 use crate::{
     ControllerConfig, ControllerControlStore, ForwardInfo, LocalEndpoint, OutfitAssetInfo,
     OutfitAssetStore, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub,
-    RemoteSessionInfo, RemoteSessionState, TcpForwardManager, export_controller_backup, transport,
+    RemoteSessionInfo, RemoteSessionState, Socks5Info, Socks5ProxyManager, TcpForwardManager,
+    export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -184,6 +185,18 @@ pub struct ForwardAddRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ForwardList {
     pub forwards: Vec<ForwardInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Socks5AddRequest {
+    pub device_id: DeviceId,
+    #[serde(default)]
+    pub listen_port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Socks5List {
+    pub proxies: Vec<Socks5Info>,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteSessionPathInfo {
@@ -381,6 +394,7 @@ pub(crate) struct LocalApiState {
     pub outfit_assets: Arc<Mutex<OutfitAssetStore>>,
     pub remote: RemoteHub,
     pub forwards: TcpForwardManager,
+    pub socks5: Socks5ProxyManager,
     pub shutdown_tx: watch::Sender<bool>,
 }
 
@@ -428,6 +442,11 @@ enum LocalMethod {
     ForwardList,
     ForwardRemove {
         forward_id: ForwardId,
+    },
+    Socks5Add(Socks5AddRequest),
+    Socks5List,
+    Socks5Remove {
+        proxy_id: ProxyId,
     },
     ActivityList {
         limit: u32,
@@ -479,6 +498,8 @@ enum LocalResponse {
     ShellTask(ShellTaskReply),
     ForwardInfo(ForwardInfo),
     ForwardList(ForwardList),
+    Socks5Info(Socks5Info),
+    Socks5List(Socks5List),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -640,6 +661,11 @@ async fn dispatch(
         LocalMethod::ForwardList => (forward_list_response(state), false),
         LocalMethod::ForwardRemove { forward_id } => {
             (forward_remove_response(state, forward_id).await, false)
+        }
+        LocalMethod::Socks5Add(request) => (socks5_add_response(state, request).await, false),
+        LocalMethod::Socks5List => (socks5_list_response(state), false),
+        LocalMethod::Socks5Remove { proxy_id } => {
+            (socks5_remove_response(state, proxy_id).await, false)
         }
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
@@ -1344,6 +1370,65 @@ async fn forward_remove_response(state: &LocalApiState, forward_id: ForwardId) -
     }
 }
 
+async fn socks5_add_response(state: &LocalApiState, request: Socks5AddRequest) -> LocalResponse {
+    let site_id = match authorize_tcp_egress_device(state, request.device_id) {
+        Ok(site_id) => site_id,
+        Err(response) => return response,
+    };
+    let started = Instant::now();
+    match state
+        .socks5
+        .add(request.device_id, request.listen_port)
+        .await
+    {
+        Ok(info) => {
+            record_shell_activity(
+                state,
+                site_id,
+                request.device_id,
+                "socks5_add",
+                Some(info.listen_addr.to_string()),
+                ActivityResult::Succeeded,
+                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                0,
+            );
+            LocalResponse::Socks5Info(info)
+        }
+        Err(error) => local_error(LocalApiErrorCode::Unavailable, error.to_string()),
+    }
+}
+
+fn socks5_list_response(state: &LocalApiState) -> LocalResponse {
+    match state.socks5.list() {
+        Ok(proxies) => LocalResponse::Socks5List(Socks5List { proxies }),
+        Err(error) => local_error(LocalApiErrorCode::Internal, error.to_string()),
+    }
+}
+
+async fn socks5_remove_response(state: &LocalApiState, proxy_id: ProxyId) -> LocalResponse {
+    match state.socks5.remove(proxy_id).await {
+        Ok(info) => {
+            if let Ok(store) = state.control.lock()
+                && let Some(device) = store.snapshot().catalog.device(info.device_id)
+            {
+                let site_id = device.device.site_id;
+                drop(store);
+                record_shell_activity(
+                    state,
+                    site_id,
+                    info.device_id,
+                    "socks5_remove",
+                    Some(info.listen_addr.to_string()),
+                    ActivityResult::Cancelled,
+                    0,
+                    0,
+                );
+            }
+            LocalResponse::Socks5Info(info)
+        }
+        Err(error) => local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    }
+}
 fn authorize_tcp_egress_device(
     state: &LocalApiState,
     device_id: DeviceId,
@@ -2231,6 +2316,35 @@ impl LocalApiClient {
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
     }
+    pub async fn socks5_add(
+        &self,
+        request: Socks5AddRequest,
+    ) -> Result<Socks5Info, LocalApiClientError> {
+        match self.request(LocalMethod::Socks5Add(request)).await? {
+            LocalResponse::Socks5Info(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn socks5_list(&self) -> Result<Socks5List, LocalApiClientError> {
+        match self.request(LocalMethod::Socks5List).await? {
+            LocalResponse::Socks5List(proxies) => Ok(proxies),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn socks5_remove(
+        &self,
+        proxy_id: ProxyId,
+    ) -> Result<Socks5Info, LocalApiClientError> {
+        match self.request(LocalMethod::Socks5Remove { proxy_id }).await? {
+            LocalResponse::Socks5Info(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
     pub async fn activity_list(&self, limit: u32) -> Result<ActivityList, LocalApiClientError> {
         match self.request(LocalMethod::ActivityList { limit }).await? {
             LocalResponse::ActivityList(result) => Ok(result),
@@ -2584,6 +2698,7 @@ mod tests {
             )),
             remote: RemoteHub::default(),
             forwards: TcpForwardManager::new(RemoteHub::default()),
+            socks5: Socks5ProxyManager::new(RemoteHub::default()),
             shutdown_tx: watch::channel(false).0,
         }
     }

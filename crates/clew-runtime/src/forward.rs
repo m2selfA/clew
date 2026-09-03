@@ -214,26 +214,63 @@ async fn serve_local_connection(
     _permit: OwnedSemaphorePermit,
 ) {
     let connection_id = ForwardConnectionId::new();
-    let open = TcpForwardRequest::open(
-        info.forward_id,
-        connection_id,
-        info.destination.clone(),
-        HARD_MAX_TCP_FORWARD_CONNECT_TIMEOUT_MS,
-    );
-    let Ok(open) = open else {
+    let opened = tokio::select! {
+        _ = shutdown.changed() => return,
+        result = open_forward_connection(
+            &remote,
+            info.device_id,
+            info.forward_id,
+            connection_id,
+            info.destination.clone(),
+        ) => result,
+    };
+    let Ok((
+        generation,
+        TcpForwardReply::Opened {
+            connection_id: actual,
+        },
+    )) = opened
+    else {
         return;
     };
-    let (generation, reply) = tokio::select! {
-        _ = shutdown.changed() => return,
-        result = remote.tcp_forward_open(info.device_id, open) => {
-            let Ok(result) = result else { return; };
-            result
-        }
-    };
-    if !matches!(reply, TcpForwardReply::Opened { connection_id: actual } if actual == connection_id)
-    {
+    if actual != connection_id {
         return;
     }
+    pump_forward_connection(
+        remote,
+        info.device_id,
+        generation,
+        connection_id,
+        &mut local,
+        shutdown,
+    )
+    .await;
+}
+
+pub(crate) async fn open_forward_connection(
+    remote: &RemoteHub,
+    device_id: DeviceId,
+    forward_id: ForwardId,
+    connection_id: ForwardConnectionId,
+    destination: TcpForwardDestination,
+) -> Result<(u64, TcpForwardReply), crate::RemoteHubError> {
+    let open = TcpForwardRequest::open(
+        forward_id,
+        connection_id,
+        destination,
+        HARD_MAX_TCP_FORWARD_CONNECT_TIMEOUT_MS,
+    )?;
+    remote.tcp_forward_open(device_id, open).await
+}
+
+pub(crate) async fn pump_forward_connection(
+    remote: RemoteHub,
+    device_id: DeviceId,
+    generation: u64,
+    connection_id: ForwardConnectionId,
+    local: &mut TcpStream,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let _ = local.set_nodelay(true);
     let mut local_eof_sent = false;
     let mut local_buffer = vec![0_u8; HARD_MAX_TCP_FORWARD_CHUNK_BYTES as usize];
@@ -254,19 +291,19 @@ async fn serve_local_connection(
                 Ok(Err(_)) => break,
             }
         };
-        let request = TcpForwardRequest::exchange(
+        let request = match TcpForwardRequest::exchange(
             connection_id,
             &write,
             write_eof,
             HARD_MAX_TCP_FORWARD_CHUNK_BYTES,
             REMOTE_READ_WAIT_MS.min(HARD_MAX_TCP_FORWARD_READ_WAIT_MS),
-        );
-        let Ok(request) = request else {
-            break;
+        ) {
+            Ok(request) => request,
+            Err(_) => break,
         };
         let reply = tokio::select! {
             _ = shutdown.changed() => break,
-            result = remote.tcp_forward_on_generation(info.device_id, generation, request) => {
+            result = remote.tcp_forward_on_generation(device_id, generation, request) => {
                 let Ok(reply) = result else { break; };
                 reply
             }
@@ -295,7 +332,7 @@ async fn serve_local_connection(
     }
     let _ = remote
         .tcp_forward_on_generation(
-            info.device_id,
+            device_id,
             generation,
             TcpForwardRequest::Close { connection_id },
         )

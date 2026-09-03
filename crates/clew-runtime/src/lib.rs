@@ -10,6 +10,7 @@ mod lock;
 mod outfit;
 mod outfit_asset;
 mod remote;
+mod socks5;
 mod transport;
 
 pub use backup::{ControllerBackupIoError, export_controller_backup, restore_controller_backup};
@@ -29,7 +30,7 @@ pub use local_api::{
     OutfitSetFieldRequest, OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest,
     RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
     RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
-    RemoteWriteRequest,
+    RemoteWriteRequest, Socks5AddRequest, Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
@@ -43,4 +44,7 @@ pub use outfit_asset::{
 pub use remote::{
     MAX_REMOTE_CONNECTIONS, RemoteConnectionError, RemoteHub, RemoteHubError, RemotePathState,
     RemoteSessionInfo, RemoteSessionState, RemoteSessionTopology, handle_remote_connection,
+};
+pub use socks5::{
+    HARD_MAX_SOCKS5_LISTENERS, Socks5Info, Socks5ProxyManager, Socks5ProxyManagerError,
 };

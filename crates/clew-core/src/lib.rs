@@ -15,7 +15,7 @@ pub use control::{
 };
 pub use device::{DeviceNameOrigin, DeviceRecord, DeviceSummary, MemberCapabilities, SiteMember};
 pub use id::{
-    ControllerId, DeviceId, ForwardConnectionId, ForwardId, InviteId, RequestId, SiteId,
+    ControllerId, DeviceId, ForwardConnectionId, ForwardId, InviteId, ProxyId, RequestId, SiteId,
     StableIdError, TaskId, TransferId,
 };
 pub use naming::{

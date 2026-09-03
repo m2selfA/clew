@@ -110,6 +110,7 @@ define_stable_id!(TransferId);
 define_stable_id!(RequestId);
 define_stable_id!(ForwardId);
 define_stable_id!(ForwardConnectionId);
+define_stable_id!(ProxyId);
 
 #[cfg(test)]
 mod tests {

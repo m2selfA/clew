@@ -10,7 +10,7 @@ mod mcp;
 mod studio;
 
 use clap::{Args, Parser, Subcommand};
-use clew_core::{DeviceId, ForwardId, InviteId, TaskId, select_executable_device};
+use clew_core::{DeviceId, ForwardId, InviteId, ProxyId, TaskId, select_executable_device};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
     acquire_host_instance, resolve_host_launch_with_mode,
@@ -23,7 +23,7 @@ use clew_runtime::{
     InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitCloneRequest,
     OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteEditRequest,
     RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
     restore_controller_backup, start_controller,
 };
 
@@ -198,6 +198,11 @@ enum Command {
         #[command(subcommand)]
         command: ForwardCommand,
     },
+    /// Manage Controller-owned loopback proxy adapters.
+    Proxy {
+        #[command(subcommand)]
+        command: ProxyCommand,
+    },
     /// Serve Clew's agent tools over Model Context Protocol.
     Mcp {
         #[command(subcommand)]
@@ -315,6 +320,38 @@ enum ForwardCommand {
     /// Remove one Controller-owned local TCP forward.
     Remove {
         forward_id: ForwardId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum ProxyCommand {
+    /// Manage a SOCKS5 v5/no-auth/TCP-CONNECT loopback proxy.
+    Socks5 {
+        #[command(subcommand)]
+        command: Socks5Command,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum Socks5Command {
+    /// Add a persistent Controller-owned SOCKS5 loopback listener.
+    Add {
+        #[arg(value_name = "DEVICE")]
+        device: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        listen_port: u16,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// List Controller-owned SOCKS5 listeners.
+    List {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Remove one Controller-owned SOCKS5 listener.
+    Remove {
+        proxy_id: ProxyId,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -749,6 +786,41 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&info)?);
             }
+        },
+        Command::Proxy { command } => match command {
+            ProxyCommand::Socks5 { command } => match command {
+                Socks5Command::Add {
+                    device,
+                    listen_port,
+                    state_dir,
+                } => {
+                    let client = LocalApiClient::new(controller_config(state_dir)?);
+                    let devices = client.device_list().await?;
+                    let device_id = select_executable_device(&devices.devices, device.as_deref())?;
+                    let info = client
+                        .socks5_add(Socks5AddRequest {
+                            device_id,
+                            listen_port,
+                        })
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
+                Socks5Command::List { state_dir } => {
+                    let result = LocalApiClient::new(controller_config(state_dir)?)
+                        .socks5_list()
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                Socks5Command::Remove {
+                    proxy_id,
+                    state_dir,
+                } => {
+                    let info = LocalApiClient::new(controller_config(state_dir)?)
+                        .socks5_remove(proxy_id)
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
+            },
         },
         Command::Mcp { command } => match command {
             McpCommand::Stdio { state_dir } => {
