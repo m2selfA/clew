@@ -32,6 +32,36 @@ const CONNECTOR_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
 const SEALED_ACTIVATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_CONTINUITY_GAP_MS: u64 = 15_000;
+
+#[derive(Clone, Copy, Debug)]
+struct SessionContinuity {
+    last_peer_activity_unix_ms: u64,
+}
+
+impl SessionContinuity {
+    fn new(now_unix_ms: u64) -> Self {
+        Self {
+            last_peer_activity_unix_ms: now_unix_ms,
+        }
+    }
+
+    fn ensure_current(&self, now_unix_ms: u64) -> Result<(), RemoteHubError> {
+        if now_unix_ms < self.last_peer_activity_unix_ms
+            || now_unix_ms.saturating_sub(self.last_peer_activity_unix_ms)
+                > SESSION_CONTINUITY_GAP_MS
+        {
+            return Err(RemoteHubError::SessionContinuityLost);
+        }
+        Ok(())
+    }
+
+    fn observe_peer_activity(&mut self, now_unix_ms: u64) -> Result<(), RemoteHubError> {
+        self.ensure_current(now_unix_ms)?;
+        self.last_peer_activity_unix_ms = now_unix_ms;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1136,11 +1166,14 @@ async fn recv_rpc_reply_with_progress(
     inner: &mut InnerSession,
     stream: &mut IrohStream,
     request_id: RequestId,
+    continuity: &mut SessionContinuity,
 ) -> Result<InnerMessage, RemoteHubError> {
     loop {
+        continuity.ensure_current(hub_unix_ms()?)?;
         let message = tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, inner.recv(stream))
             .await
             .map_err(|_| RemoteHubError::RpcLivenessTimeout(request_id))??;
+        continuity.observe_peer_activity(hub_unix_ms()?)?;
         if is_rpc_progress(request_id, &message)? {
             continue;
         }
@@ -1153,11 +1186,17 @@ async fn send_rpc_request_with_timeout(
     stream: &mut IrohStream,
     request_id: RequestId,
     message: InnerMessage,
+    continuity: &SessionContinuity,
 ) -> Result<(), RemoteHubError> {
+    continuity.ensure_current(hub_unix_ms()?)?;
     tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, inner.send(stream, &message))
         .await
         .map_err(|_| RemoteHubError::RpcLivenessTimeout(request_id))??;
     Ok(())
+}
+
+fn hub_unix_ms() -> Result<u64, RemoteHubError> {
+    unix_ms().map_err(|_| RemoteHubError::SessionContinuityLost)
 }
 
 async fn handle_member(
@@ -1222,6 +1261,7 @@ async fn handle_member(
         inner.send(stream, &lease.into_message()?).await?;
     }
     let connected_unix_ms = unix_ms()?;
+    let mut continuity = SessionContinuity::new(connected_unix_ms);
     let connection = stream.connection().clone();
     let initial_path = match topology {
         RemoteSessionTopology::Direct => classify_connection_path(&connection),
@@ -1255,10 +1295,14 @@ async fn handle_member(
         tokio::time::Instant::now() + SESSION_HEARTBEAT_INTERVAL,
         SESSION_HEARTBEAT_INTERVAL,
     );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let command = tokio::select! {
             _ = &mut connection_closed => break,
             _ = heartbeat.tick() => {
+                if continuity.ensure_current(unix_ms()?).is_err() {
+                    break;
+                }
                 let payload = generation.to_le_bytes().to_vec();
                 let ping = InnerMessage::new("session_ping", payload.clone())?;
                 let result = tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, async {
@@ -1268,7 +1312,11 @@ async fn handle_member(
                 })
                 .await;
                 match result {
-                    Ok(Ok(pong)) if pong.kind == "session_pong" && pong.payload == payload => {}
+                    Ok(Ok(pong)) if pong.kind == "session_pong" && pong.payload == payload => {
+                        if continuity.observe_peer_activity(unix_ms()?).is_err() {
+                            break;
+                        }
+                    }
                     _ => break,
                 }
                 continue;
@@ -1288,8 +1336,21 @@ async fn handle_member(
                     _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
                     result = async {
                         let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
-                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
                         Ok(ReadReply::from_message(&message)?)
                     } => result,
                 };
@@ -1308,8 +1369,21 @@ async fn handle_member(
                     _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
                     result = async {
                         let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
-                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
                         Ok(FsQueryReply::from_message(&message)?)
                     } => result,
                 };
@@ -1328,8 +1402,21 @@ async fn handle_member(
                     _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
                     result = async {
                         let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
-                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
                         Ok(FsMutationReply::from_message(&message)?)
                     } => result,
                 };
@@ -1348,8 +1435,21 @@ async fn handle_member(
                     _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
                     result = async {
                         let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
-                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
                         Ok(ShellTaskReply::from_message(&message)?)
                     } => result,
                 };
@@ -1477,6 +1577,8 @@ pub enum RemoteHubError {
     StatePoisoned,
     #[error("remote session generation overflow")]
     GenerationOverflow,
+    #[error("remote session continuity was lost across a long process pause or wall-clock jump")]
+    SessionContinuityLost,
     #[error("remote RPC {0} stopped making progress")]
     RpcLivenessTimeout(RequestId),
     #[error("Controller live Shell task projection capacity is exhausted")]
@@ -1788,6 +1890,24 @@ mod tests {
         drop(stream);
         connector_outer.close().await;
         controller_outer.close().await;
+    }
+
+    #[test]
+    fn session_continuity_rejects_long_pause_or_clock_regression() {
+        let mut continuity = SessionContinuity::new(10_000);
+        continuity
+            .observe_peer_activity(10_000 + SESSION_CONTINUITY_GAP_MS)
+            .unwrap();
+        assert!(matches!(
+            continuity.ensure_current(10_000 + SESSION_CONTINUITY_GAP_MS * 2 + 1),
+            Err(RemoteHubError::SessionContinuityLost)
+        ));
+
+        let continuity = SessionContinuity::new(20_000);
+        assert!(matches!(
+            continuity.ensure_current(19_999),
+            Err(RemoteHubError::SessionContinuityLost)
+        ));
     }
 
     #[test]

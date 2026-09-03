@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a + V3b + V3c + V3d DONE）**
+**Status：IN PROGRESS（V3a + V3b + V3c + V3d + V3e DONE）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -1031,6 +1031,20 @@ V3c Shell reattach至此封板。V3c-1中“网络重连即可免除旧grace取�
 - focused descriptor **4/4 PASS**，proto Feature 6 **1/1 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **181 passed / 0 failed / 6 ignored**。
 
 V3d至此封板。下一块 V3e：sleep/resume。目标只处理OS suspend/长时间sleep造成的stale session/path/liveness与Host reconnect节奏，不做后台service persistence；恢复后必须重新authenticated session/generation，旧RPC/Shell/File resume各自继续遵守V3b/V3c/V3d既有身份边界。
+
+### V3e — Sleep/resume continuity + wall-clock deadlines
+
+**Status：DONE（2026-09-03）**
+
+- Controller每个authenticated Target InnerSession新增process-local `SessionContinuity`：记录最近一次**peer activity的Unix wall-clock ms**。continuity hard gap固定为 **15s = 5s heartbeat interval + 5s timeout + 5s margin**；空闲heartbeat发出前、每个业务RPC发送前、每个 `rpc_progress`/final reply收到时都检查。墙钟前进超过15s或发生回退都视为session continuity丢失，当前generation立即fail closed并退出；不会在长suspend后的旧Noise transport上继续Read/Mutation/Shell。V3b replayable RPC随后仍以同RequestId等待新generation，Shell/File分别继续遵守V3c/V3d身份边界；
+- idle heartbeat与Host active-RPC `rpc_progress` interval都显式改为 `MissedTickBehavior::Skip`，避免suspend/resume后Tokio默认burst补发一串旧timer tick。长停顿恢复只触发一次stale-session收口/重新认证，不制造heartbeat/progress storm；
+- Host Shell command timeout与V3c reconnect grace从纯相对 `tokio::sleep`提升为**wall-clock deadline + 最多250ms poll**。系统/进程长停顿计入用户给出的command timeout和30s reconnect grace；墙钟回退同样fail closed。这样Controller projection的Unix deadline与Host task owner不再因平台上monotonic timer是否计入sleep而分叉；每个new session epoch仍必须重新Status/Attach proof，网络恢复本身不续task；
+- focused validation：Controller continuity边界 **1/1 PASS**（15s整可接受，超过即stale，clock regression拒绝）；Host wall-deadline纯状态 **1/1 PASS**；V3c reconnect **4/4 PASS**；原 `live_shell_task_has_bounded_output_status_timeout_cancel_and_root_policy` **1/1 PASS**；V3b cross-generation replay / Shell Start zero-blind-replay **1/1 PASS**；
+- **真实 Windows runtime-pause product gate PASS**：cap00隔离Controller + mzd真实Host/同一signed `--allow-shell` Site Kit。单个cap00 PowerShell测试进程先精确读取同DeviceId **generation 7**，随后仅对隔离Controller PID `86652` 调用Windows `NtSuspendProcess` 暂停 **20.039s**，`finally`中恢复；恢复后同一脚本轮询到**generation 8**，`connected_unix_ms=1788444177839`明确晚于suspend start `1788444156534`，证明长runtime pause后旧InnerSession没有被续用，而是重新authenticated session/generation。没有暂停整机、SSH或mzd；
+- Host-runtime pause另外做过诊断性探针，但自动化调用间隙与自然network generation切换会让归因不稳定，因此**不计入正式PASS**、也不写成OS sleep真机证据；Host侧正式证据只采用wall-deadline focused tests +正常Shell timeout回归。V3e不声称拥有Windows/macOS/Linux power-event hook，也不引入service/background persistence；
+- 真实 no-public NearbyFile Connector full business chain **1/1 PASS（3.57s）**；smoke后mzd Host job、Controller、远端/本地fixture全部清理。final `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **183 passed / 0 failed / 6 ignored**。
+
+V3e至此封板。下一块 V3f：wire/capability compatibility matrix。重点冻结`WIRE_MAJOR` hard incompatibility、`CAPABILITY_VERSION`与Feature位的独立语义、unknown feature forward-compat、FileResume feature 6不被版本号暗示，以及旧peer/新peer在不理解新feature时仍可安全使用V2/V3基础面；不在本块新增第二wire major或自动协议升级。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1131,13 +1145,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c + V3d DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c + V3d + V3e DONE）**
 
-**Next block：V3e — sleep/resume**
+**Next block：V3f — wire/capability compatibility matrix**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b已闭合短RPC跨generation replay，V3c已闭合same-Device Shell TaskId reattach，V3d把早期Feature 6占位提升为不泄漏Controller本机path、带stable TransferId与monotonic hash checkpoint的纯控制面File resume contract，同时仍不实现V5数据面。下一块处理OS sleep/resume导致的stale session/liveness/reconnect语义。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b闭合短RPC跨generation replay，V3c闭合same-Device Shell TaskId reattach，V3d冻结File resume纯控制面contract，V3e将长runtime pause显式变成session continuity中断并把Shell timeout/grace统一为wall-clock deadline。下一块冻结wire major/capability version/feature negotiation兼容矩阵，避免后续V4/V5把“版本号”和“已实现feature”混为一谈。
 
 ### Change log
+
+- **2026-09-03** — V3e sleep/resume continuity DONE：Controller新增15s wall-clock `SessionContinuity`，idle heartbeat/业务send/progress/reply都拒绝长pause后的旧InnerSession，heartbeat/progress missed tick改为Skip；Host Shell timeout与30s reconnect grace改为wall-clock deadline（250ms poll），clock regression fail closed。focused continuity **1/1**、wall deadline **1/1**、V3c reconnect **4/4**、V3b replay **1/1**，no-public Connector **1/1（3.57s）**。Windows真实runtime-pause gate在同一脚本中精确观测隔离Controller **generation 7 → suspend 20.039s → generation 8**；Host-pause诊断因时序归因不稳定未计正式PASS。workspace **183/0/6**。下一块 V3f compatibility matrix。
 
 - **2026-09-03** — V3d File resume interface reservation DONE：复用既有proto `FEATURE_FILE_RESUME=6`且保持`CAPABILITY_VERSION=1`，新增显式feature查询但当前生产不自动广告；新增stable `TransferId`与8KiB peer-visible `FileResumeDescriptor v1`，绑定Controller/Site/Device/direction/device path/size/revision/offset/prefix hash/final hash，Controller本机path故意留在future private state。successor validator冻结scope、revision/offset单调、same-offset prefix hash与known final hash；complete checkpoint必须有匹配full SHA-256。无文件I/O、无chunk/data plane/Local API/CLI/MCP。descriptor **4/4**、Feature 6 **1/1**、workspace **181/0/6**。下一块 V3e sleep/resume。
 

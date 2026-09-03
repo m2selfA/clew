@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clew_core::{ReadPolicy, TaskId};
@@ -21,6 +21,8 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinHandle,
 };
+
+const WALL_DEADLINE_POLL_MS: u64 = 250;
 
 #[derive(Clone, Debug)]
 pub struct HostShellService {
@@ -444,9 +446,9 @@ fn schedule_reconnect_grace(inner: &Arc<HostShellServiceInner>, epoch: u64) {
         return;
     };
     let weak = Arc::downgrade(inner);
-    let grace = inner.reconnect_grace;
+    let deadline_unix_ms = wall_deadline_after(inner.reconnect_grace);
     handle.spawn(async move {
-        tokio::time::sleep(grace).await;
+        wait_for_wall_deadline(deadline_unix_ms).await;
         let Some(inner) = weak.upgrade() else {
             return;
         };
@@ -524,8 +526,7 @@ async fn run_child(
     stdout_task: JoinHandle<std::io::Result<()>>,
     stderr_task: JoinHandle<std::io::Result<()>>,
 ) {
-    let timeout_sleep = tokio::time::sleep(timeout);
-    tokio::pin!(timeout_sleep);
+    let timeout_deadline_unix_ms = wall_deadline_after(timeout);
     let (phase, exit_code) = tokio::select! {
         result = child.wait() => match result {
             Ok(status) => (ShellTaskPhase::Exited, status.code()),
@@ -536,7 +537,7 @@ async fn run_child(
             let _ = child.kill().await;
             (ShellTaskPhase::Cancelled, None)
         },
-        _ = &mut timeout_sleep => {
+        _ = wait_for_wall_deadline(timeout_deadline_unix_ms) => {
             let _ = child.kill().await;
             (ShellTaskPhase::TimedOut, None)
         }
@@ -561,6 +562,46 @@ async fn run_child(
             state.phase = phase;
             state.exit_code = exit_code;
         }
+    }
+}
+
+fn unix_ms_now() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn wall_deadline_after(duration: Duration) -> Option<u64> {
+    let now = unix_ms_now()?;
+    let duration_ms = u64::try_from(duration.as_millis()).ok()?;
+    now.checked_add(duration_ms)
+}
+
+fn wall_deadline_reached(previous_now: u64, now: u64, deadline: u64) -> bool {
+    now < previous_now || now >= deadline
+}
+
+async fn wait_for_wall_deadline(deadline_unix_ms: Option<u64>) {
+    let Some(deadline_unix_ms) = deadline_unix_ms else {
+        return;
+    };
+    let Some(mut previous_now) = unix_ms_now() else {
+        return;
+    };
+    loop {
+        let Some(now) = unix_ms_now() else {
+            return;
+        };
+        if wall_deadline_reached(previous_now, now, deadline_unix_ms) {
+            return;
+        }
+        previous_now = now;
+        let remaining_ms = deadline_unix_ms.saturating_sub(now);
+        tokio::time::sleep(Duration::from_millis(
+            remaining_ms.min(WALL_DEADLINE_POLL_MS).max(1),
+        ))
+        .await;
     }
 }
 
@@ -644,6 +685,13 @@ mod tests {
     use super::*;
     use clew_transport::HARD_MAX_SHELL_ATTACH_BYTES_PER_STREAM;
     use tempfile::tempdir;
+
+    #[test]
+    fn wall_deadline_counts_forward_pause_and_fails_closed_on_clock_regression() {
+        assert!(!wall_deadline_reached(1_000, 1_100, 1_200));
+        assert!(wall_deadline_reached(1_100, 1_200, 1_200));
+        assert!(wall_deadline_reached(1_100, 1_099, 1_200));
+    }
 
     #[test]
     fn retained_ring_reports_lost_prefix_and_absolute_cursors() {

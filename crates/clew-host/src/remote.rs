@@ -806,6 +806,7 @@ where
     tokio::pin!(operation);
     let interval = Duration::from_millis(RPC_PROGRESS_INTERVAL_MS);
     let mut progress = tokio::time::interval_at(Instant::now() + interval, interval);
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             result = &mut operation => return result,
