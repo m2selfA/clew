@@ -10,9 +10,10 @@ use clew_identity::{EnrollmentError, StoredControllerIdentity};
 use clew_transport::{
     BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest,
     BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
-    ControllerSessionAuthority, InnerSession, IrohProtocol, IrohStream, ReadReply, ReadRequest,
-    SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease,
-    SiteDiscoveryTag, read_bootstrap, read_connector_open, write_bootstrap,
+    ControllerSessionAuthority, FsQueryReply, FsQueryRequest, InnerSession, IrohProtocol,
+    IrohStream, ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError,
+    SealedBootstrapSession, SignedConnectorLease, SiteDiscoveryTag, read_bootstrap,
+    read_connector_open, write_bootstrap,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -47,6 +48,10 @@ enum RemoteCommand {
     Read {
         request: ReadRequest,
         reply: oneshot::Sender<Result<ReadReply, RemoteHubError>>,
+    },
+    FsQuery {
+        request: FsQueryRequest,
+        reply: oneshot::Sender<Result<FsQueryReply, RemoteHubError>>,
     },
     Stop,
 }
@@ -87,6 +92,31 @@ impl RemoteHub {
             .ok_or(RemoteHubError::Offline(device_id))?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::Read {
+            request,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| RemoteHubError::Offline(device_id))?;
+        reply_rx
+            .await
+            .map_err(|_| RemoteHubError::Offline(device_id))?
+    }
+
+    pub async fn fs_query(
+        &self,
+        device_id: DeviceId,
+        request: FsQueryRequest,
+    ) -> Result<FsQueryReply, RemoteHubError> {
+        let tx = self
+            .inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?
+            .sessions
+            .get(&device_id)
+            .map(|slot| slot.tx.clone())
+            .ok_or(RemoteHubError::Offline(device_id))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(RemoteCommand::FsQuery {
             request,
             reply: reply_tx,
         })
@@ -575,6 +605,19 @@ async fn handle_member(
                     break;
                 }
             }
+            RemoteCommand::FsQuery { request, reply } => {
+                let result = async {
+                    inner.send(stream, &request.into_message()?).await?;
+                    let message = inner.recv(stream).await?;
+                    Ok(FsQueryReply::from_message(&message)?)
+                }
+                .await;
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
             RemoteCommand::Stop => break,
         }
     }
@@ -635,6 +678,8 @@ pub enum RemoteHubError {
     TokenOverflow,
     #[error(transparent)]
     Inner(#[from] clew_transport::InnerSessionError),
+    #[error(transparent)]
+    FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     Read(#[from] clew_transport::ReadProtocolError),
 }

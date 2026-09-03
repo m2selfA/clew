@@ -1,7 +1,14 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    path::{Path, PathBuf},
+    time::{Duration, UNIX_EPOCH},
+};
 
 use clew_core::ReadPolicy;
-use clew_transport::{ReadErrorCode, ReadReply, ReadRequest};
+use clew_transport::{
+    FsGlobPage, FsPathInfo, FsPathKind, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
+    HARD_MAX_FS_SCAN_ENTRIES, ReadErrorCode, ReadReply, ReadRequest,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
     time::timeout,
@@ -44,37 +51,70 @@ impl HostReadService {
         }
     }
 
+    pub async fn execute_fs_query(&self, request: FsQueryRequest) -> FsQueryReply {
+        if request.validate().is_err() {
+            return FsQueryReply::error(
+                FsQueryErrorCode::InvalidRequest,
+                "invalid bounded filesystem query",
+            );
+        }
+        if !self.policy.allows_read() {
+            return FsQueryReply::error(
+                FsQueryErrorCode::Denied,
+                "filesystem query is outside the allowed policy",
+            );
+        }
+        if let FsQueryRequest::Glob { max_bytes, .. } = &request
+            && *max_bytes > self.policy.max_result_bytes
+        {
+            return FsQueryReply::error(
+                FsQueryErrorCode::Denied,
+                "filesystem query byte limit exceeds the allowed policy",
+            );
+        }
+        let operation = async {
+            match request {
+                FsQueryRequest::PathInfo { path } => self.path_info_once(path).await,
+                FsQueryRequest::Glob {
+                    root,
+                    pattern,
+                    cursor,
+                    limit,
+                    max_bytes,
+                } => {
+                    self.glob_once(root, pattern, cursor, limit, max_bytes)
+                        .await
+                }
+            }
+        };
+        match timeout(
+            Duration::from_millis(self.policy.timeout_ms as u64),
+            operation,
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            Err(_) => FsQueryReply::error(FsQueryErrorCode::Timeout, "filesystem query timed out"),
+        }
+    }
+
     async fn read_once(&self, request: ReadRequest) -> ReadReply {
         let requested = PathBuf::from(&request.path);
-        if !requested.is_absolute() {
-            return ReadReply::error(ReadErrorCode::Denied, "Read path must be absolute");
-        }
-        let target = match tokio::fs::canonicalize(&requested).await {
+        let target = match self.canonical_allowed(&requested).await {
             Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(PathAccessError::NotAbsolute | PathAccessError::OutsideRoots) => {
+                return ReadReply::error(
+                    ReadErrorCode::Denied,
+                    "Read target is outside allowed roots",
+                );
+            }
+            Err(PathAccessError::NotFound) => {
                 return ReadReply::error(ReadErrorCode::NotFound, "Read target was not found");
             }
-            Err(_) => {
+            Err(PathAccessError::Io) => {
                 return ReadReply::error(ReadErrorCode::Io, "Read target could not be opened");
             }
         };
-
-        let mut allowed = false;
-        for root in &self.policy.roots {
-            let Ok(root) = tokio::fs::canonicalize(root).await else {
-                continue;
-            };
-            if target.starts_with(&root) {
-                allowed = true;
-                break;
-            }
-        }
-        if !allowed {
-            return ReadReply::error(
-                ReadErrorCode::Denied,
-                "Read target is outside allowed roots",
-            );
-        }
 
         let metadata = match tokio::fs::metadata(&target).await {
             Ok(metadata) => metadata,
@@ -106,6 +146,300 @@ impl HostReadService {
         ReadReply::data(data)
             .unwrap_or_else(|_| ReadReply::error(ReadErrorCode::Io, "Read result bound failed"))
     }
+
+    async fn path_info_once(&self, path: String) -> FsQueryReply {
+        let requested = PathBuf::from(&path);
+        let target = match self.canonical_allowed(&requested).await {
+            Ok(path) => path,
+            Err(error) => return fs_access_error(error),
+        };
+        let metadata = match tokio::fs::metadata(&target).await {
+            Ok(metadata) => metadata,
+            Err(_) => return FsQueryReply::error(FsQueryErrorCode::Io, "metadata failed"),
+        };
+        let Some(path) = target.to_str() else {
+            return FsQueryReply::error(FsQueryErrorCode::Io, "filesystem path is not valid UTF-8");
+        };
+        FsQueryReply::PathInfo(path_info(path.to_owned(), &metadata, None))
+    }
+
+    async fn glob_once(
+        &self,
+        root: String,
+        pattern: String,
+        cursor: u64,
+        limit: u32,
+        max_bytes: u32,
+    ) -> FsQueryReply {
+        let requested = PathBuf::from(&root);
+        let root = match self.canonical_allowed(&requested).await {
+            Ok(path) => path,
+            Err(error) => return fs_access_error(error),
+        };
+        let metadata = match tokio::fs::metadata(&root).await {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return FsQueryReply::error(FsQueryErrorCode::Io, "glob root metadata failed");
+            }
+        };
+        if !metadata.is_dir() {
+            return FsQueryReply::error(
+                FsQueryErrorCode::NotDirectory,
+                "glob root is not a directory",
+            );
+        }
+        let pattern = pattern.replace('\\', "/");
+        if pattern.starts_with('/') || pattern.split('/').count() > 128 {
+            return FsQueryReply::error(
+                FsQueryErrorCode::InvalidRequest,
+                "glob pattern must be a bounded relative pattern",
+            );
+        }
+
+        let mut queue = VecDeque::from([(root.clone(), String::new())]);
+        let mut visited_directories = BTreeSet::from([root.clone()]);
+        let mut scanned = 0_usize;
+        let mut matched = 0_u64;
+        let mut entries = Vec::new();
+        while let Some((directory, prefix)) = queue.pop_front() {
+            let mut reader = match tokio::fs::read_dir(&directory).await {
+                Ok(reader) => reader,
+                Err(_) => {
+                    return FsQueryReply::error(FsQueryErrorCode::Io, "glob directory read failed");
+                }
+            };
+            let mut children = Vec::new();
+            loop {
+                match reader.next_entry().await {
+                    Ok(Some(entry)) => children.push(entry),
+                    Ok(None) => break,
+                    Err(_) => {
+                        return FsQueryReply::error(
+                            FsQueryErrorCode::Io,
+                            "glob directory iteration failed",
+                        );
+                    }
+                }
+            }
+            children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+            for entry in children {
+                scanned = scanned.saturating_add(1);
+                if scanned > HARD_MAX_FS_SCAN_ENTRIES {
+                    return FsQueryReply::error(
+                        FsQueryErrorCode::ScanLimit,
+                        "glob scan exceeded its hard entry bound",
+                    );
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let relative = if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let file_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(_) => {
+                        return FsQueryReply::error(
+                            FsQueryErrorCode::Io,
+                            "glob file type lookup failed",
+                        );
+                    }
+                };
+                if file_type.is_dir()
+                    && !file_type.is_symlink()
+                    && let Ok(canonical_child) = tokio::fs::canonicalize(entry.path()).await
+                    && canonical_child.starts_with(&root)
+                    && visited_directories.insert(canonical_child.clone())
+                {
+                    queue.push_back((canonical_child, relative.clone()));
+                }
+                if !glob_matches(&pattern, &relative) {
+                    continue;
+                }
+                matched = matched.saturating_add(1);
+                if matched <= cursor {
+                    continue;
+                }
+                if entries.len() >= limit as usize {
+                    return glob_page(entries, cursor, true);
+                }
+                let metadata = match tokio::fs::symlink_metadata(entry.path()).await {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        return FsQueryReply::error(
+                            FsQueryErrorCode::Io,
+                            "glob metadata lookup failed",
+                        );
+                    }
+                };
+                let Some(path) = entry.path().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let info = path_info(path, &metadata, Some(file_type.is_symlink()));
+                let mut candidate = entries.clone();
+                candidate.push(info.clone());
+                let candidate_reply = FsQueryReply::Glob(FsGlobPage {
+                    entries: candidate,
+                    next_cursor: Some(cursor.saturating_add(entries.len() as u64 + 1)),
+                    truncated: true,
+                });
+                let encoded_len = serde_json::to_vec(&candidate_reply)
+                    .map(|encoded| encoded.len())
+                    .unwrap_or(usize::MAX);
+                if encoded_len > max_bytes as usize {
+                    if entries.is_empty() {
+                        return FsQueryReply::error(
+                            FsQueryErrorCode::InvalidRequest,
+                            "glob max_bytes is too small for the next result entry",
+                        );
+                    }
+                    return glob_page(entries, cursor, true);
+                }
+                entries.push(info);
+            }
+        }
+        glob_page(entries, cursor, false)
+    }
+
+    async fn canonical_allowed(&self, requested: &Path) -> Result<PathBuf, PathAccessError> {
+        if !requested.is_absolute() {
+            return Err(PathAccessError::NotAbsolute);
+        }
+        let target = tokio::fs::canonicalize(requested).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PathAccessError::NotFound
+            } else {
+                PathAccessError::Io
+            }
+        })?;
+        for root in &self.policy.roots {
+            let Ok(root) = tokio::fs::canonicalize(root).await else {
+                continue;
+            };
+            if target.starts_with(&root) {
+                return Ok(target);
+            }
+        }
+        Err(PathAccessError::OutsideRoots)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PathAccessError {
+    NotAbsolute,
+    NotFound,
+    OutsideRoots,
+    Io,
+}
+
+fn fs_access_error(error: PathAccessError) -> FsQueryReply {
+    match error {
+        PathAccessError::NotAbsolute | PathAccessError::OutsideRoots => FsQueryReply::error(
+            FsQueryErrorCode::Denied,
+            "filesystem target is outside allowed roots",
+        ),
+        PathAccessError::NotFound => FsQueryReply::error(
+            FsQueryErrorCode::NotFound,
+            "filesystem target was not found",
+        ),
+        PathAccessError::Io => FsQueryReply::error(
+            FsQueryErrorCode::Io,
+            "filesystem target could not be opened",
+        ),
+    }
+}
+
+fn path_info(path: String, metadata: &std::fs::Metadata, symlink: Option<bool>) -> FsPathInfo {
+    let kind = if symlink == Some(true) {
+        FsPathKind::Symlink
+    } else if metadata.is_file() {
+        FsPathKind::File
+    } else if metadata.is_dir() {
+        FsPathKind::Directory
+    } else {
+        FsPathKind::Other
+    };
+    let modified_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    FsPathInfo {
+        path,
+        kind,
+        size: metadata.len(),
+        modified_unix_ms,
+    }
+}
+
+fn glob_page(entries: Vec<FsPathInfo>, cursor: u64, truncated: bool) -> FsQueryReply {
+    let next_cursor = truncated.then(|| cursor.saturating_add(entries.len() as u64));
+    FsQueryReply::Glob(FsGlobPage {
+        entries,
+        next_cursor,
+        truncated,
+    })
+}
+
+fn glob_matches(pattern: &str, relative: &str) -> bool {
+    let pattern: Vec<_> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<_> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let mut matched = vec![vec![false; path.len() + 1]; pattern.len() + 1];
+    matched[0][0] = true;
+    for pattern_index in 0..pattern.len() {
+        for path_index in 0..=path.len() {
+            if !matched[pattern_index][path_index] {
+                continue;
+            }
+            if pattern[pattern_index] == "**" {
+                matched[pattern_index + 1][path_index] = true;
+                if path_index < path.len() {
+                    matched[pattern_index][path_index + 1] = true;
+                }
+            } else if path_index < path.len()
+                && wildcard_segment_matches(pattern[pattern_index], path[path_index])
+            {
+                matched[pattern_index + 1][path_index + 1] = true;
+            }
+        }
+    }
+    matched[pattern.len()][path.len()]
+}
+
+fn wildcard_segment_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pattern_index, mut text_index) = (0_usize, 0_usize);
+    let mut star = None;
+    let mut star_text_index = 0_usize;
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_text_index = text_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            star_text_index += 1;
+            text_index = star_text_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
@@ -151,6 +485,77 @@ mod tests {
         assert!(matches!(
             reply,
             ReadReply::Error(error) if error.code == ReadErrorCode::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn path_info_and_glob_are_root_bounded_paginated_and_byte_bounded() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        let first = root.join("a.rs");
+        let second = nested.join("b.rs");
+        fs::write(&first, b"fn a() {}\n").unwrap();
+        fs::write(&second, b"fn b() {}\n").unwrap();
+        fs::write(nested.join("c.txt"), b"not rust\n").unwrap();
+        let service = HostReadService::new(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 4_096, 5_000).unwrap(),
+        )
+        .unwrap();
+
+        let info = service
+            .execute_fs_query(FsQueryRequest::path_info(first.to_string_lossy()).unwrap())
+            .await;
+        assert!(matches!(
+            info,
+            FsQueryReply::PathInfo(FsPathInfo { kind: FsPathKind::File, size, .. }) if size == 10
+        ));
+
+        let page_one = service
+            .execute_fs_query(
+                FsQueryRequest::glob(root.to_string_lossy(), "**/*.rs", 0, 1, 4_096).unwrap(),
+            )
+            .await;
+        let FsQueryReply::Glob(page_one) = page_one else {
+            panic!("expected first glob page");
+        };
+        assert_eq!(page_one.entries.len(), 1);
+        assert!(page_one.entries[0].path.ends_with("a.rs"));
+        assert!(page_one.truncated);
+        assert_eq!(page_one.next_cursor, Some(1));
+
+        let page_two = service
+            .execute_fs_query(
+                FsQueryRequest::glob(root.to_string_lossy(), "**/*.rs", 1, 4, 4_096).unwrap(),
+            )
+            .await;
+        let FsQueryReply::Glob(page_two) = page_two else {
+            panic!("expected second glob page");
+        };
+        assert_eq!(page_two.entries.len(), 1);
+        assert!(page_two.entries[0].path.ends_with("b.rs"));
+        assert!(!page_two.truncated);
+        assert_eq!(page_two.next_cursor, None);
+
+        let too_small = service
+            .execute_fs_query(
+                FsQueryRequest::glob(root.to_string_lossy(), "**/*.rs", 0, 4, 1).unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            too_small,
+            FsQueryReply::Error(error) if error.code == FsQueryErrorCode::InvalidRequest
+        ));
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let denied = service
+            .execute_fs_query(FsQueryRequest::path_info(outside.to_string_lossy()).unwrap())
+            .await;
+        assert!(matches!(
+            denied,
+            FsQueryReply::Error(error) if error.code == FsQueryErrorCode::Denied
         ));
     }
 

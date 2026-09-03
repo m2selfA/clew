@@ -20,7 +20,8 @@ use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, InviteIssueRequest, LocalApiClient,
     OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteReadRequest, restore_controller_backup, start_controller,
+    OutfitSetFieldRequest, RemoteGlobRequest, RemotePathInfoRequest, RemoteReadRequest,
+    restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -106,6 +107,26 @@ enum Command {
         offset: u64,
         #[arg(long, default_value_t = 16_384)]
         limit: u32,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Return bounded metadata for one path on an enrolled executable device.
+    PathInfo {
+        #[arg(value_name = "DEVICE_OR_PATH", num_args = 1..=2)]
+        operands: Vec<String>,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// List paths matching a bounded relative glob under one allowed root.
+    Glob {
+        #[arg(value_name = "DEVICE_ROOT_PATTERN", num_args = 2..=3)]
+        operands: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        cursor: u64,
+        #[arg(long, default_value_t = 128)]
+        limit: u32,
+        #[arg(long, default_value_t = 32_768)]
+        max_bytes: u32,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -378,6 +399,54 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?;
             std::io::stdout().write_all(&result.data)?;
+        }
+        Command::PathInfo {
+            operands,
+            state_dir,
+        } => {
+            let (selector, path) = match operands.as_slice() {
+                [path] => (None, path.clone()),
+                [selector, path] => (Some(selector.as_str()), path.clone()),
+                _ => unreachable!("clap enforces one or two path-info operands"),
+            };
+            let config = controller_config(state_dir)?;
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let info = client
+                .path_info(RemotePathInfoRequest { device_id, path })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&info)?);
+        }
+        Command::Glob {
+            operands,
+            cursor,
+            limit,
+            max_bytes,
+            state_dir,
+        } => {
+            let (selector, root, pattern) = match operands.as_slice() {
+                [root, pattern] => (None, root.clone(), pattern.clone()),
+                [selector, root, pattern] => {
+                    (Some(selector.as_str()), root.clone(), pattern.clone())
+                }
+                _ => unreachable!("clap enforces two or three glob operands"),
+            };
+            let config = controller_config(state_dir)?;
+            let client = LocalApiClient::new(config);
+            let devices = client.device_list().await?;
+            let device_id = select_executable_device(&devices.devices, selector)?;
+            let page = client
+                .glob(RemoteGlobRequest {
+                    device_id,
+                    root,
+                    pattern,
+                    cursor,
+                    limit,
+                    max_bytes,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&page)?);
         }
         Command::Rename {
             device_id,

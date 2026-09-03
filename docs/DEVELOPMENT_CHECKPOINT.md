@@ -772,7 +772,7 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 
 ## 9. V2 — Agent Minimum
 
-**Status：IN PROGRESS（V2a DONE）**
+**Status：IN PROGRESS（V2a + V2b-1 DONE）**
 
 ### V2a — Shared device selection + selector-aware bounded Read
 
@@ -785,7 +785,19 @@ Acceptance：**PASS（组合证据，路径不混淆）**。mDNS 可用网络中
 - selector 只在 CLI/MCP adapter 层把人类/agent selector 解析成 DeviceId；Local Controller API 与远端 `ReadRequest` 仍只接受稳定 DeviceId，因此没有把名称歧义或 GUI 状态带进 wire protocol；真正 Read 继续复用 V1.4 已有 policy/root/byte-limit/timeout/InnerSession 路径；
 - focused regression：core selector **3/3 PASS**（helper-only、qualified/unique/ambiguous、omitted selector）；CLI adapter **1/1 PASS**，证明单 operand 会进入唯一设备自动选择语义、双 operand 会进入 named selector 语义；`cargo fmt -- --check` 与 `cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **145 passed / 0 failed / 6 ignored**。
 
-下一块 V2b：在同一 DeviceId resolution 和 InnerSession business boundary 上增加 bounded `PathInfo/Glob/Grep`，先闭 read-only agent filesystem surface，再进入 Edit/Write 与 Shell task；不提前实现 V3 reconnect/reattach。
+### V2b-1 — Bounded PathInfo + Glob
+
+**Status：DONE（2026-09-03）**
+
+- 新增共享 `FsQueryRequest/FsQueryReply` InnerSession RPC，当前只承载 `PathInfo` 与 `Glob`；仍走原 V1.3 Target↔Controller authenticated InnerSession，Connector 只转发 ciphertext，没有新增 helper-visible 文件协议或旁路 transport；
+- `PathInfo` 复用 V1.4 `ReadPolicy` 的 canonical allowed-root 判定，返回 bounded UTF-8 canonical path、`File/Directory/Symlink/Other`、size 与可选 modified time；越界 root、缺失目标、I/O 与 timeout 都是结构化 fail-closed error；
+- `Glob` 要求一个已授权 absolute root + bounded relative pattern；支持 path segment、`**`、segment 内 `*` / `?`。Host 使用 deterministic breadth-first scan、每目录稳定排序、最多 **100,000 scanned entries**、最多 **1,024 result items**、pattern ≤ **1,024 bytes**，并同时受 Site `max_result_bytes` 与请求 `max_bytes` 约束；cursor 是“已消费匹配数”，truncated page 返回 next cursor；
+- 递归目录不能靠 junction/reparse/symlink 逃出 requested root：每个候选子目录再次 canonicalize，只有仍 `starts_with(requested_root)` 且 canonical path 未访问过才入队；symlink directory 不递归，canonical directory visited set 阻止环路；
+- Host 生成 reply 前按实际 JSON payload 逐项检查 `max_bytes`；transport 层还独立拒绝超过 `HARD_MAX_READ_RESULT_BYTES = 48 KiB` 的 `fs_query_result`；Controller Local API 再次检查实际 Glob reply 不超过本次请求的 `max_bytes`，因此 compromised/buggy Host 也不能绕过 agent output budget；
+- Controller Local API 新增 DeviceId-only `RemotePathInfoRequest` / `RemoteGlobRequest`，继续在 Controller catalog 复核 Site/device revoke、execute capability、ReadPolicy 与 timeout，并记录 `path_info` / `glob` Activity；CLI `path-info` / `glob` 只在 adapter 层使用 V2a shared selector，wire 里仍没有人类名称；
+- focused validation：protocol roundtrip/hard-bound **1/1 PASS**；Host root/pagination/byte-bound **1/1 PASS**；真实 no-public Connector regression 在同一 InnerSession 中连续 `Read → PathInfo → Glob` **1/1 PASS（3.48s）**；CLI shared-selector surface **1/1 PASS**；`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **148 passed / 0 failed / 6 ignored**。
+
+下一块 V2b-2：在同一个 `FsQuery`/ReadPolicy/selector/Activity 骨架上实现 bounded Grep；文件内容扫描必须流式有 scan-byte/file-byte/line-length hard bounds，不用无界 `read_to_string`，完成后再封 read-only filesystem surface。
 
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
@@ -901,13 +913,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；V2a DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；V2a + V2b-1 DONE）**
 
-**Next block：V2b — bounded PathInfo / Glob / Grep read-only surface**
+**Next block：V2b-2 — bounded Grep read-only surface**
 
 V1.5 已在 `3a20cd2` 正式封板。V2a 已把既有设备选择规则从 Host 私有实现提升为 `clew-core` 共享语义，并把 `clew read` 接到 `device.list → shared selector → DeviceId-only Local API Read`；DeviceId、`Site/Device`、唯一短名、唯一设备自动选择、重名候选与 helper-only 拒绝均已 focused 覆盖。后续 MCP 必须复用这层 target resolution，而不是自己按列表顺序挑设备。下一步 V2b 只扩展 bounded read-only filesystem tools，不提前回灌 V3 reconnect/reattach 或 V5 transfer plane。
 
 ### Change log
+
+- **2026-09-03** — V2b-1 bounded PathInfo/Glob DONE：新增 `fs_query` InnerSession RPC 与 DeviceId-only Local API/CLI adapters；PathInfo/Glob 全复用 ReadPolicy canonical roots/timeout，Glob 加 deterministic BFS、cursor、100k scan-entry/1024 item/pattern/byte hard bounds，并对 junction/reparse 目录做 canonical-root containment + visited 去重。transport 与 Controller 双重校验 reply byte budget。focused protocol、Host、CLI、真实 Connector `Read→PathInfo→Glob` 均 PASS；下一块 V2b-2 bounded Grep。
 
 - **2026-09-03** — V2a shared selector + bounded Read adapter DONE：将 `select_executable_device` / `DeviceSelectionError` 从 Host 提升到 `clew-core`，保留 Host compatibility re-export；`clew read` 从 DeviceId-only 扩展为 DeviceId / `Site/Device` / unique short name，并支持单 operand 时唯一在线 executable device 自动选择。Local API/wire 仍只吃 DeviceId，helper-only 与 ambiguity fail closed。focused selector **3/3**、CLI **1/1**，workspace **145/0/6**；下一块 V2b PathInfo/Glob/Grep。
 

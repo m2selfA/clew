@@ -14,7 +14,10 @@ use clew_core::{
 };
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
-use clew_transport::{IrohOuter, ReadErrorCode, ReadReply, ReadRequest, noise_static_public};
+use clew_transport::{
+    FsGlobPage, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
+    IrohOuter, ReadErrorCode, ReadReply, ReadRequest, noise_static_public,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -89,6 +92,23 @@ pub struct RemoteReadRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteReadResult {
     pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemotePathInfoRequest {
+    pub device_id: DeviceId,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteGlobRequest {
+    pub device_id: DeviceId,
+    pub root: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub cursor: u64,
+    pub limit: u32,
+    pub max_bytes: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -306,6 +326,8 @@ enum LocalMethod {
         device_id: DeviceId,
     },
     Read(RemoteReadRequest),
+    PathInfo(RemotePathInfoRequest),
+    Glob(RemoteGlobRequest),
     ActivityList {
         limit: u32,
     },
@@ -346,6 +368,9 @@ enum LocalResponse {
     DeviceRenamed(DeviceRecord),
     ReadResult(RemoteReadResult),
     ReadError(clew_transport::ReadErrorBody),
+    PathInfo(FsPathInfo),
+    Glob(FsGlobPage),
+    FsQueryError(FsQueryErrorBody),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -470,6 +495,8 @@ async fn dispatch(
             (response, false)
         }
         LocalMethod::Read(request) => (read_response(state, request).await, false),
+        LocalMethod::PathInfo(request) => (path_info_response(state, request).await, false),
+        LocalMethod::Glob(request) => (glob_response(state, request).await, false),
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
                 return (
@@ -815,6 +842,182 @@ async fn backup_export_response(
     }
 }
 
+async fn path_info_response(
+    state: &LocalApiState,
+    request: RemotePathInfoRequest,
+) -> LocalResponse {
+    let wire_request = match FsQueryRequest::path_info(&request.path) {
+        Ok(request) => request,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
+    fs_query_response(
+        state,
+        request.device_id,
+        wire_request,
+        "path_info",
+        request.path,
+        None,
+    )
+    .await
+}
+
+async fn glob_response(state: &LocalApiState, request: RemoteGlobRequest) -> LocalResponse {
+    let wire_request = match FsQueryRequest::glob(
+        &request.root,
+        &request.pattern,
+        request.cursor,
+        request.limit,
+        request.max_bytes,
+    ) {
+        Ok(request) => request,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
+    fs_query_response(
+        state,
+        request.device_id,
+        wire_request,
+        "glob",
+        request.root,
+        Some(request.max_bytes),
+    )
+    .await
+}
+
+async fn fs_query_response(
+    state: &LocalApiState,
+    device_id: DeviceId,
+    wire_request: FsQueryRequest,
+    operation: &'static str,
+    path_summary: String,
+    requested_max_bytes: Option<u32>,
+) -> LocalResponse {
+    let (site_id, policy) = match state.control.lock() {
+        Ok(store) => {
+            let Some(device) = store.snapshot().catalog.device(device_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
+            let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
+                return local_error(LocalApiErrorCode::Denied, "device is not available");
+            };
+            if device.revoked
+                || site.revoked
+                || !device.device.capabilities.execute
+                || !site.read_policy.allows_read()
+                || requested_max_bytes
+                    .is_some_and(|max_bytes| max_bytes > site.read_policy.max_result_bytes)
+            {
+                return local_error(
+                    LocalApiErrorCode::Denied,
+                    "read-only filesystem query is not permitted",
+                );
+            }
+            (site.site_id, site.read_policy.clone())
+        }
+        Err(_) => {
+            return local_error(
+                LocalApiErrorCode::Internal,
+                "controller state is unavailable",
+            );
+        }
+    };
+    let expected_path_info = matches!(wire_request, FsQueryRequest::PathInfo { .. });
+    let started = Instant::now();
+    let remote_timeout = Duration::from_millis(u64::from(policy.timeout_ms).saturating_add(2_000));
+    let remote_result = timeout(
+        remote_timeout,
+        state.remote.fs_query(device_id, wire_request),
+    )
+    .await;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let (response, activity_result, transferred_bytes) = match remote_result {
+        Err(_) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "remote filesystem query timed out",
+            ),
+            ActivityResult::TimedOut,
+            0,
+        ),
+        Ok(Err(_)) => (
+            local_error(
+                LocalApiErrorCode::Unavailable,
+                "device is offline or reconnecting",
+            ),
+            ActivityResult::Failed,
+            0,
+        ),
+        Ok(Ok(FsQueryReply::PathInfo(info))) if expected_path_info => {
+            let bytes = serde_json::to_vec(&info).map_or(0, |encoded| encoded.len() as u64);
+            (
+                LocalResponse::PathInfo(info),
+                ActivityResult::Succeeded,
+                bytes,
+            )
+        }
+        Ok(Ok(FsQueryReply::Glob(page))) if !expected_path_info => {
+            match serde_json::to_vec(&page) {
+                Ok(encoded)
+                    if requested_max_bytes
+                        .is_some_and(|max_bytes| encoded.len() > max_bytes as usize) =>
+                {
+                    (
+                        local_error(
+                            LocalApiErrorCode::Internal,
+                            "device returned a filesystem result larger than requested",
+                        ),
+                        ActivityResult::Failed,
+                        0,
+                    )
+                }
+                Ok(encoded) => (
+                    LocalResponse::Glob(page),
+                    ActivityResult::Succeeded,
+                    encoded.len() as u64,
+                ),
+                Err(_) => (
+                    local_error(
+                        LocalApiErrorCode::Internal,
+                        "device returned an invalid filesystem result",
+                    ),
+                    ActivityResult::Failed,
+                    0,
+                ),
+            }
+        }
+        Ok(Ok(FsQueryReply::Error(error))) => {
+            let result = match error.code {
+                FsQueryErrorCode::Denied => ActivityResult::Denied,
+                FsQueryErrorCode::Timeout => ActivityResult::TimedOut,
+                _ => ActivityResult::Failed,
+            };
+            (LocalResponse::FsQueryError(error), result, 0)
+        }
+        Ok(Ok(_)) => (
+            local_error(
+                LocalApiErrorCode::Internal,
+                "device returned the wrong filesystem query result kind",
+            ),
+            ActivityResult::Failed,
+            0,
+        ),
+    };
+    if let Ok(now) = unix_ms_value()
+        && let Ok(mut store) = state.control.lock()
+    {
+        let _ = store.record_activity(
+            now,
+            site_id,
+            device_id,
+            operation,
+            Some(path_summary),
+            activity_result,
+            duration_ms,
+            transferred_bytes,
+        );
+    }
+    response
+}
+
 async fn read_response(state: &LocalApiState, request: RemoteReadRequest) -> LocalResponse {
     let (site_id, policy) = match state.control.lock() {
         Ok(store) => {
@@ -1064,6 +1267,36 @@ impl LocalApiClient {
         match self.request(LocalMethod::Read(request)).await? {
             LocalResponse::ReadResult(result) => Ok(result),
             LocalResponse::ReadError(error) => Err(LocalApiClientError::ReadRemote {
+                code: error.code,
+                message: error.message,
+            }),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn path_info(
+        &self,
+        request: RemotePathInfoRequest,
+    ) -> Result<FsPathInfo, LocalApiClientError> {
+        match self.request(LocalMethod::PathInfo(request)).await? {
+            LocalResponse::PathInfo(info) => Ok(info),
+            LocalResponse::FsQueryError(error) => Err(LocalApiClientError::FsQueryRemote {
+                code: error.code,
+                message: error.message,
+            }),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn glob(
+        &self,
+        request: RemoteGlobRequest,
+    ) -> Result<FsGlobPage, LocalApiClientError> {
+        match self.request(LocalMethod::Glob(request)).await? {
+            LocalResponse::Glob(page) => Ok(page),
+            LocalResponse::FsQueryError(error) => Err(LocalApiClientError::FsQueryRemote {
                 code: error.code,
                 message: error.message,
             }),
@@ -1348,6 +1581,11 @@ pub enum LocalApiClientError {
     #[error("remote read failed ({code:?}): {message}")]
     ReadRemote {
         code: ReadErrorCode,
+        message: String,
+    },
+    #[error("remote filesystem query failed ({code:?}): {message}")]
+    FsQueryRemote {
+        code: FsQueryErrorCode,
         message: String,
     },
     #[error("local API request timed out")]

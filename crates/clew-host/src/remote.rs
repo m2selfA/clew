@@ -10,11 +10,11 @@ use clew_transport::{
     BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
     ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
-    InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery, NearbyConnectorFile,
-    ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError,
-    SealedBootstrapSession, SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional,
-    read_bootstrap, read_connector_open, read_connector_ready, write_bootstrap,
-    write_connector_open, write_connector_ready,
+    FsQueryErrorCode, FsQueryReply, FsQueryRequest, InnerSession, IrohOuter, IrohProtocol,
+    MdnsConnectorDiscovery, NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest,
+    SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, SignedConnectorLease,
+    SiteDiscoveryTag, forward_opaque_bidirectional, read_bootstrap, read_connector_open,
+    read_connector_ready, write_bootstrap, write_connector_open, write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
@@ -820,18 +820,42 @@ async fn serve_networked_membership_with_outer_timing(
         tokio::select! {
             message = inner.recv(&mut stream) => {
                 let message = message?;
-                let reply = match (service.as_ref(), ReadRequest::from_message(&message)) {
-                    (Some(service), Ok(request)) => service.execute(request).await,
-                    (None, Ok(_)) => ReadReply::error(
-                        ReadErrorCode::Denied,
-                        "read is not permitted on this Connector-only device",
-                    ),
-                    (_, Err(_)) => ReadReply::error(
+                let reply = match message.kind.as_str() {
+                    "read" => {
+                        let reply = match (service.as_ref(), ReadRequest::from_message(&message)) {
+                            (Some(service), Ok(request)) => service.execute(request).await,
+                            (None, Ok(_)) => ReadReply::error(
+                                ReadErrorCode::Denied,
+                                "read is not permitted on this Connector-only device",
+                            ),
+                            (_, Err(_)) => ReadReply::error(
+                                ReadErrorCode::InvalidRequest,
+                                "malformed bounded Read request",
+                            ),
+                        };
+                        reply.into_message()?
+                    }
+                    "fs_query" => {
+                        let reply = match (service.as_ref(), FsQueryRequest::from_message(&message)) {
+                            (Some(service), Ok(request)) => service.execute_fs_query(request).await,
+                            (None, Ok(_)) => FsQueryReply::error(
+                                FsQueryErrorCode::Denied,
+                                "filesystem query is not permitted on this Connector-only device",
+                            ),
+                            (_, Err(_)) => FsQueryReply::error(
+                                FsQueryErrorCode::InvalidRequest,
+                                "malformed bounded filesystem query",
+                            ),
+                        };
+                        reply.into_message()?
+                    }
+                    _ => ReadReply::error(
                         ReadErrorCode::InvalidRequest,
-                        "unsupported or malformed v1 host request",
-                    ),
+                        "unsupported v2 host request",
+                    )
+                    .into_message()?,
                 };
-                inner.send(&mut stream, &reply.into_message()?).await?;
+                inner.send(&mut stream, &reply).await?;
             }
             accepted = outer.accept_classified(), if connector && tunnels.len() < MAX_CONNECTOR_TUNNELS => {
                 let (protocol, inbound) = accepted?;
@@ -1040,6 +1064,8 @@ pub enum HostRemoteError {
     Bootstrap(#[from] clew_transport::BootstrapProtocolError),
     #[error(transparent)]
     Inner(#[from] clew_transport::InnerSessionError),
+    #[error(transparent)]
+    FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     Read(#[from] clew_transport::ReadProtocolError),
     #[error(transparent)]
@@ -2221,6 +2247,7 @@ mod tests {
             let expected_device = membership.identity.public_identity();
             let device_id = membership.marker.device_id;
             let proof_path = proof_path.to_string_lossy().into_owned();
+            let share_path = share.to_string_lossy().into_owned();
             async move {
                 let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
                 assert_eq!(protocol, IrohProtocol::Connector);
@@ -2245,7 +2272,7 @@ mod tests {
                 inner
                     .send(
                         &mut stream,
-                        &ReadRequest::new(proof_path, 0, 4_096)
+                        &ReadRequest::new(proof_path.clone(), 0, 4_096)
                             .unwrap()
                             .into_message()
                             .unwrap(),
@@ -2257,6 +2284,44 @@ mod tests {
                     ReadReply::from_message(&reply).unwrap(),
                     ReadReply::Data(READ_PROOF.to_vec())
                 );
+
+                inner
+                    .send(
+                        &mut stream,
+                        &FsQueryRequest::path_info(proof_path.clone())
+                            .unwrap()
+                            .into_message()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let info_reply = inner.recv(&mut stream).await.unwrap();
+                let FsQueryReply::PathInfo(info) = FsQueryReply::from_message(&info_reply).unwrap()
+                else {
+                    panic!("expected PathInfo reply over Connector InnerSession");
+                };
+                assert_eq!(info.kind, clew_transport::FsPathKind::File);
+                assert_eq!(info.size, READ_PROOF.len() as u64);
+                assert!(info.path.ends_with("proof.txt"));
+
+                inner
+                    .send(
+                        &mut stream,
+                        &FsQueryRequest::glob(share_path, "*.txt", 0, 8, 4_096)
+                            .unwrap()
+                            .into_message()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let glob_reply = inner.recv(&mut stream).await.unwrap();
+                let FsQueryReply::Glob(page) = FsQueryReply::from_message(&glob_reply).unwrap()
+                else {
+                    panic!("expected Glob reply over Connector InnerSession");
+                };
+                assert_eq!(page.entries.len(), 1);
+                assert!(page.entries[0].path.ends_with("proof.txt"));
+                assert!(!page.truncated);
             }
         });
 

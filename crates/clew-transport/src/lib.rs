@@ -2,6 +2,7 @@
 
 mod connector;
 mod discovery;
+mod fs_query;
 mod inner;
 mod lease;
 mod nearby;
@@ -18,6 +19,11 @@ pub use connector::{
 pub use discovery::{
     ConnectorCandidate, ConnectorDiscoveryAdvertisement, ConnectorDiscoveryError,
     ConnectorDiscoveryEvent, ConnectorDiscoveryEvents, MdnsConnectorDiscovery, SiteDiscoveryTag,
+};
+pub use fs_query::{
+    FsGlobPage, FsPathInfo, FsPathKind, FsQueryErrorBody, FsQueryErrorCode, FsQueryProtocolError,
+    FsQueryReply, FsQueryRequest, HARD_MAX_FS_PATTERN_BYTES, HARD_MAX_FS_RESULT_ITEMS,
+    HARD_MAX_FS_SCAN_ENTRIES,
 };
 pub use inner::{
     ControllerSessionAuthority, ControllerSessionIdentity, DeviceSessionClaim,

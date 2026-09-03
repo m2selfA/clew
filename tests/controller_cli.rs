@@ -63,6 +63,20 @@ fn run_read(state_dir: &Path, operands: &[&str]) -> Output {
     command.arg("--state-dir").arg(state_dir).output().unwrap()
 }
 
+fn run_path_info(state_dir: &Path, operands: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("path-info");
+    command.args(operands);
+    command.arg("--state-dir").arg(state_dir).output().unwrap()
+}
+
+fn run_glob(state_dir: &Path, operands: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clew"));
+    command.arg("glob");
+    command.args(operands);
+    command.arg("--state-dir").arg(state_dir).output().unwrap()
+}
+
 fn run_shutdown(state_dir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_clew"))
         .arg("shutdown")
@@ -151,6 +165,38 @@ fn read_cli_accepts_shared_device_selector_or_single_device_auto_selection() {
     );
 
     let named = run_read(state_dir, &["GPU-01", "proof.txt"]);
+    assert!(!named.status.success());
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
+        "{}",
+        String::from_utf8_lossy(&named.stderr)
+    );
+}
+
+#[test]
+fn path_info_and_glob_cli_reuse_shared_device_selection() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path();
+    let _controller = spawn_controller(state_dir);
+    wait_until_ready(state_dir);
+
+    let info = run_path_info(state_dir, &["proof.txt"]);
+    assert!(!info.status.success());
+    assert!(
+        String::from_utf8_lossy(&info.stderr).contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+
+    let glob = run_glob(state_dir, &["/shared", "**/*.rs"]);
+    assert!(!glob.status.success());
+    assert!(
+        String::from_utf8_lossy(&glob.stderr).contains("no online executable device is available"),
+        "{}",
+        String::from_utf8_lossy(&glob.stderr)
+    );
+
+    let named = run_glob(state_dir, &["GPU-01", "/shared", "**/*.rs"]);
     assert!(!named.status.success());
     assert!(
         String::from_utf8_lossy(&named.stderr).contains("device selector not found: GPU-01"),
