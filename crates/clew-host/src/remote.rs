@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use clew_core::{DeviceId, DeviceRecord, SiteId, StateLayout};
+use clew_core::{DeviceId, DeviceRecord, RequestId, SiteId, StateLayout};
 use clew_identity::{ControllerPublicIdentity, DeviceIdentityStore};
 use clew_transport::{
     BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
@@ -12,11 +12,12 @@ use clew_transport::{
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
     FsMutationErrorCode, FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply,
     FsQueryRequest, InnerMessage, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
-    NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext,
-    SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply,
-    ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional,
-    read_bootstrap, read_connector_open, read_connector_ready, unwrap_rpc_request, wrap_rpc_reply,
-    write_bootstrap, write_connector_open, write_connector_ready,
+    NearbyConnectorFile, RPC_PROGRESS_INTERVAL_MS, ReadErrorCode, ReadReply, ReadRequest,
+    SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode,
+    ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
+    forward_opaque_bidirectional, read_bootstrap, read_connector_open, read_connector_ready,
+    unwrap_rpc_request, wrap_rpc_progress, wrap_rpc_reply, write_bootstrap, write_connector_open,
+    write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
@@ -761,6 +762,29 @@ async fn serve_networked_membership_with_outer(
     .await
 }
 
+async fn complete_rpc_with_progress<F>(
+    inner: &mut InnerSession,
+    stream: &mut clew_transport::IrohStream,
+    request_id: RequestId,
+    operation: F,
+) -> Result<InnerMessage, HostRemoteError>
+where
+    F: Future<Output = Result<InnerMessage, HostRemoteError>>,
+{
+    tokio::pin!(operation);
+    let interval = Duration::from_millis(RPC_PROGRESS_INTERVAL_MS);
+    let mut progress = tokio::time::interval_at(Instant::now() + interval, interval);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = progress.tick() => {
+                let progress = wrap_rpc_progress(request_id)?;
+                inner.send(stream, &progress).await?;
+            }
+        }
+    }
+}
+
 async fn serve_networked_membership_with_outer_timing(
     membership: &HostMembership,
     outer: &IrohOuter,
@@ -848,73 +872,77 @@ async fn serve_networked_membership_with_outer_timing(
                     continue;
                 }
                 let (request_id, message) = unwrap_rpc_request(&message)?;
-                let reply = match message.kind.as_str() {
-                    "read" => {
-                        let reply = match (service.as_ref(), read_allowed, ReadRequest::from_message(&message)) {
-                            (Some(service), true, Ok(request)) => service.execute(request).await,
-                            (_, false, Ok(_)) | (None, true, Ok(_)) => ReadReply::error(
-                                ReadErrorCode::Denied,
-                                "read is not permitted by this device grant",
-                            ),
-                            (_, _, Err(_)) => ReadReply::error(
-                                ReadErrorCode::InvalidRequest,
-                                "malformed bounded Read request",
-                            ),
-                        };
-                        reply.into_message()?
-                    }
-                    "fs_query" => {
-                        let reply = match (service.as_ref(), read_allowed, FsQueryRequest::from_message(&message)) {
-                            (Some(service), true, Ok(request)) => service.execute_fs_query(request).await,
-                            (_, false, Ok(_)) | (None, true, Ok(_)) => FsQueryReply::error(
-                                FsQueryErrorCode::Denied,
-                                "filesystem query is not permitted by this device grant",
-                            ),
-                            (_, _, Err(_)) => FsQueryReply::error(
-                                FsQueryErrorCode::InvalidRequest,
-                                "malformed bounded filesystem query",
-                            ),
-                        };
-                        reply.into_message()?
-                    }
-                    "fs_mutation" => {
-                        let reply = match (service.as_ref(), write_allowed, FsMutationRequest::from_message(&message)) {
-                            (Some(service), true, Ok(request)) => service.execute_fs_mutation_rpc(request_id, request, true).await,
-                            (_, false, Ok(_)) | (None, true, Ok(_)) => FsMutationReply::error(
-                                FsMutationErrorCode::Denied,
-                                "filesystem mutation is not permitted by this device grant",
-                            ),
-                            (_, _, Err(_)) => FsMutationReply::error(
-                                FsMutationErrorCode::InvalidRequest,
-                                "malformed bounded filesystem mutation",
-                            ),
-                        };
-                        reply.into_message()?
-                    }
-                    "shell_task" => {
-                        let reply = match (
-                            shell_service.as_ref(),
-                            shell_allowed,
-                            ShellTaskRequest::from_message(&message),
-                        ) {
-                            (Some(service), true, Ok(request)) => service.execute(request, true).await,
-                            (_, false, Ok(_)) | (None, true, Ok(_)) => ShellTaskReply::error(
-                                ShellTaskErrorCode::Denied,
-                                "Shell task is not permitted by this device grant",
-                            ),
-                            (_, _, Err(_)) => ShellTaskReply::error(
-                                ShellTaskErrorCode::InvalidRequest,
-                                "malformed bounded Shell task request",
-                            ),
-                        };
-                        reply.into_message()?
-                    }
-                    _ => ReadReply::error(
-                        ReadErrorCode::InvalidRequest,
-                        "unsupported v3 RPC request",
-                    )
-                    .into_message()?,
+                let operation = async {
+                    let reply = match message.kind.as_str() {
+                        "read" => {
+                            let reply = match (service.as_ref(), read_allowed, ReadRequest::from_message(&message)) {
+                                (Some(service), true, Ok(request)) => service.execute(request).await,
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => ReadReply::error(
+                                    ReadErrorCode::Denied,
+                                    "read is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => ReadReply::error(
+                                    ReadErrorCode::InvalidRequest,
+                                    "malformed bounded Read request",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        "fs_query" => {
+                            let reply = match (service.as_ref(), read_allowed, FsQueryRequest::from_message(&message)) {
+                                (Some(service), true, Ok(request)) => service.execute_fs_query(request).await,
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => FsQueryReply::error(
+                                    FsQueryErrorCode::Denied,
+                                    "filesystem query is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => FsQueryReply::error(
+                                    FsQueryErrorCode::InvalidRequest,
+                                    "malformed bounded filesystem query",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        "fs_mutation" => {
+                            let reply = match (service.as_ref(), write_allowed, FsMutationRequest::from_message(&message)) {
+                                (Some(service), true, Ok(request)) => service.execute_fs_mutation_rpc(request_id, request, true).await,
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => FsMutationReply::error(
+                                    FsMutationErrorCode::Denied,
+                                    "filesystem mutation is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => FsMutationReply::error(
+                                    FsMutationErrorCode::InvalidRequest,
+                                    "malformed bounded filesystem mutation",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        "shell_task" => {
+                            let reply = match (
+                                shell_service.as_ref(),
+                                shell_allowed,
+                                ShellTaskRequest::from_message(&message),
+                            ) {
+                                (Some(service), true, Ok(request)) => service.execute(request, true).await,
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => ShellTaskReply::error(
+                                    ShellTaskErrorCode::Denied,
+                                    "Shell task is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => ShellTaskReply::error(
+                                    ShellTaskErrorCode::InvalidRequest,
+                                    "malformed bounded Shell task request",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        _ => ReadReply::error(
+                            ReadErrorCode::InvalidRequest,
+                            "unsupported v3 RPC request",
+                        )
+                        .into_message()?,
+                    };
+                    Ok::<_, HostRemoteError>(reply)
                 };
+                let reply = complete_rpc_with_progress(&mut inner, &mut stream, request_id, operation).await?;
                 let reply = wrap_rpc_reply(request_id, reply)?;
                 inner.send(&mut stream, &reply).await?;
             }

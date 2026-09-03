@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a + V3b-1 + V3b-2a DONE）**
+**Status：IN PROGRESS（V3a + V3b DONE）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -974,6 +974,22 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 - focused dedupe **1/1 PASS**：首次 create-only成功后测试人为修改目标文件，再用同 RequestId重放，精确返回第一次 result且目标保持人为修改内容，证明没有再次执行；同 RequestId换正文明确 `InvalidRequest`。既有 mutation authority/precondition **1/1 PASS**；no-public Connector全业务链 **1/1 PASS（3.62s）**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **169 passed / 0 failed / 6 ignored**。
 
 下一块 V3b-2b：Controller在同一 Local API总 timeout预算内等待新 session generation，并对 Read/FsQuery/FsMutation用**同一 RequestId**重发。Read/PathInfo/Glob/Grep天然安全；FsMutation依赖本块 Host dedupe + 原强 precondition；Shell Start/Status/Attach/Cancel仍不进入通用 replay。
+
+### V3b-2b — Cross-generation replay + active-RPC liveness
+
+**Status：DONE（2026-09-03）**
+
+- `RemoteHub` 增加 process-local session-change revision `watch`：register/unregister/disconnect 都在释放 state lock 后推进 revision；replay caller先检查当前 session，再等待 revision变化，因此没有 polling，也没有“先检查、后 subscribe”式 lost wakeup。每次重放都要求 generation 与刚失败的 generation不同，不能在已坏旧 channel 上自旋；
+- Read/FsQuery/FsMutation 每个 Local API逻辑调用只生成一个 RequestId。send失败、reply channel断开或当前 session RPC失败后，Read/Query/Mutation等待新 generation并用**同一 RequestId**重发；Read/PathInfo/Glob/Grep天然可 replay，mutation依赖 V3b-2a Host cache + create-only/expected-SHA precondition。Host返回 `FsMutation Timeout` 表示 worker仍 in-flight 时，Controller先在**同一 generation / 同 RequestId**再次查询 cache；若随后 session断开，再在新 generation继续同 ID；
+- Shell Start与 Shell Status/Attach/Cancel故意不进入上述通用 replay loop。Start在 reply未知时不能 blind replay；V2 task projection仍绑定当前 generation，generation替换会使旧 projection stale。Shell跨 reconnect恢复只由下一块 V3c `TaskId` reattach定义，不能借通用 RequestId retry偷跑；
+- 真实 Windows 50k-entry Glob hard-kill gate暴露并修复 V3a 的 active-RPC liveness遗漏：旧 5s/5s heartbeat只在 member loop idle时运行，进入长 `inner.recv(reply)` 后会被业务 RPC串行等待遮住；iroh `connection.closed()`本身又不会在远端进程 hard-kill 后立即完成，因此 Host死后10s仍可能误报 online；
+- 新增 E2E `rpc_progress`：Host长业务操作未完成时每 **2s** 只发送 `rpc_progress + 16-byte RequestId`，不包含业务正文、path、stdout/stderr或env；Controller等待最终 reply时要求每 **5s** 至少收到一次同 RequestId progress或最终 reply。progress ID错配/截断 fail closed；合法 15s Glob/Grep timeout不会被5s liveness窗口截短，Host hard-kill后 progress停止，当前 generation约5s内退出并触发 replay。idle `session_ping/pong`仍独立存在；
+- Controller仍不拥有无界后台 retry deadline：整个 RemoteHub replay future受既有 Local API `signed policy timeout + 2s` 外层 timeout取消。caller超时/取消后不会继续偷偷重放。mutation若在 caller超时后最终完成，Host process-lifetime cache仍会保存该 RequestId结果；客户端之后发起**新**逻辑调用会获得新 RequestId，并继续依靠强 precondition fail closed；这仍不是持久 exactly-once事务；
+- focused validation：`rpc_progress` bounded/correlation **3/3 PASS**；RemoteHub synthetic replay **1/1 PASS**，覆盖 initial-offline wait、Read/FsQuery跨 generation同 ID、FsMutation same-generation in-flight retry→cross-generation同 ID，以及 Shell Start零 replay；V3a generation stale-update **1/1 PASS**；no-public Connector full business chain **1/1 PASS（3.33s）**；
+- 真实 Windows product gate：50,000 empty files，启动 `clew glob <root> '**/*.zzz' --limit 1` 后250ms确认原始 Glob仍 in-flight，随后 hard-kill Host；Controller **6073ms**进入 offline，原 DeviceId重启后 session **generation 1→2**；没有重启/重发 CLI，**原始同一个 Glob进程**在新 generation完成，exit `0`，返回完整 `entries=[] / truncated=false` page。smoke finally authenticated shutdown Controller并删除全部 fixture/state；
+- final gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **171 passed / 0 failed / 6 ignored**。
+
+V3b request replay matrix至此封板。下一块 V3c：Shell task reattach。目标是 Host task在 active InnerSession断开时不再按 V2语义立刻取消，而是进入有界 reconnect grace；Controller用 stable TaskId在新 generation重新证明 device/session后恢复 projection。必须保持 explicit timeout/cancel，不能把断线 grace升级成永久 orphan process。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1074,13 +1090,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b-1 + V3b-2a DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b DONE）**
 
-**Next block：V3b-2b — Controller cross-generation replay**
+**Next block：V3c — Shell task reconnect / reattach**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b-1建立 stable RequestId correlation；V3b-2a已让 Host mutation在当前 Host process内对同 RequestId dedupe，并收口 blocking worker timeout后的未知结果。下一块让 Controller在既有 Local API deadline内等待新 generation、以同 RequestId重放 Read/FsQuery/FsMutation；Shell lifecycle继续单独处理。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b现已把短 RPC的 stable RequestId correlation、Host mutation dedupe、Controller cross-generation replay和 active-RPC liveness全部闭合；Read/FsQuery/FsMutation能在同一 Local API deadline内恢复，Shell明确没有 blind replay。下一块单独定义 TaskId reattach与断线 grace，不把 Host task变成永久后台进程。
 
 ### Change log
+
+- **2026-09-03** — V3b-2b cross-generation replay + active-RPC liveness DONE / V3b closed：RemoteHub用 session-change watch等新 generation，Read/FsQuery/FsMutation跨 generation保持同 RequestId；mutation Host Timeout先同 generation查询 in-flight cache，session loss后继续同 ID，Shell Start零 blind replay。真实50k Glob hard-kill发现并修复 active RPC遮住 idle heartbeat：新增2s RequestId-only `rpc_progress`，Controller 5s progress deadline；修复后 hard-kill **6073ms** offline、generation **1→2**，原始同一 Glob进程无需重发即 exit 0并返回完整空 page。RPC progress **3/3**、synthetic replay **1/1**、no-public Connector **1/1（3.33s）**、workspace **171/0/6**。下一块 V3c Shell reattach。
 
 - **2026-09-03** — V3b-2a Host mutation RequestId dedupe DONE：HostReadService增加128-entry process-lifetime replay cache，只存 fingerprint+bounded reply；同 ID同请求返回首次结果、同 ID异请求拒绝，in-flight worker跨 InnerSession继续完成并缓存，修复旧 `timeout(spawn_blocking)` 后副作用无人记录的歧义。dedupe **1/1 PASS**、mutation regression **1/1 PASS**、no-public Connector **1/1 PASS（3.62s）**、workspace **169/0/6**。下一块 V3b-2b Controller cross-generation replay。
 

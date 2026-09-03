@@ -55,8 +55,9 @@ pub use protocol::{
     ReadProtocolError, ReadReply, ReadRequest, read_bootstrap, write_bootstrap,
 };
 pub use rpc::{
-    RPC_REPLY_MESSAGE_KIND, RPC_REQUEST_MESSAGE_KIND, RpcProtocolError, unwrap_rpc_reply,
-    unwrap_rpc_request, wrap_rpc_reply, wrap_rpc_request,
+    RPC_PROGRESS_INTERVAL_MS, RPC_PROGRESS_MESSAGE_KIND, RPC_REPLY_MESSAGE_KIND,
+    RPC_REQUEST_MESSAGE_KIND, RpcProtocolError, is_rpc_progress, unwrap_rpc_reply,
+    unwrap_rpc_request, wrap_rpc_progress, wrap_rpc_reply, wrap_rpc_request,
 };
 pub use sealed_bootstrap::{
     MAX_SEALED_BOOTSTRAP_PLAINTEXT, SealedBootstrapContext, SealedBootstrapError,

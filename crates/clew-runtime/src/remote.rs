@@ -14,11 +14,12 @@ use clew_transport::{
     HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
     ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
     ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
-    read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
+    is_rpc_progress, read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request,
+    write_bootstrap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
 use crate::{ControlStoreError, ControllerControlStore};
@@ -67,9 +68,20 @@ pub struct RemoteSessionInfo {
     pub last_path_change_unix_ms: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RemoteHub {
     inner: Arc<Mutex<RemoteHubState>>,
+    session_changes: watch::Sender<u64>,
+}
+
+impl Default for RemoteHub {
+    fn default() -> Self {
+        let (session_changes, _) = watch::channel(0_u64);
+        Self {
+            inner: Arc::new(Mutex::new(RemoteHubState::default())),
+            session_changes,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -199,31 +211,69 @@ impl RemoteHub {
         }
     }
 
+    fn signal_session_change(&self) {
+        self.session_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    async fn replay_session_after(
+        &self,
+        device_id: DeviceId,
+        previous_generation: Option<u64>,
+    ) -> Result<(u64, mpsc::Sender<RemoteCommand>), RemoteHubError> {
+        let mut changes = self.session_changes.subscribe();
+        loop {
+            let current = {
+                let state = self
+                    .inner
+                    .lock()
+                    .map_err(|_| RemoteHubError::StatePoisoned)?;
+                state
+                    .sessions
+                    .get(&device_id)
+                    .map(|slot| (slot.generation, slot.tx.clone()))
+            };
+            if let Some((generation, tx)) = current
+                && previous_generation != Some(generation)
+            {
+                return Ok((generation, tx));
+            }
+            changes
+                .changed()
+                .await
+                .map_err(|_| RemoteHubError::Offline(device_id))?;
+        }
+    }
+
     pub async fn read(
         &self,
         device_id: DeviceId,
         request: ReadRequest,
     ) -> Result<ReadReply, RemoteHubError> {
-        let tx = self
-            .inner
-            .lock()
-            .map_err(|_| RemoteHubError::StatePoisoned)?
-            .sessions
-            .get(&device_id)
-            .map(|slot| slot.tx.clone())
-            .ok_or(RemoteHubError::Offline(device_id))?;
         let request_id = RequestId::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(RemoteCommand::Read {
-            request_id,
-            request,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| RemoteHubError::Offline(device_id))?;
-        reply_rx
-            .await
-            .map_err(|_| RemoteHubError::Offline(device_id))?
+        let mut previous_generation = None;
+        loop {
+            let (generation, tx) = self
+                .replay_session_after(device_id, previous_generation)
+                .await?;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx
+                .send(RemoteCommand::Read {
+                    request_id,
+                    request: request.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                previous_generation = Some(generation);
+                continue;
+            }
+            match reply_rx.await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(_)) | Err(_) => previous_generation = Some(generation),
+            }
+        }
     }
 
     pub async fn fs_query(
@@ -231,26 +281,30 @@ impl RemoteHub {
         device_id: DeviceId,
         request: FsQueryRequest,
     ) -> Result<FsQueryReply, RemoteHubError> {
-        let tx = self
-            .inner
-            .lock()
-            .map_err(|_| RemoteHubError::StatePoisoned)?
-            .sessions
-            .get(&device_id)
-            .map(|slot| slot.tx.clone())
-            .ok_or(RemoteHubError::Offline(device_id))?;
         let request_id = RequestId::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(RemoteCommand::FsQuery {
-            request_id,
-            request,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| RemoteHubError::Offline(device_id))?;
-        reply_rx
-            .await
-            .map_err(|_| RemoteHubError::Offline(device_id))?
+        let mut previous_generation = None;
+        loop {
+            let (generation, tx) = self
+                .replay_session_after(device_id, previous_generation)
+                .await?;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx
+                .send(RemoteCommand::FsQuery {
+                    request_id,
+                    request: request.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                previous_generation = Some(generation);
+                continue;
+            }
+            match reply_rx.await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(_)) | Err(_) => previous_generation = Some(generation),
+            }
+        }
     }
 
     pub async fn fs_mutation(
@@ -258,26 +312,35 @@ impl RemoteHub {
         device_id: DeviceId,
         request: FsMutationRequest,
     ) -> Result<FsMutationReply, RemoteHubError> {
-        let tx = self
-            .inner
-            .lock()
-            .map_err(|_| RemoteHubError::StatePoisoned)?
-            .sessions
-            .get(&device_id)
-            .map(|slot| slot.tx.clone())
-            .ok_or(RemoteHubError::Offline(device_id))?;
         let request_id = RequestId::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(RemoteCommand::FsMutation {
-            request_id,
-            request,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|_| RemoteHubError::Offline(device_id))?;
-        reply_rx
-            .await
-            .map_err(|_| RemoteHubError::Offline(device_id))?
+        let mut previous_generation = None;
+        loop {
+            let (generation, tx) = self
+                .replay_session_after(device_id, previous_generation)
+                .await?;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx
+                .send(RemoteCommand::FsMutation {
+                    request_id,
+                    request: request.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                previous_generation = Some(generation);
+                continue;
+            }
+            match reply_rx.await {
+                Ok(Ok(FsMutationReply::Error(error)))
+                    if error.code == clew_transport::FsMutationErrorCode::Timeout =>
+                {
+                    previous_generation = None;
+                }
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(_)) | Err(_) => previous_generation = Some(generation),
+            }
+        }
     }
 
     pub async fn shell_start(
@@ -462,7 +525,7 @@ impl RemoteHub {
 
     pub fn disconnect(&self, device_id: DeviceId) {
         let disconnected_unix_ms = unix_ms().ok();
-        if let Ok(mut state) = self.inner.lock()
+        let changed = if let Ok(mut state) = self.inner.lock()
             && let Some(slot) = state.sessions.remove(&device_id)
         {
             state.shell_tasks.retain(|_, projection| {
@@ -477,6 +540,12 @@ impl RemoteHub {
                 }
             }
             let _ = slot.tx.try_send(RemoteCommand::Stop);
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.signal_session_change();
         }
     }
 
@@ -488,42 +557,46 @@ impl RemoteHub {
         connected_unix_ms: u64,
     ) -> Result<(u64, mpsc::Receiver<RemoteCommand>), RemoteHubError> {
         let (tx, rx) = mpsc::channel(REMOTE_COMMAND_CAPACITY);
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| RemoteHubError::StatePoisoned)?;
-        state.next_generation = state
-            .next_generation
-            .checked_add(1)
-            .ok_or(RemoteHubError::GenerationOverflow)?;
-        let generation = state.next_generation;
-        state
-            .shell_tasks
-            .retain(|_, projection| projection.device_id != device_id);
-        state.session_info.insert(
-            device_id,
-            RemoteSessionInfo {
+        let generation = {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| RemoteHubError::StatePoisoned)?;
+            state.next_generation = state
+                .next_generation
+                .checked_add(1)
+                .ok_or(RemoteHubError::GenerationOverflow)?;
+            let generation = state.next_generation;
+            state
+                .shell_tasks
+                .retain(|_, projection| projection.device_id != device_id);
+            state.session_info.insert(
                 device_id,
-                generation,
-                state: RemoteSessionState::Connected,
-                topology,
-                path,
-                connected_unix_ms,
-                last_transition_unix_ms: connected_unix_ms,
-                last_path_change_unix_ms: connected_unix_ms,
-            },
-        );
-        if let Some(previous) = state
-            .sessions
-            .insert(device_id, RemoteSessionSlot { generation, tx })
-        {
-            let _ = previous.tx.try_send(RemoteCommand::Stop);
-        }
+                RemoteSessionInfo {
+                    device_id,
+                    generation,
+                    state: RemoteSessionState::Connected,
+                    topology,
+                    path,
+                    connected_unix_ms,
+                    last_transition_unix_ms: connected_unix_ms,
+                    last_path_change_unix_ms: connected_unix_ms,
+                },
+            );
+            if let Some(previous) = state
+                .sessions
+                .insert(device_id, RemoteSessionSlot { generation, tx })
+            {
+                let _ = previous.tx.try_send(RemoteCommand::Stop);
+            }
+            generation
+        };
+        self.signal_session_change();
         Ok((generation, rx))
     }
 
     fn unregister(&self, device_id: DeviceId, generation: u64, disconnected_unix_ms: Option<u64>) {
-        if let Ok(mut state) = self.inner.lock()
+        let changed = if let Ok(mut state) = self.inner.lock()
             && state
                 .sessions
                 .get(&device_id)
@@ -541,6 +614,12 @@ impl RemoteHub {
                     info.last_transition_unix_ms = disconnected_unix_ms;
                 }
             }
+            true
+        } else {
+            false
+        };
+        if changed {
+            self.signal_session_change();
         }
     }
 }
@@ -922,6 +1001,34 @@ fn finalize_persisted(
     })?)
 }
 
+async fn recv_rpc_reply_with_progress(
+    inner: &mut InnerSession,
+    stream: &mut IrohStream,
+    request_id: RequestId,
+) -> Result<InnerMessage, RemoteHubError> {
+    loop {
+        let message = tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, inner.recv(stream))
+            .await
+            .map_err(|_| RemoteHubError::RpcLivenessTimeout(request_id))??;
+        if is_rpc_progress(request_id, &message)? {
+            continue;
+        }
+        return Ok(unwrap_rpc_reply(request_id, &message)?);
+    }
+}
+
+async fn send_rpc_request_with_timeout(
+    inner: &mut InnerSession,
+    stream: &mut IrohStream,
+    request_id: RequestId,
+    message: InnerMessage,
+) -> Result<(), RemoteHubError> {
+    tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, inner.send(stream, &message))
+        .await
+        .map_err(|_| RemoteHubError::RpcLivenessTimeout(request_id))??;
+    Ok(())
+}
+
 async fn handle_member(
     stream: &mut IrohStream,
     identity: &StoredControllerIdentity,
@@ -1046,14 +1153,15 @@ async fn handle_member(
                 request,
                 reply,
             } => {
-                let result = async {
-                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                    inner.send(stream, &message).await?;
-                    let message = inner.recv(stream).await?;
-                    let message = unwrap_rpc_reply(request_id, &message)?;
-                    Ok(ReadReply::from_message(&message)?)
-                }
-                .await;
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
+                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        Ok(ReadReply::from_message(&message)?)
+                    } => result,
+                };
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
@@ -1065,14 +1173,15 @@ async fn handle_member(
                 request,
                 reply,
             } => {
-                let result = async {
-                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                    inner.send(stream, &message).await?;
-                    let message = inner.recv(stream).await?;
-                    let message = unwrap_rpc_reply(request_id, &message)?;
-                    Ok(FsQueryReply::from_message(&message)?)
-                }
-                .await;
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
+                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        Ok(FsQueryReply::from_message(&message)?)
+                    } => result,
+                };
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
@@ -1084,14 +1193,15 @@ async fn handle_member(
                 request,
                 reply,
             } => {
-                let result = async {
-                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                    inner.send(stream, &message).await?;
-                    let message = inner.recv(stream).await?;
-                    let message = unwrap_rpc_reply(request_id, &message)?;
-                    Ok(FsMutationReply::from_message(&message)?)
-                }
-                .await;
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
+                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        Ok(FsMutationReply::from_message(&message)?)
+                    } => result,
+                };
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
@@ -1103,14 +1213,15 @@ async fn handle_member(
                 request,
                 reply,
             } => {
-                let result = async {
-                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
-                    inner.send(stream, &message).await?;
-                    let message = inner.recv(stream).await?;
-                    let message = unwrap_rpc_reply(request_id, &message)?;
-                    Ok(ShellTaskReply::from_message(&message)?)
-                }
-                .await;
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(&mut inner, stream, request_id, message).await?;
+                        let message = recv_rpc_reply_with_progress(&mut inner, stream, request_id).await?;
+                        Ok(ShellTaskReply::from_message(&message)?)
+                    } => result,
+                };
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
@@ -1235,6 +1346,8 @@ pub enum RemoteHubError {
     StatePoisoned,
     #[error("remote session generation overflow")]
     GenerationOverflow,
+    #[error("remote RPC {0} stopped making progress")]
+    RpcLivenessTimeout(RequestId),
     #[error("Controller live Shell task projection capacity is exhausted")]
     ShellProjectionCapacity,
     #[error("Shell follow-up referenced unknown or stale task {0}")]
@@ -1600,6 +1713,215 @@ mod tests {
         assert_eq!(disconnected.generation, generation_two);
         assert_eq!(disconnected.state, RemoteSessionState::Disconnected);
         assert_eq!(disconnected.last_transition_unix_ms, 2_300);
+    }
+
+    #[tokio::test]
+    async fn replayable_rpcs_keep_request_id_across_generation_but_shell_start_does_not_replay() {
+        let hub = RemoteHub::default();
+        let device_id = DeviceId::new();
+
+        let read_hub = hub.clone();
+        let read_call = tokio::spawn(async move {
+            read_hub
+                .read(device_id, ReadRequest::new("/replay/read", 0, 16).unwrap())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!read_call.is_finished());
+        let (generation_one, mut commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_000,
+            )
+            .unwrap();
+        let RemoteCommand::Read {
+            request_id: read_id_one,
+            reply: read_reply_one,
+            ..
+        } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected first Read attempt");
+        };
+        drop(read_reply_one);
+        hub.unregister(device_id, generation_one, Some(1_100));
+        let (generation_two, mut commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                1_200,
+            )
+            .unwrap();
+        let RemoteCommand::Read {
+            request_id: read_id_two,
+            reply: read_reply_two,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(2), commands_two.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected replayed Read attempt");
+        };
+        assert_eq!(read_id_two, read_id_one);
+        read_reply_two
+            .send(Ok(ReadReply::Data(b"replayed-read".to_vec())))
+            .unwrap();
+        assert_eq!(
+            read_call.await.unwrap().unwrap(),
+            ReadReply::Data(b"replayed-read".to_vec())
+        );
+
+        let query_hub = hub.clone();
+        let query_call = tokio::spawn(async move {
+            query_hub
+                .fs_query(
+                    device_id,
+                    FsQueryRequest::path_info("/replay/query").unwrap(),
+                )
+                .await
+        });
+        let RemoteCommand::FsQuery {
+            request_id: query_id_one,
+            reply: query_reply_one,
+            ..
+        } = commands_two.recv().await.unwrap()
+        else {
+            panic!("expected first FsQuery attempt");
+        };
+        drop(query_reply_one);
+        hub.unregister(device_id, generation_two, Some(1_300));
+        let (generation_three, mut commands_three) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Relay,
+                1_400,
+            )
+            .unwrap();
+        let RemoteCommand::FsQuery {
+            request_id: query_id_two,
+            reply: query_reply_two,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(2), commands_three.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected replayed FsQuery attempt");
+        };
+        assert_eq!(query_id_two, query_id_one);
+        let query_result = FsQueryReply::error(
+            clew_transport::FsQueryErrorCode::NotFound,
+            "replayed query proof",
+        );
+        query_reply_two.send(Ok(query_result.clone())).unwrap();
+        assert_eq!(query_call.await.unwrap().unwrap(), query_result);
+
+        let mutation_request = FsMutationRequest::write(
+            "/replay/mutation",
+            "replay mutation",
+            clew_transport::FsWritePrecondition::CreateOnly,
+        )
+        .unwrap();
+        let mutation_hub = hub.clone();
+        let mutation_call =
+            tokio::spawn(
+                async move { mutation_hub.fs_mutation(device_id, mutation_request).await },
+            );
+        let RemoteCommand::FsMutation {
+            request_id: mutation_id_one,
+            reply: mutation_reply_one,
+            ..
+        } = commands_three.recv().await.unwrap()
+        else {
+            panic!("expected first FsMutation attempt");
+        };
+        mutation_reply_one
+            .send(Ok(FsMutationReply::error(
+                clew_transport::FsMutationErrorCode::Timeout,
+                "still in progress",
+            )))
+            .unwrap();
+        let RemoteCommand::FsMutation {
+            request_id: mutation_id_two,
+            reply: mutation_reply_two,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(2), commands_three.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected same-generation FsMutation replay after in-flight timeout");
+        };
+        assert_eq!(mutation_id_two, mutation_id_one);
+        drop(mutation_reply_two);
+        hub.unregister(device_id, generation_three, Some(1_500));
+        let (generation_four, mut commands_four) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_600,
+            )
+            .unwrap();
+        let RemoteCommand::FsMutation {
+            request_id: mutation_id_three,
+            reply: mutation_reply_three,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(2), commands_four.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected cross-generation FsMutation replay");
+        };
+        assert_eq!(mutation_id_three, mutation_id_one);
+        let mutation_result = FsMutationReply::Result(clew_transport::FsMutationResult {
+            sha256: "11".repeat(32),
+            size: 15,
+            created: true,
+        });
+        mutation_reply_three
+            .send(Ok(mutation_result.clone()))
+            .unwrap();
+        assert_eq!(mutation_call.await.unwrap().unwrap(), mutation_result);
+
+        let shell_hub = hub.clone();
+        let shell_call = tokio::spawn(async move {
+            shell_hub
+                .shell_start(
+                    device_id,
+                    ShellTaskRequest::start("echo no-replay", "/replay", BTreeMap::new(), 5_000)
+                        .unwrap(),
+                )
+                .await
+        });
+        let RemoteCommand::ShellTask { reply, .. } = commands_four.recv().await.unwrap() else {
+            panic!("expected Shell Start on current generation");
+        };
+        drop(reply);
+        hub.unregister(device_id, generation_four, Some(1_700));
+        let (_generation_five, mut commands_five) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                1_800,
+            )
+            .unwrap();
+        assert!(matches!(
+            shell_call.await.unwrap(),
+            Err(RemoteHubError::Offline(actual)) if actual == device_id
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commands_five.recv())
+                .await
+                .is_err(),
+            "Shell Start must not be replayed onto a new session generation"
+        );
     }
 
     #[tokio::test]

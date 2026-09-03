@@ -7,6 +7,8 @@ use crate::{InnerMessage, InnerSessionError};
 
 pub const RPC_REQUEST_MESSAGE_KIND: &str = "rpc_request";
 pub const RPC_REPLY_MESSAGE_KIND: &str = "rpc_reply";
+pub const RPC_PROGRESS_MESSAGE_KIND: &str = "rpc_progress";
+pub const RPC_PROGRESS_INTERVAL_MS: u64 = 2_000;
 const RPC_NESTED_HEADER_BYTES: usize = 16 + 1 + 4;
 const MAX_NESTED_KIND_BYTES: usize = 64;
 
@@ -42,6 +44,30 @@ pub fn unwrap_rpc_reply(
         });
     }
     Ok(nested)
+}
+
+pub fn wrap_rpc_progress(request_id: RequestId) -> Result<InnerMessage, RpcProtocolError> {
+    Ok(InnerMessage::new(
+        RPC_PROGRESS_MESSAGE_KIND,
+        request_id.as_bytes().to_vec(),
+    )?)
+}
+
+pub fn is_rpc_progress(
+    expected_request_id: RequestId,
+    message: &InnerMessage,
+) -> Result<bool, RpcProtocolError> {
+    if message.kind != RPC_PROGRESS_MESSAGE_KIND {
+        return Ok(false);
+    }
+    let actual_request_id = RequestId::try_from(message.payload.as_slice())?;
+    if actual_request_id != expected_request_id {
+        return Err(RpcProtocolError::RequestIdMismatch {
+            expected: expected_request_id,
+            actual: actual_request_id,
+        });
+    }
+    Ok(true)
 }
 
 fn wrap_rpc(
@@ -159,6 +185,32 @@ mod tests {
             unwrap_rpc_reply(RequestId::new(), &wrapped),
             Err(RpcProtocolError::RequestIdMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn rpc_progress_is_bounded_and_correlated_to_the_active_request() {
+        let request_id = RequestId::new();
+        let progress = wrap_rpc_progress(request_id).unwrap();
+        assert_eq!(progress.kind, RPC_PROGRESS_MESSAGE_KIND);
+        assert_eq!(progress.payload.len(), 16);
+        assert!(is_rpc_progress(request_id, &progress).unwrap());
+        assert!(matches!(
+            is_rpc_progress(RequestId::new(), &progress),
+            Err(RpcProtocolError::RequestIdMismatch { .. })
+        ));
+
+        let mut truncated = progress.clone();
+        truncated.payload.pop();
+        assert!(matches!(
+            is_rpc_progress(request_id, &truncated),
+            Err(RpcProtocolError::StableId(StableIdError::InvalidLength(15)))
+        ));
+        let reply = wrap_rpc_reply(
+            request_id,
+            InnerMessage::new("read_result", vec![]).unwrap(),
+        )
+        .unwrap();
+        assert!(!is_rpc_progress(request_id, &reply).unwrap());
     }
 
     #[test]
