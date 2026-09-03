@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a + V3b + V3c DONE）**
+**Status：IN PROGRESS（V3a + V3b + V3c + V3d DONE）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -1017,6 +1017,20 @@ V3b request replay matrix至此封板。下一块 V3c：Shell task reattach。�
 - smoke cleanup完成：临时firewall由远端 `try/finally`自动删除，显式复查时已无匹配规则；mzd Host测试进程终止，cap00隔离Controller authenticated shutdown，远端/本地fixture与state目录全部删除。final gate：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **176 passed / 0 failed / 6 ignored**。
 
 V3c Shell reattach至此封板。V3c-1中“网络重连即可免除旧grace取消”的初始规则由本块正式收紧为“**newer-epoch TaskId proof才可免除**”。下一块 V3d：File resume 接口预留；只冻结stable transfer identity、offset/hash/precondition/resume capability与reconnect ownership边界，不实现V5的chunk manifest、bulk data plane、directory transfer或并发调度。
+
+### V3d — File resume interface reservation
+
+**Status：DONE（2026-09-03）**
+
+- 复用早期proto skeleton已经固定的 `FEATURE_FILE_RESUME = 6`，**没有重新分配feature号，也没有提升 `CAPABILITY_VERSION=1`**。新增 `hello_has_feature` / `hello_supports_file_resume`只负责显式查询peer广告；focused test冻结Feature 6编号，并证明相同capability_version本身绝不隐含File resume支持。当前生产路径没有因为本块自动把Feature 6加入任何Hello；
+- `clew-core`新增stable UUID strong type `TransferId`。它只标识Controller-owned逻辑传输，**不是authorization token**；future resume仍必须重新经过当前Controller/Site/Device授权与当前authenticated session。TransferId不复用RequestId/TaskId，也不绑定某一次InnerSession generation，因此可以跨reconnect指向同一逻辑transfer；
+- `clew-transport`新增8KiB hard-bound、versioned `FileResumeDescriptor v1`：绑定 `TransferId + ControllerId + SiteId + DeviceId + direction + device_path + total_size + checkpoint_revision + confirmed_offset + confirmed_prefix_sha256 + optional final_sha256`。descriptor是peer-visible control object，**故意不携带Controller本机path**；future Controller-private local path/state只允许按TransferId本地索引，避免把本机用户名/目录结构无必要暴露给Target；
+- 单descriptor fail closed：device path最多2048 UTF-8 bytes且禁NUL；revision非零；`offset <= total_size`；hash只接受canonical lowercase SHA-256；offset=0必须使用empty-prefix SHA-256；`offset == total_size`时必须已有full-file SHA-256且与prefix hash一致，避免把“complete”状态建立在没有最终完整性证明的checkpoint上；decode在JSON解析前先执行8KiB size gate；
+- `validate_successor_of(previous)`冻结resume precondition：同TransferId的后继checkpoint不得换Controller/Site/Device/direction/device_path/total_size；revision必须严格递增，offset不得回退，同一offset的prefix hash不得改变；full hash可从未知升级为已知，但一旦已知不得删除或更改；complete transfer拒绝继续追加checkpoint。该比较只冻结恢复identity与checkpoint单调性，future V5仍必须对实际partial-file bytes重新验证prefix hash，不能把descriptor当成磁盘事实；
+- 本块**不打开文件、不创建 `.part`、不发送chunk、不增加transfer task/store/Local API/CLI/MCP、不新增transport ALPN**，也不实现V5的manifest、目录传输、并发、progress/cancel。它只给未来V5预留能与V3 reconnect语义一致的control contract；
+- focused descriptor **4/4 PASS**，proto Feature 6 **1/1 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **181 passed / 0 failed / 6 ignored**。
+
+V3d至此封板。下一块 V3e：sleep/resume。目标只处理OS suspend/长时间sleep造成的stale session/path/liveness与Host reconnect节奏，不做后台service persistence；恢复后必须重新authenticated session/generation，旧RPC/Shell/File resume各自继续遵守V3b/V3c/V3d既有身份边界。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1117,13 +1131,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c + V3d DONE）**
 
-**Next block：V3d — File resume interface reservation**
+**Next block：V3e — sleep/resume**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b已闭合短 RPC跨generation replay；V3c现在把Shell task恢复收紧为stable TaskId + same authenticated DeviceId + shared 30s grace + newer-epoch Status/Attach proof，并以cap00↔mzd真实generation 3→4同TaskId Status/Attach完成产品验收。下一块只预留File resume的身份/能力/恢复接口，不提前实现V5数据面。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b已闭合短RPC跨generation replay，V3c已闭合same-Device Shell TaskId reattach，V3d把早期Feature 6占位提升为不泄漏Controller本机path、带stable TransferId与monotonic hash checkpoint的纯控制面File resume contract，同时仍不实现V5数据面。下一块处理OS sleep/resume导致的stale session/liveness/reconnect语义。
 
 ### Change log
+
+- **2026-09-03** — V3d File resume interface reservation DONE：复用既有proto `FEATURE_FILE_RESUME=6`且保持`CAPABILITY_VERSION=1`，新增显式feature查询但当前生产不自动广告；新增stable `TransferId`与8KiB peer-visible `FileResumeDescriptor v1`，绑定Controller/Site/Device/direction/device path/size/revision/offset/prefix hash/final hash，Controller本机path故意留在future private state。successor validator冻结scope、revision/offset单调、same-offset prefix hash与known final hash；complete checkpoint必须有匹配full SHA-256。无文件I/O、无chunk/data plane/Local API/CLI/MCP。descriptor **4/4**、Feature 6 **1/1**、workspace **181/0/6**。下一块 V3e sleep/resume。
 
 - **2026-09-03** — V3c-2 Controller TaskId reattach + per-epoch proof DONE / V3c closed：Controller projection跨generation保留原DeviceId并在30s内用Status proof重绑；independent review修复Start unknown-result orphan，新增Started→Status receipt后才向caller返回TaskId；真实跨机时序又收紧Host为每个new session epoch都必须重新Status/Attach proof，网络重连本身不再延长task。Host reconnect **4/4**、runtime **35/35**、no-public Connector **1/1（3.49s）**。cap00 Controller + mzd Host真实20s program-scoped firewall gate观测generation **3 disconnected → 4 connected（13.750s）**，原TaskId Status仍Running、Attach保留断线前26-byte stdout且`lost_prefix=false`、Cancel PASS；workspace **176/0/6**。下一块 V3d File resume接口预留。
 

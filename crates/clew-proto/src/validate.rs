@@ -146,6 +146,16 @@ pub fn hello_device_id(hello: &v1::Hello) -> Result<Option<DeviceId>, WireValida
         .map_err(|_| WireValidationError::ZeroId("device_id"))
 }
 
+#[must_use]
+pub fn hello_has_feature(hello: &v1::Hello, feature: v1::Feature) -> bool {
+    hello.features.contains(&(feature as i32))
+}
+
+#[must_use]
+pub fn hello_supports_file_resume(hello: &v1::Hello) -> bool {
+    hello_has_feature(hello, v1::Feature::FileResume)
+}
+
 fn check_frame_size(actual: usize) -> Result<(), WireValidationError> {
     let max = HARD_MAX_FRAME_SIZE as usize;
     if actual > max {
@@ -240,6 +250,17 @@ mod tests {
             hello_device_id(&decoded).unwrap(),
             hello_device_id(&hello).unwrap()
         );
+    }
+
+    #[test]
+    fn file_resume_feature_number_is_frozen_but_not_implied_by_capability_version() {
+        assert_eq!(v1::Feature::FileResume as i32, 6);
+        let mut hello = sample_hello();
+        assert!(!hello_supports_file_resume(&hello));
+        hello.features.push(v1::Feature::FileResume as i32);
+        hello.validate_wire().unwrap();
+        assert!(hello_supports_file_resume(&hello));
+        assert!(hello_has_feature(&hello, v1::Feature::FileResume));
     }
 
     #[test]

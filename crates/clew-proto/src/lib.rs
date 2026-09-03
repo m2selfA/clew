@@ -8,6 +8,7 @@ pub mod v1 {
 
 pub use validate::{
     ValidateWire, WireValidationError, decode_wire_message, encode_wire_message, hello_device_id,
+    hello_has_feature, hello_supports_file_resume,
 };
 
 pub const WIRE_MAJOR: u32 = 1;

@@ -14,7 +14,9 @@ pub use control::{
     HARD_MAX_READ_TIMEOUT_MS, ReadPolicy,
 };
 pub use device::{DeviceNameOrigin, DeviceRecord, DeviceSummary, MemberCapabilities, SiteMember};
-pub use id::{ControllerId, DeviceId, InviteId, RequestId, SiteId, StableIdError, TaskId};
+pub use id::{
+    ControllerId, DeviceId, InviteId, RequestId, SiteId, StableIdError, TaskId, TransferId,
+};
 pub use naming::{
     DeviceTag, DeviceTagAllocation, DeviceTagAllocationError, DeviceTagParseError,
     allocate_device_tag,

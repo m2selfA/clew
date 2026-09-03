@@ -2,6 +2,7 @@
 
 mod connector;
 mod discovery;
+mod file_resume;
 mod fs_mutation;
 mod fs_query;
 mod inner;
@@ -22,6 +23,10 @@ pub use connector::{
 pub use discovery::{
     ConnectorCandidate, ConnectorDiscoveryAdvertisement, ConnectorDiscoveryError,
     ConnectorDiscoveryEvent, ConnectorDiscoveryEvents, MdnsConnectorDiscovery, SiteDiscoveryTag,
+};
+pub use file_resume::{
+    EMPTY_SHA256_HEX, FILE_RESUME_DESCRIPTOR_VERSION, FileResumeDescriptor, FileResumeError,
+    FileTransferDirection, MAX_FILE_RESUME_DESCRIPTOR_BYTES, MAX_FILE_RESUME_PATH_BYTES,
 };
 pub use fs_mutation::{
     FsMutationErrorBody, FsMutationErrorCode, FsMutationProtocolError, FsMutationReply,
