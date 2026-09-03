@@ -530,7 +530,7 @@ V1.25b-2 macOS acceptance evidence：
 
 ## 8. V1.5 — Zero-config Site Connector
 
-**Status：IN PROGRESS（V1.5a–e DONE on Windows + macOS；只剩 V1.5 final multi-machine acceptance）**
+**Status：IN PROGRESS（V1.5a–e DONE；三机产品路径 PASS；只剩 physical no-public multi-machine gate）**
 
 V1.5a implementation spike 已完成并冻结当前依赖/API事实：项目使用 `iroh 1.1.0`；mDNS AddressLookup 已从核心 crate 拆到 `iroh-mdns-address-lookup 0.5.0`。Clew 使用独立 Clew-only mDNS service，而**不**把 Site metadata 挂进 endpoint-global `AddressLookupServices` / `UserData`，避免 N0 preset 的 DNS/Pkarr publisher 把 LAN Site hint 带到公网。Clew 不按旧版 iroh discovery 示例编码。
 
@@ -711,7 +711,20 @@ macOS exact-commit acceptance：implementation commit `84b99c7` 的 tracked arch
 
 Aqua product gate：exact binary 的 Controller GUI 持续 >15 秒 stderr 为空并自动拉起 `ready=true` Controller；该 Controller 又在 **442 ms** 内真实签出 macOS 当前 ClientFlavor 的 `site.clew`。同一普通 `execute_preferred` sidecar 以 `host --connector-only` 启动后，Host Aqua GUI 持续 >15 秒 stderr 为空，Controller `devices` 明确返回 `online=true / executable=false / connector=true`；second launch **112 ms** 返回 `already running; requested the existing window to show`。Host/Controller job 与 smoke state/kit 均已清理。
 
-下一步只做 V1.5 final multi-machine acceptance。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
+V1.5 final multi-machine acceptance 已推进到真实三机产品路径；剩余 blocker 已收窄为 **physical no-public Target 与 nearby Helper 必须真实二层/三层互通**。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
+
+2026-09-03 三机 acceptance（当前 HEAD `7d5fed9`，Windows binary SHA-256 `d3a373ed2a186bfd3ca0dafcd1db0c5610d697e4c022056cee74b1a224cbe971`）：
+
+- cap00 = isolated Controller，imini = Helper，mzd = Target；三机使用同一精确 binary 与同一真实 Controller-signed `site.clew`；
+- imini 通过生产 `host --foreground --connector-only` 完成 enrollment，Controller `devices` 返回 `online=true / executable=false / connector=true`；
+- mzd 通过普通 `host --foreground` 完成 enrollment，Controller 返回 `online=true / executable=true / connector=true`；Controller 真实 bounded Read 读取 mzd 的 `D:\\tmp\\clew-v15-final-7d5fed9\\share\\acceptance.txt`，精确返回 `CLEW-V15-FINAL-MULTIMACHINE`；
+- 为避免把 direct/relay 成功误报成 Connector 成功，额外检查 mzd 状态发现 `nearby-connector.export.json`，证明该轮至少建立过 direct Controller uplink，因此这条三机证据**只证明真实机器/产品入口/权限/Read**，不冒充 no-public gate；
+- 随后从 imini 的 production per-Site export 取出 1881-byte `nearby-connection.clew`，在 mzd 对**仅本次测试 binary**临时添加 Windows Firewall `RemoteAddress=Internet` outbound block，保留 LAN，再用全新 `target-nopublic-state` 尝试首次 enrollment。Target 正确导入 fallback 并停在 `device-key.pending.json + nearby-connector.import.json`，没有错误变成 Active；helper 文件中的 direct hints 为 `10.100.9.235:65137` / `10.100.10.199:65137` / `120.197.102.82:2581`，前两条从 mzd 当前网络不可达，Internet hint 又被测试规则刻意阻断，所以该物理拓扑无法完成 nearby-only path；
+- firewall rule 已在测试后删除，Target/Helper jobs 已停止，isolated Controller 已 authenticated shutdown。这个失败是**测试拓扑不具备 nearby reachability**，不是 fallback 信任/协议 gate 的失败；macOS 已知 mDNS-blocked 环境中的 no-mDNS enrollment+active Read 证据仍由 V1.5c-3 exact `c4fbae6` 保持 PASS。
+
+- 本轮文档收口后统一 gate：`cargo fmt -- --check` PASS；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **143 passed / 0 failed / 6 ignored**。
+
+因此下一步不再改协议：只需换一对真实同 LAN 且 Target 可屏蔽公网、仍能直达 Helper 的机器，复跑同一 Site Kit 首次 enrollment + Read；通过后即可封 V1.5。
 
 计划：
 
@@ -852,11 +865,11 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V1.5 — Zero-config Site Connector（IN PROGRESS；V1.5a DONE）**
+**Current block：V1.5 — Zero-config Site Connector（IN PROGRESS；V1.5a–e DONE，三机产品路径 PASS）**
 
-**Next block：V1.5d — multiple-helper health/failover + suspend/resume**
+**Next block：V1.5 final physical no-public multi-machine acceptance**
 
-V1.5a–c 已把 discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序与 mDNS-blocked fallback 全部闭环。V1.5d 不再扩张协议角色：先把 candidate race 改成 bounded concurrent health selection，证明坏/慢 Helper 不会阻塞其它候选；再做 Helper-A 断线→Helper-B 自动恢复的真实 acceptance，并补 helper suspend/resume 后 endpoint/lease/mDNS refresh。Target 仍只绑定 Site，不持久绑定具体 HelperId。
+协议/产品实现已收口：discovery、Controller-signed lease、sealed first enrollment、active InnerSession/Read、任意启动顺序、Nearby fallback、bounded concurrent Helper selection、Helper-A→B session rebuild、LAN presence refresh、GUI invite 与 same-Site-Kit helper-only entry 均已有 focused / Windows / macOS 证据。2026-09-03 又完成 cap00 Controller + imini Helper + mzd Target 的真实三机 enrollment/权限/Read；唯一未闭合的是“Target 屏蔽公网后仍与真实 nearby Helper 可达”的物理网络 gate。当前 mzd↔imini 不具备这种 LAN reachability，因此保持 IN PROGRESS，不重新打开 V1.5 协议设计。
 
 ### Change log
 
