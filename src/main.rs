@@ -599,6 +599,7 @@ async fn wait_for_host_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 async fn run_host_network_lifecycle(
     layout: clew_core::StateLayout,
     state: HostLaunchState,
