@@ -7,8 +7,10 @@ pub mod v1 {
 }
 
 pub use validate::{
-    ValidateWire, WireValidationError, decode_wire_message, encode_wire_message, hello_device_id,
-    hello_has_feature, hello_supports_file_resume,
+    IMPLEMENTED_FEATURES, NegotiatedLimits, ValidateWire, WireValidationError, decode_wire_message,
+    encode_wire_message, feature_negotiated, hello_advertises_feature,
+    hello_advertises_file_resume, hello_device_id, locally_implements_feature, negotiate_limits,
+    negotiated_implemented_features,
 };
 
 pub const WIRE_MAJOR: u32 = 1;

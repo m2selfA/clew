@@ -8,6 +8,10 @@ const ID_BYTES: usize = 16;
 const MAX_SOFTWARE_VERSION_BYTES: usize = 128;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 
+/// Features implemented end-to-end by the current runtime and safe to negotiate today.
+/// Enum values not listed here are reserved/known protocol vocabulary only.
+pub const IMPLEMENTED_FEATURES: &[v1::Feature] = &[v1::Feature::ToolRpc, v1::Feature::ShellTask];
+
 pub trait ValidateWire {
     fn validate_wire(&self) -> Result<(), WireValidationError>;
 }
@@ -147,13 +151,65 @@ pub fn hello_device_id(hello: &v1::Hello) -> Result<Option<DeviceId>, WireValida
 }
 
 #[must_use]
-pub fn hello_has_feature(hello: &v1::Hello, feature: v1::Feature) -> bool {
+pub fn hello_advertises_feature(hello: &v1::Hello, feature: v1::Feature) -> bool {
     hello.features.contains(&(feature as i32))
 }
 
 #[must_use]
-pub fn hello_supports_file_resume(hello: &v1::Hello) -> bool {
-    hello_has_feature(hello, v1::Feature::FileResume)
+pub fn hello_advertises_file_resume(hello: &v1::Hello) -> bool {
+    hello_advertises_feature(hello, v1::Feature::FileResume)
+}
+
+#[must_use]
+pub fn locally_implements_feature(feature: v1::Feature) -> bool {
+    IMPLEMENTED_FEATURES.contains(&feature)
+}
+
+pub fn feature_negotiated(
+    local: &v1::Hello,
+    peer: &v1::Hello,
+    feature: v1::Feature,
+) -> Result<bool, WireValidationError> {
+    local.validate_wire()?;
+    peer.validate_wire()?;
+    Ok(locally_implements_feature(feature)
+        && hello_advertises_feature(local, feature)
+        && hello_advertises_feature(peer, feature))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NegotiatedLimits {
+    pub max_frame_size: u32,
+    pub max_concurrent_requests: u32,
+}
+
+pub fn negotiate_limits(
+    local: &v1::Hello,
+    peer: &v1::Hello,
+) -> Result<NegotiatedLimits, WireValidationError> {
+    local.validate_wire()?;
+    peer.validate_wire()?;
+    Ok(NegotiatedLimits {
+        max_frame_size: local.max_frame_size.min(peer.max_frame_size),
+        max_concurrent_requests: local
+            .max_concurrent_requests
+            .min(peer.max_concurrent_requests),
+    })
+}
+
+pub fn negotiated_implemented_features(
+    local: &v1::Hello,
+    peer: &v1::Hello,
+) -> Result<Vec<v1::Feature>, WireValidationError> {
+    local.validate_wire()?;
+    peer.validate_wire()?;
+    Ok(IMPLEMENTED_FEATURES
+        .iter()
+        .copied()
+        .filter(|feature| {
+            hello_advertises_feature(local, *feature) && hello_advertises_feature(peer, *feature)
+        })
+        .collect())
 }
 
 fn check_frame_size(actual: usize) -> Result<(), WireValidationError> {
@@ -256,11 +312,124 @@ mod tests {
     fn file_resume_feature_number_is_frozen_but_not_implied_by_capability_version() {
         assert_eq!(v1::Feature::FileResume as i32, 6);
         let mut hello = sample_hello();
-        assert!(!hello_supports_file_resume(&hello));
+        assert!(!hello_advertises_file_resume(&hello));
         hello.features.push(v1::Feature::FileResume as i32);
         hello.validate_wire().unwrap();
-        assert!(hello_supports_file_resume(&hello));
-        assert!(hello_has_feature(&hello, v1::Feature::FileResume));
+        assert!(hello_advertises_file_resume(&hello));
+        assert!(hello_advertises_feature(&hello, v1::Feature::FileResume));
+        assert!(!locally_implements_feature(v1::Feature::FileResume));
+    }
+
+    #[test]
+    fn compatibility_matrix_separates_wire_capability_version_and_feature_bits() {
+        let mut local = sample_hello();
+        local.features = vec![
+            v1::Feature::ToolRpc as i32,
+            v1::Feature::ShellTask as i32,
+            v1::Feature::FileResume as i32,
+        ];
+        local.capability_version = 1;
+
+        let mut old_peer = sample_hello();
+        old_peer.capability_version = 1;
+        old_peer.features = vec![v1::Feature::ToolRpc as i32];
+        assert_eq!(
+            negotiated_implemented_features(&local, &old_peer).unwrap(),
+            vec![v1::Feature::ToolRpc]
+        );
+        assert!(feature_negotiated(&local, &old_peer, v1::Feature::ToolRpc).unwrap());
+        assert!(!feature_negotiated(&local, &old_peer, v1::Feature::ShellTask).unwrap());
+
+        let mut newer_peer = old_peer.clone();
+        newer_peer.capability_version = 999;
+        newer_peer.features.push(v1::Feature::ShellTask as i32);
+        newer_peer.features.push(999);
+        assert_eq!(
+            negotiated_implemented_features(&local, &newer_peer).unwrap(),
+            vec![v1::Feature::ToolRpc, v1::Feature::ShellTask]
+        );
+        assert!(feature_negotiated(&local, &newer_peer, v1::Feature::ShellTask).unwrap());
+
+        newer_peer.features.push(v1::Feature::FileResume as i32);
+        assert!(hello_advertises_file_resume(&local));
+        assert!(hello_advertises_file_resume(&newer_peer));
+        assert!(!feature_negotiated(&local, &newer_peer, v1::Feature::FileResume).unwrap());
+        assert!(
+            !negotiated_implemented_features(&local, &newer_peer)
+                .unwrap()
+                .contains(&v1::Feature::FileResume)
+        );
+    }
+
+    #[test]
+    fn known_future_features_are_not_negotiated_until_runtime_implementation_exists() {
+        let mut local = sample_hello();
+        let mut peer = sample_hello();
+        local.features = vec![
+            v1::Feature::Forward as i32,
+            v1::Feature::Socks5 as i32,
+            v1::Feature::HttpConnect as i32,
+            v1::Feature::FileResume as i32,
+        ];
+        peer.features = local.features.clone();
+
+        for feature in [
+            v1::Feature::Forward,
+            v1::Feature::Socks5,
+            v1::Feature::HttpConnect,
+            v1::Feature::FileResume,
+        ] {
+            assert!(hello_advertises_feature(&local, feature));
+            assert!(!locally_implements_feature(feature));
+            assert!(!feature_negotiated(&local, &peer, feature).unwrap());
+        }
+        assert!(
+            negotiated_implemented_features(&local, &peer)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn negotiated_limits_take_the_stricter_valid_peer_bounds() {
+        let mut local = sample_hello();
+        local.max_frame_size = 8 * 1024 * 1024;
+        local.max_concurrent_requests = 1024;
+        let mut peer = sample_hello();
+        peer.max_frame_size = 2 * 1024 * 1024;
+        peer.max_concurrent_requests = 2048;
+
+        assert_eq!(
+            negotiate_limits(&local, &peer).unwrap(),
+            NegotiatedLimits {
+                max_frame_size: 2 * 1024 * 1024,
+                max_concurrent_requests: 1024,
+            }
+        );
+
+        peer.max_frame_size = HARD_MAX_FRAME_SIZE + 1;
+        assert!(matches!(
+            negotiate_limits(&local, &peer),
+            Err(WireValidationError::OutOfRange {
+                field: "max_frame_size",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wrong_wire_major_blocks_negotiation_even_with_matching_feature_bits() {
+        let mut local = sample_hello();
+        let mut peer = sample_hello();
+        local.features = vec![v1::Feature::ToolRpc as i32];
+        peer.features = local.features.clone();
+        peer.wire_major = WIRE_MAJOR + 1;
+
+        assert!(matches!(
+            feature_negotiated(&local, &peer, v1::Feature::ToolRpc),
+            Err(WireValidationError::UnsupportedWireMajor { found, supported })
+                if found == WIRE_MAJOR + 1 && supported == WIRE_MAJOR
+        ));
     }
 
     #[test]

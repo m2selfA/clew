@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a + V3b + V3c + V3d + V3e DONE）**
+**Status：DONE（2026-09-03；V3a–V3f 全部封板）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -1022,7 +1022,7 @@ V3c Shell reattach至此封板。V3c-1中“网络重连即可免除旧grace取�
 
 **Status：DONE（2026-09-03）**
 
-- 复用早期proto skeleton已经固定的 `FEATURE_FILE_RESUME = 6`，**没有重新分配feature号，也没有提升 `CAPABILITY_VERSION=1`**。新增 `hello_has_feature` / `hello_supports_file_resume`只负责显式查询peer广告；focused test冻结Feature 6编号，并证明相同capability_version本身绝不隐含File resume支持。当前生产路径没有因为本块自动把Feature 6加入任何Hello；
+- 复用早期proto skeleton已经固定的 `FEATURE_FILE_RESUME = 6`，**没有重新分配feature号，也没有提升 `CAPABILITY_VERSION=1`**。V3f随后将这里的查询helper正式收紧命名为 `hello_advertises_feature` / `hello_advertises_file_resume`，强调它们只表示peer Hello显式广告、绝不代表本地runtime已实现或已经协商；focused test冻结Feature 6编号，并证明相同capability_version本身绝不隐含File resume支持。当前生产路径没有因为本块自动把Feature 6加入任何Hello；
 - `clew-core`新增stable UUID strong type `TransferId`。它只标识Controller-owned逻辑传输，**不是authorization token**；future resume仍必须重新经过当前Controller/Site/Device授权与当前authenticated session。TransferId不复用RequestId/TaskId，也不绑定某一次InnerSession generation，因此可以跨reconnect指向同一逻辑transfer；
 - `clew-transport`新增8KiB hard-bound、versioned `FileResumeDescriptor v1`：绑定 `TransferId + ControllerId + SiteId + DeviceId + direction + device_path + total_size + checkpoint_revision + confirmed_offset + confirmed_prefix_sha256 + optional final_sha256`。descriptor是peer-visible control object，**故意不携带Controller本机path**；future Controller-private local path/state只允许按TransferId本地索引，避免把本机用户名/目录结构无必要暴露给Target；
 - 单descriptor fail closed：device path最多2048 UTF-8 bytes且禁NUL；revision非零；`offset <= total_size`；hash只接受canonical lowercase SHA-256；offset=0必须使用empty-prefix SHA-256；`offset == total_size`时必须已有full-file SHA-256且与prefix hash一致，避免把“complete”状态建立在没有最终完整性证明的checkpoint上；decode在JSON解析前先执行8KiB size gate；
@@ -1045,6 +1045,20 @@ V3d至此封板。下一块 V3e：sleep/resume。目标只处理OS suspend/长�
 - 真实 no-public NearbyFile Connector full business chain **1/1 PASS（3.57s）**；smoke后mzd Host job、Controller、远端/本地fixture全部清理。final `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **183 passed / 0 failed / 6 ignored**。
 
 V3e至此封板。下一块 V3f：wire/capability compatibility matrix。重点冻结`WIRE_MAJOR` hard incompatibility、`CAPABILITY_VERSION`与Feature位的独立语义、unknown feature forward-compat、FileResume feature 6不被版本号暗示，以及旧peer/新peer在不理解新feature时仍可安全使用V2/V3基础面；不在本块新增第二wire major或自动协议升级。
+
+### V3f — Wire/capability compatibility matrix
+
+**Status：DONE（2026-09-03）**
+
+- 将“认识proto枚举值”与“当前build真正实现”拆开：新增显式 `IMPLEMENTED_FEATURES = [ToolRpc, ShellTask]`。`Forward / Socks5 / HttpConnect / FileResume`即使是当前代码生成器认识的enum，也只是future/reserved vocabulary；V4/V5 runtime未闭合前 `locally_implements_feature(...)` 必须为false，防止以后因为enum已存在就误开功能；
+- V3d的feature查询helper更名为 `hello_advertises_feature` / `hello_advertises_file_resume`，只描述某个Hello是否**显式广告**位。新增 `feature_negotiated(local, peer, feature)`：先分别执行完整Hello wire validation，然后要求“当前build实现 + local显式广告 + peer显式广告”三者同时成立。`negotiated_implemented_features`只从当前实现白名单做交集，因此unknown feature与known-future feature都不会偷偷进入可用面；
+- `CAPABILITY_VERSION`继续只要求非零，不作为feature推断器。compatibility matrix明确验证capability_version **1 ↔ 999**仍可在同一`WIRE_MAJOR=1`下协商共同的ToolRpc/ShellTask；高版本peer附带unknown feature `999`会被wire roundtrip保真保存，但当前build忽略其语义。双方即使都广告`FileResume=6`，因为当前build没有V5 data plane，协商结果仍为false；
+- `WIRE_MAJOR`仍是硬兼容边界：任一Hello major不是当前`WIRE_MAJOR=1`，即使feature bits完全相同也在协商前返回`UnsupportedWireMajor`；本块不增加第二major、fallback major或自动协议升级；
+- 新增 `NegotiatedLimits`：双方Hello都先通过各自 hard bounds，之后`max_frame_size`与`max_concurrent_requests`只取两边更严格的**min**。peer宣告超过本地hard max时直接拒绝，不允许“新版本更大额度”反向扩大旧peer/当前build安全面；
+- 本块仍是proto compatibility contract，不把Hello强行接进现有InnerSession握手、不自动广告任何feature、不改变ALPN/Noise/Helper路径。它冻结的是V4/V5以后接入feature negotiation时必须遵守的语义，不伪装成已经存在第二套runtime negotiation；
+- proto focused **11/11 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **187 passed / 0 failed / 6 ignored**。
+
+**V3 Reliability 至此 DONE。** 七项计划全部闭合：connection/session generation与path/liveness、request idempotency/replay matrix、Shell TaskId reattach、File resume接口预留、path telemetry、sleep/resume continuity、wire/capability compatibility matrix。下一阶段进入V4 Dynamic Networking；第一块只做bounded TCP forward，不提前把SOCKS5/HTTP CONNECT一起塞进同一大块。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1145,13 +1159,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b + V3c + V3d + V3e DONE）**
+**Current block：V3 — Reliability（DONE；V3a–V3f 全部封板）**
 
-**Next block：V3f — wire/capability compatibility matrix**
+**Next block：V4a — bounded TCP forward**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3b闭合短RPC跨generation replay，V3c闭合same-Device Shell TaskId reattach，V3d冻结File resume纯控制面contract，V3e将长runtime pause显式变成session continuity中断并把Shell timeout/grace统一为wall-clock deadline。下一块冻结wire major/capability version/feature negotiation兼容矩阵，避免后续V4/V5把“版本号”和“已实现feature”混为一谈。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum，V3现在也完整封板：session generation/path/liveness、same-RequestId replay、same-Device Shell TaskId reattach、File resume控制契约、sleep/resume continuity与wire/capability matrix全部具备明确fail-closed边界。V3f进一步冻结“peer广告 / 本地实现 / 双方协商”三层feature语义，当前build只协商ToolRpc+ShellTask；V4/V5枚举占位不会提前变成可用能力。下一块进入V4a TCP forward。
 
 ### Change log
+
+- **2026-09-03** — V3f wire/capability compatibility matrix DONE / **V3 Reliability DONE**：feature语义拆成peer advertisement、current-build implementation、bilateral negotiation三层；`IMPLEMENTED_FEATURES`当前只含ToolRpc+ShellTask，Forward/Socks5/HttpConnect/FileResume即使双方Hello都广告也不协商。capability_version 1↔999不推断feature，unknown 999保真但忽略；wrong WIRE_MAJOR硬拒绝；frame/concurrency negotiated limit取双方valid bounds的min。proto **11/11**、workspace **187/0/6**。V3七项全部封板，下一阶段V4a bounded TCP forward。
 
 - **2026-09-03** — V3e sleep/resume continuity DONE：Controller新增15s wall-clock `SessionContinuity`，idle heartbeat/业务send/progress/reply都拒绝长pause后的旧InnerSession，heartbeat/progress missed tick改为Skip；Host Shell timeout与30s reconnect grace改为wall-clock deadline（250ms poll），clock regression fail closed。focused continuity **1/1**、wall deadline **1/1**、V3c reconnect **4/4**、V3b replay **1/1**，no-public Connector **1/1（3.57s）**。Windows真实runtime-pause gate在同一脚本中精确观测隔离Controller **generation 7 → suspend 20.039s → generation 8**；Host-pause诊断因时序归因不稳定未计正式PASS。workspace **183/0/6**。下一块 V3f compatibility matrix。
 
