@@ -10,6 +10,7 @@ mod nearby;
 mod outer;
 mod protocol;
 mod sealed_bootstrap;
+mod shell_task;
 
 pub use connector::{
     CONNECTOR_CONTROL_VERSION, ConnectorControlError, ConnectorOpenRequest, ConnectorReady,
@@ -55,4 +56,12 @@ pub use protocol::{
 pub use sealed_bootstrap::{
     MAX_SEALED_BOOTSTRAP_PLAINTEXT, SealedBootstrapContext, SealedBootstrapError,
     SealedBootstrapSession, noise_static_public,
+};
+pub use shell_task::{
+    HARD_MAX_SHELL_ATTACH_BYTES_PER_STREAM, HARD_MAX_SHELL_COMMAND_BYTES,
+    HARD_MAX_SHELL_ENV_ENTRIES, HARD_MAX_SHELL_ENV_KEY_BYTES, HARD_MAX_SHELL_ENV_TOTAL_BYTES,
+    HARD_MAX_SHELL_ENV_VALUE_BYTES, HARD_MAX_SHELL_RETAINED_BYTES_PER_STREAM,
+    HARD_MAX_SHELL_TASKS_PER_SESSION, HARD_MAX_SHELL_TIMEOUT_MS, ShellOutputChunk,
+    ShellTaskErrorBody, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase,
+    ShellTaskProtocolError, ShellTaskReply, ShellTaskRequest, ShellTaskStatus,
 };

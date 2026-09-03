@@ -851,6 +851,19 @@ V2 filesystem agent surface（Devices/selector + Read/PathInfo/Glob/Grep/Write/E
 
 下一块 V2d-1：实现 live-session Shell task core。Host 持有 process/task，Controller 持有 projection；`shell.start/status/attach/cancel` 都是短 InnerSession RPC，stdout/stderr 有 bounded retained buffer + cursor，timeout/cancel 必须终止 child。V2 不承诺 connection loss 后 reattach；该恢复语义仍在 V3。
 
+### V2d-1a — TaskId + bounded Shell wire contract
+
+**Status：DONE（2026-09-03）**
+
+- `TaskId` 提升为 `clew-core` stable UUID strong type，与 DeviceId/SiteId 同样拒绝 nil/错误长度；不使用进程 PID 或 Local API connection identity 充当长期 task identity；
+- 新增 `shell_task` InnerSession business RPC，冻结 `Start / Status / Attach / Cancel` 四个短请求与 `Started / Status / Output / CancelAccepted / Error` 回复；Host process lifetime 不绑定某一次 CLI/MCP Local API 请求；
+- Start hard bounds：command **8 KiB**，cwd 复用 signed root path **2 KiB** hard bound，env 最多 **32** 项、key **128 B**、value **2 KiB**、总 **16 KiB**，timeout **1..=30 min**；env key 只接受 `[A-Za-z_][A-Za-z0-9_]*`，NUL 全拒绝；
+- output contract：stdout/stderr 各自的 retained ring hard cap预留为 **32 KiB**；Attach 每路最多 **12 KiB raw bytes**，Base64 后两路同时仍明显低于 **60 KiB** InnerSession plaintext；cursor 使用绝对 byte offset，response 同时携带 requested/start/next/retained base+next，若请求 cursor 已被 ring 淘汰必须显式 `lost_prefix=true`，不能静默伪装连续输出；
+- phase 冻结为 `Running / Exited / TimedOut / Cancelled / Failed`，V2 只有 live-session task semantics；wire 里没有 reconnect generation/replay token/reattach proof，避免提前实现 V3；
+- focused validation：Shell protocol roundtrip/bounds/Base64/cursor **1/1 PASS**；`cargo check --all-targets` PASS，0 warnings；显式 `cargo test --workspace --all-targets` **155 passed / 0 failed / 6 ignored**。
+
+下一块 V2d-1b：Host-owned task/process store。必须 `env_clear` 后只投影最小 host baseline + bounded explicit env；初始 cwd 必须 canonicalize 到 signed roots；stdout/stderr reader 必须持续 drain 且 ring bounded；timeout/cancel 必须终止 child；live InnerSession drop 必须触发全部 task cancel，V3 才允许跨 session reattach。
+
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
 - MCP stdio + Streamable HTTP；
@@ -965,13 +978,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem surface + V2d-0 Shell authority DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem + Shell authority + V2d-1a wire DONE）**
 
-**Next block：V2d-1 — bounded live-session Shell task core**
+**Next block：V2d-1b — Host-owned live-session Shell task/process store**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 filesystem agent surface 已完整闭合；Shell 的 signed authority 也已补齐并保持 default-deny。下一步只实现 live-session task core：Host process/task + Controller projection + bounded stdout/stderr cursor + timeout/cancel；MCP/CLI 都只能是 adapter。connection loss 后 reattach/replay 仍严格留在 V3，不能在 V2 偷偷引入 generic recovery。
+V1.5 已在 `3a20cd2` 正式封板。V2 filesystem surface 和 Shell signed authority 已闭合；Shell wire 现在也有稳定 TaskId、严格 request/output bounds 与 cursor contract。下一步实现 Host task/process store，并把生命周期严格绑定当前 Target↔Controller live InnerSession；Controller projection/CLI/MCP 仍在后续子块，connection-loss reattach/replay 仍属于 V3。
 
 ### Change log
+
+- **2026-09-03** — V2d-1a bounded Shell wire DONE：新增 stable `TaskId` 与 `shell_task Start/Status/Attach/Cancel` 短 RPC；command/cwd/env/timeout 全 hard-bound，stdout/stderr 设计为 32KiB ring + 12KiB/stream Base64 page，绝对 cursor + `lost_prefix` 明示丢前缀；phase 不包含任何 V3 reconnect/replay 语义。protocol **1/1 PASS**，workspace **155/0/6**。下一块 V2d-1b Host process/task store。
 
 - **2026-09-03** — V2d-0 signed Shell authority DONE + Windows Mint parser blocker fixed：execute-preferred ceiling 扩为 read/write/shell/connector，但仍与 signed grant 相交；`allow_shell` serde-default false，CLI 仅显式 `--allow-shell` opt-in，GUI 继续 false。真实 signed kit 对照确认默认 `shell=false`、opt-in `shell=true` 且 write 独立。该 smoke 暴露 `Command::Mint` 巨大 variant 在 Windows Clap derive 下 stack overflow，拆为独立 `MintArgs` 后 `mint --help`/真实 mint 恢复 PASS。workspace **154/0/6**。下一块 V2d-1 live-session Shell task core。
 
