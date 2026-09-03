@@ -895,6 +895,21 @@ V2 filesystem agent surface（Devices/selector + Read/PathInfo/Glob/Grep/Write/E
 
 V2d Shell minimum 至此 DONE：这是**live-session persistent task**，不是 reconnect-persistent task。connection loss 后 task reattach/replay 仍严格属于 V3。下一块 V2e：MCP stdio + Streamable HTTP，只做 Controller Local API adapter，不在 MCP 内复制选机/权限/文件/Shell状态。
 
+### V2e-1 — MCP stdio Local API adapter
+
+**Status：DONE（2026-09-03）**
+
+- 采用官方 Rust MCP SDK `rmcp 3.2.0`，只启用 server/macros/stdio/schema 所需 features；不手写 JSON-RPC/MCP framing，也不把 MCP 变成第二个 Controller runtime；
+- 新增 `clew mcp stdio --state-dir ...`。MCP server 只持有 `LocalApiClient`，没有 Controller state store、Host/iroh/InnerSession import；设备选择直接调用 `clew-core::select_executable_device`，所以 DeviceId / `Site/Device` / unique short name / single-device auto-select 与 helper-only 排除语义完全复用 CLI/core，而不是复制一套 selector；
+- stdio暴露 11 个 typed tools：`devices/read/path_info/glob/grep/write/edit/shell_start/shell_status/shell_attach/shell_cancel`。typed `JsonSchema` 输入继续把所有实际 bounds交给既有 Local API/transport验证；Read以 Base64 structuredContent保真返回 binary bytes；其他结果直接复用既有 bounded Local API结构；tool error text额外截到 2KiB且 UTF-8 safe；
+- Write MCP contract要求显式 `mode=create_only|match_sha256`；match模式必须带 expected SHA-256，create-only禁止混带 hash。Shell Start才接受 shared device selector；Shell Status/Attach/Cancel只接受 TaskId，继续复用 Controller live projection，不给 MCP重新指定 Device的机会；
+- MCP启动前先通过 Local API探测 Controller；若不存在，只 spawn同一个 `clew controller --state-dir ...` single-owner进程并等待最多8秒 ready。MCP stdio退出不关闭 Controller；真实 auto-start smoke确认空 state initialize成功、devices可调用、MCP退出后 Controller仍存活并可单独 authenticated shutdown；
+- raw MCP wire smoke（protocol `2025-06-18`）完成 initialize → initialized → tools/list → tools/call；11个工具均有 object inputSchema，`devices`返回 structuredContent，no-device Read通过 shared selector返回 expected tool error；
+- 真实 Windows Host product smoke：默认 read Site Kit下 MCP `read`真实返回19-byte `CLEW-MCP-STDIO-READ`；另一个 `--allow-write --allow-shell` Site Kit通过 MCP wire连续 `PathInfo → Glob → Grep → Write(create-only) → Edit(expected SHA) → Read verify → Shell Start → Status → Attach` 全 PASS；所有 smoke state/process均清理；
+- focused MCP unit **2/2 PASS**（exact V2 tool surface + UTF-8-safe bounded error）；final `cargo fmt -- --check` PASS，`cargo check --workspace --all-targets` PASS / 0 warnings，`cargo test --workspace --all-targets` **163 passed / 0 failed / 6 ignored**。
+
+下一块 V2e-2：Streamable HTTP。继续复用同一个 `ClewMcpServer`/LocalApiClient tool router，只新增 localhost HTTP transport；HTTP listener不得绑定非-loopback默认地址，也不把 MCP session语义拿来实现 V3 Shell reconnect/reattach。
+
 - Glob / Grep / Read / Edit / Write；
 - Shell persistent task；
 - MCP stdio + Streamable HTTP；
@@ -1009,13 +1024,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V2 — Agent Minimum（IN PROGRESS；filesystem + live-session Shell Local API/CLI DONE）**
+**Current block：V2 — Agent Minimum（IN PROGRESS；MCP stdio DONE）**
 
-**Next block：V2e — MCP stdio + Streamable HTTP minimum**
+**Next block：V2e-2 — MCP Streamable HTTP minimum**
 
-V1.5 已在 `3a20cd2` 正式封板。V2 filesystem 与 live-session Shell 从 signed authority → InnerSession → Host → Controller projection → Local API/CLI 已闭合。下一块 MCP 只能作为 Controller Local API adapter，复用 shared selector 与所有既有 bounds/authority；connection-loss Shell reattach/replay仍属于 V3。
+V1.5 已在 `3a20cd2` 正式封板。V2 filesystem/live-session Shell与 MCP stdio Local API adapter均已闭合。下一块只增加 localhost Streamable HTTP transport，并复用完全相同的 MCP tool router；connection-loss Shell reattach/replay仍属于 V3。
 
 ### Change log
+
+- **2026-09-03** — V2e-1 MCP stdio DONE：接入官方 `rmcp 3.2.0`，`clew mcp stdio`只持有 LocalApiClient/shared selector，11个 typed tools覆盖 Devices + filesystem + live Shell；MCP可在 Controller缺席时拉起同一个 single-owner Controller且自身退出不拆 Controller。raw initialize/tools/list/devices smoke、real Host MCP Read、write+shell full surface sweep均 PASS；workspace **163/0/6**。下一块 V2e-2 Streamable HTTP。
 
 - **2026-09-03** — V2d-1c Controller live Shell projection + Local API/CLI DONE：TaskId绑定 DeviceId+live session token，follow-up无 Device参数；global projection hard cap 8192。independent review修复 Start caller timeout/drop导致 orphan task的风险：RemoteHub internal completion继续接收 Started，caller已消失时自动 Cancel并清 projection，RAII reservation确保无 slot leak。projection/cancellation **2/2 PASS**，CLI **1/1 PASS**；Windows shell-capable product Start→Status→Attach + Activity plaintext-negative PASS，default Site Kit Controller-side Denied PASS；workspace **161/0/6**。V2d DONE，下一块 V2e MCP。
 

@@ -5,6 +5,7 @@ mod gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod host_gui;
 mod invite_io;
+mod mcp;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
@@ -189,6 +190,11 @@ enum Command {
         #[command(subcommand)]
         command: ShellCommand,
     },
+    /// Serve Clew's agent tools over Model Context Protocol.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Rename an enrolled device in the Controller catalog.
     Rename {
         device_id: DeviceId,
@@ -252,6 +258,15 @@ enum Command {
     },
     /// List devices known to the running Controller.
     Devices {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Serve MCP over stdin/stdout. The Controller remains the only state owner.
+    Stdio {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -649,6 +664,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Shell { command } => run_shell_command(command).await?,
+        Command::Mcp { command } => match command {
+            McpCommand::Stdio { state_dir } => {
+                mcp::serve_stdio(controller_config(state_dir)?).await?;
+            }
+        },
         Command::Rename {
             device_id,
             display_name,
