@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod forward;
 mod instance;
 mod membership;
 mod naming;
@@ -13,6 +14,7 @@ mod site;
 mod ui;
 
 pub use clew_core::{DeviceSelectionError, select_executable_device};
+pub use forward::HostTcpForwardService;
 pub use instance::{HostInstance, HostInstanceKey, HostInstanceStart, acquire_host_instance};
 pub use membership::{
     HostMembership, HostMembershipError, HostMembershipMarker, HostMembershipStore,

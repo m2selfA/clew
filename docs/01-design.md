@@ -694,7 +694,11 @@ side = local
 
 默认只允许 controller 本机 listener 绑 loopback；非 loopback 必须显式配置并通过 policy。
 
-每条 accepted TCP connection -> 一条 Clew TCP_FORWARD stream -> host `TcpStream::connect(dest)`。
+当前 V4a 实现冻结为：Controller 只绑定 loopback listener，listener 本身由 Controller runtime 持有，CLI `forward add` 返回后继续存在；Target outbound TCP 只有 signed `effective_grant.tcp_egress=true` 才允许，legacy/default/helper-only 全部 fail closed。
+
+每条 accepted local TCP connection 分配独立 `ForwardConnectionId`，并固定到当时的 Target **session generation**。数据面不绕过业务 E2E 边界：Controller 与 Target 在原 Target↔Controller `InnerSession` 内交换 bounded `tcp_forward { Open / Exchange / Close }` RPC；单次读写 chunk ≤12 KiB，Host active session 最多 64 条 outbound TCP connection，Controller 最多 64 个 listener/每 listener 64 条 accepted connection。Helper 若在路径中仍只看到 InnerSession ciphertext。
+
+已建立 TCP connection **不做 generation migration**：Target session 丢失/切 generation 后旧 local connection 关闭，不把 Exchange/Close 重放到新 generation；Controller listener 继续存在，新 local connection 可在新 generation 重新 `Open`。这与 §7.4 已冻结的“已建立 TCP stream 断线关闭、新连接恢复”语义一致，不能宣传成透明迁移。
 
 ## 12. SOCKS5 / HTTP Proxy
 

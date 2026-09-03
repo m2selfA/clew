@@ -14,8 +14,8 @@ use clew_transport::{
     HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
     ReadReply, ReadRequest, SHELL_RECONNECT_GRACE_MS, SealedBootstrapContext, SealedBootstrapError,
     SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest,
-    SignedConnectorLease, SiteDiscoveryTag, is_rpc_progress, read_bootstrap, read_connector_open,
-    unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
+    SignedConnectorLease, SiteDiscoveryTag, TcpForwardReply, TcpForwardRequest, is_rpc_progress,
+    read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -178,6 +178,11 @@ enum RemoteCommand {
         request_id: RequestId,
         request: FsMutationRequest,
         reply: oneshot::Sender<Result<FsMutationReply, RemoteHubError>>,
+    },
+    TcpForward {
+        request_id: RequestId,
+        request: TcpForwardRequest,
+        reply: oneshot::Sender<Result<TcpForwardReply, RemoteHubError>>,
     },
     ShellTask {
         request_id: RequestId,
@@ -374,6 +379,85 @@ impl RemoteHub {
         }
     }
 
+    pub async fn tcp_forward_open(
+        &self,
+        device_id: DeviceId,
+        request: TcpForwardRequest,
+    ) -> Result<(u64, TcpForwardReply), RemoteHubError> {
+        if !matches!(request, TcpForwardRequest::Open { .. }) {
+            return Err(RemoteHubError::InvalidTcpForwardRequestShape);
+        }
+        request.validate()?;
+        let (generation, tx) = self.current_session(device_id)?;
+        let reply = send_tcp_forward_command(&tx, device_id, request.clone()).await?;
+        validate_tcp_forward_reply_correlation(&request, &reply)?;
+        self.ensure_generation(device_id, generation)?;
+        Ok((generation, reply))
+    }
+
+    pub async fn tcp_forward_on_generation(
+        &self,
+        device_id: DeviceId,
+        generation: u64,
+        request: TcpForwardRequest,
+    ) -> Result<TcpForwardReply, RemoteHubError> {
+        if matches!(request, TcpForwardRequest::Open { .. }) {
+            return Err(RemoteHubError::InvalidTcpForwardRequestShape);
+        }
+        request.validate()?;
+        let tx = self.session_sender_for_generation(device_id, generation)?;
+        let reply = send_tcp_forward_command(&tx, device_id, request.clone()).await?;
+        validate_tcp_forward_reply_correlation(&request, &reply)?;
+        self.ensure_generation(device_id, generation)?;
+        Ok(reply)
+    }
+
+    fn current_session(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<(u64, mpsc::Sender<RemoteCommand>), RemoteHubError> {
+        self.inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?
+            .sessions
+            .get(&device_id)
+            .map(|slot| (slot.generation, slot.tx.clone()))
+            .ok_or(RemoteHubError::Offline(device_id))
+    }
+
+    fn session_sender_for_generation(
+        &self,
+        device_id: DeviceId,
+        generation: u64,
+    ) -> Result<mpsc::Sender<RemoteCommand>, RemoteHubError> {
+        self.inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?
+            .sessions
+            .get(&device_id)
+            .filter(|slot| slot.generation == generation)
+            .map(|slot| slot.tx.clone())
+            .ok_or(RemoteHubError::TcpForwardSessionChanged(device_id))
+    }
+
+    fn ensure_generation(
+        &self,
+        device_id: DeviceId,
+        generation: u64,
+    ) -> Result<(), RemoteHubError> {
+        if self
+            .inner
+            .lock()
+            .map_err(|_| RemoteHubError::StatePoisoned)?
+            .sessions
+            .get(&device_id)
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            Ok(())
+        } else {
+            Err(RemoteHubError::TcpForwardSessionChanged(device_id))
+        }
+    }
     pub async fn shell_start(
         &self,
         device_id: DeviceId,
@@ -766,6 +850,58 @@ fn prune_expired_shell_projections(state: &mut RemoteHubState, now_unix_ms: u64)
     });
 }
 
+async fn send_tcp_forward_command(
+    tx: &mpsc::Sender<RemoteCommand>,
+    device_id: DeviceId,
+    request: TcpForwardRequest,
+) -> Result<TcpForwardReply, RemoteHubError> {
+    let request_id = RequestId::new();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(RemoteCommand::TcpForward {
+        request_id,
+        request,
+        reply: reply_tx,
+    })
+    .await
+    .map_err(|_| RemoteHubError::Offline(device_id))?;
+    reply_rx
+        .await
+        .map_err(|_| RemoteHubError::Offline(device_id))?
+}
+
+fn validate_tcp_forward_reply_correlation(
+    request: &TcpForwardRequest,
+    reply: &TcpForwardReply,
+) -> Result<(), RemoteHubError> {
+    let matches = match (request, reply) {
+        (
+            TcpForwardRequest::Open { connection_id, .. },
+            TcpForwardReply::Opened {
+                connection_id: actual,
+            },
+        ) => actual == connection_id,
+        (
+            TcpForwardRequest::Exchange { connection_id, .. },
+            TcpForwardReply::Exchanged {
+                connection_id: actual,
+                ..
+            },
+        ) => actual == connection_id,
+        (
+            TcpForwardRequest::Close { connection_id },
+            TcpForwardReply::Closed {
+                connection_id: actual,
+            },
+        ) => actual == connection_id,
+        (_, TcpForwardReply::Error(_)) => true,
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(RemoteHubError::TcpForwardReplyMismatch)
+    }
+}
 async fn send_shell_task_command(
     tx: &mpsc::Sender<RemoteCommand>,
     device_id: DeviceId,
@@ -1426,6 +1562,39 @@ async fn handle_member(
                     break;
                 }
             }
+            RemoteCommand::TcpForward {
+                request_id,
+                request,
+                reply,
+            } => {
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
+                        Ok(TcpForwardReply::from_message(&message)?)
+                    } => result,
+                };
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
             RemoteCommand::ShellTask {
                 request_id,
                 request,
@@ -1581,6 +1750,12 @@ pub enum RemoteHubError {
     SessionContinuityLost,
     #[error("remote RPC {0} stopped making progress")]
     RpcLivenessTimeout(RequestId),
+    #[error("TCP forward connection is bound to an older or unavailable session for device {0}")]
+    TcpForwardSessionChanged(DeviceId),
+    #[error("TCP forward RPC used the wrong Open/Exchange/Close shape")]
+    InvalidTcpForwardRequestShape,
+    #[error("TCP forward Host returned the wrong connection id or result kind")]
+    TcpForwardReplyMismatch,
     #[error("Controller live Shell task projection capacity is exhausted")]
     ShellProjectionCapacity,
     #[error("Shell follow-up referenced unknown or stale task {0}")]
@@ -1601,6 +1776,8 @@ pub enum RemoteHubError {
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    TcpForward(#[from] clew_transport::TcpForwardProtocolError),
     #[error(transparent)]
     ShellTask(#[from] clew_transport::ShellTaskProtocolError),
     #[error(transparent)]
@@ -2175,6 +2352,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tcp_forward_connection_is_generation_bound_and_never_replayed() {
+        let hub = RemoteHub::default();
+        let device_id = DeviceId::new();
+        let forward_id = clew_core::ForwardId::new();
+        let connection_id = clew_core::ForwardConnectionId::new();
+        let (generation_one, mut commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_000,
+            )
+            .unwrap();
+
+        let open_hub = hub.clone();
+        let open = tokio::spawn(async move {
+            open_hub
+                .tcp_forward_open(
+                    device_id,
+                    TcpForwardRequest::open(
+                        forward_id,
+                        connection_id,
+                        clew_transport::TcpForwardDestination::new("127.0.0.1", 8080).unwrap(),
+                        1_000,
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        let RemoteCommand::TcpForward { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected TCP forward Open on first generation");
+        };
+        assert!(matches!(
+            request,
+            TcpForwardRequest::Open { connection_id: actual, .. } if actual == connection_id
+        ));
+        reply
+            .send(Ok(TcpForwardReply::Opened { connection_id }))
+            .unwrap();
+        let (opened_generation, opened_reply) = open.await.unwrap().unwrap();
+        assert_eq!(opened_generation, generation_one);
+        assert_eq!(opened_reply, TcpForwardReply::Opened { connection_id });
+
+        let exchange_hub = hub.clone();
+        let exchange = tokio::spawn(async move {
+            exchange_hub
+                .tcp_forward_on_generation(
+                    device_id,
+                    generation_one,
+                    TcpForwardRequest::exchange(connection_id, b"ping", false, 4, 50).unwrap(),
+                )
+                .await
+        });
+        let RemoteCommand::TcpForward { reply, .. } = commands_one.recv().await.unwrap() else {
+            panic!("expected TCP forward Exchange on original generation");
+        };
+        reply
+            .send(Ok(TcpForwardReply::exchanged(
+                connection_id,
+                b"pong",
+                false,
+            )
+            .unwrap()))
+            .unwrap();
+        let exchanged = exchange.await.unwrap().unwrap();
+        assert_eq!(exchanged.read_bytes().unwrap(), b"pong");
+
+        hub.unregister(device_id, generation_one, Some(1_100));
+        let (_generation_two, mut commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                1_200,
+            )
+            .unwrap();
+        assert!(matches!(
+            hub.tcp_forward_on_generation(
+                device_id,
+                generation_one,
+                TcpForwardRequest::Close { connection_id },
+            )
+            .await,
+            Err(RemoteHubError::TcpForwardSessionChanged(actual)) if actual == device_id
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commands_two.recv())
+                .await
+                .is_err(),
+            "established TCP forward must not replay Close/Exchange onto a new generation"
+        );
+    }
     #[tokio::test]
     async fn shell_projection_reattaches_to_same_device_after_status_proof() {
         let hub = RemoteHub::default();

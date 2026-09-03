@@ -59,7 +59,7 @@
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
 | V2 | Agent minimum | DONE | selector + bounded filesystem + live-session Shell + MCP stdio/Streamable HTTP 全闭合 |
 | V3 | Reliability | IN PROGRESS | V3a session generation/path telemetry/liveness DONE；继续 replay matrix + Shell reattach + compatibility |
-| V4 | Dynamic networking | IN PROGRESS | V4a-0 signed TCP egress authority DONE；继续 bounded TCP forward |
+| V4 | Dynamic networking | IN PROGRESS | V4a signed TCP egress + Controller-owned TCP forward DONE；继续 SOCKS5/HTTP CONNECT |
 | V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
 | V6 | Release packaging | TODO | Windows signing、macOS signing/notarization、Linux artifact、ClientFlavor pipeline |
 | V7 | Advanced Service Runtime | TODO | systemd --user → Windows Service/Linux system service，显式 opt-in |
@@ -1070,7 +1070,7 @@ V3e至此封板。下一块 V3f：wire/capability compatibility matrix。重点�
 
 ## 11. V4 — Dynamic Networking
 
-**Status：IN PROGRESS（V4a-0 DONE）**
+**Status：IN PROGRESS（V4a-0/1 DONE；TCP forward DONE）**
 
 ### V4a-0 — Signed TCP egress authority projection
 
@@ -1083,7 +1083,21 @@ V3e至此封板。下一块 V3f：wire/capability compatibility matrix。重点�
 - 真实 isolated Controller mint smoke：默认 `site.clew` 为 `execute=true/connector=true/read=true/write=false/shell=false/tcp_egress=false`；仅加 `--allow-tcp-egress` 后精确变为 `tcp_egress=true`，write/shell保持 false；
 - focused grant **3/3 PASS**（helper-only降权、ceiling不提权、legacy缺字段false）；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS；`cargo test --workspace --all-targets` **188 passed / 0 failed / 6 ignored**。
 
-下一块 V4a-1：冻结 bounded TCP forward control/data contract 与 Controller-owned loopback listener lifecycle。默认只做 local side `127.0.0.1:L → Target dest`；非-loopback listener、SOCKS5/HTTP CONNECT、remote-side listener分别后置，不能从一个 forward primitive顺手放大暴露面。
+### V4a-1 — Controller-owned bounded local TCP forward
+
+**Status：DONE（2026-09-03）**
+
+- 新增 stable `ForwardId` / `ForwardConnectionId` 与 bounded `tcp_forward { Open / Exchange / Close }` business RPC。TCP payload **不**绕过业务安全边界：Controller↔Target 继续使用既有 authenticated InnerSession；Helper/Connector 若在路径中仍只看 ciphertext；
+- 当前只实现 local side：Controller `TcpForwardManager` 仅绑定 `127.0.0.1:<port>`，`listen_port=0` 可由 OS 分配。listener hard cap **64**；每 listener accepted connection hard cap **64**；Host active session outbound connection hard cap **64**；单次 Exchange raw chunk ≤ **12 KiB**、destination host ≤255 ASCII bytes、connect timeout ≤10s、单次 remote read wait ≤250ms；
+- Host `Open` 先拿 **pre-connect semaphore permit** 再 `TcpStream::connect`，permit 与 connection entry 同寿命；focused 65th-open regression确认 destination listener只接受64条连接，Capacity在创建第65个 outbound socket前返回；
+- Controller listener lifecycle真正归 Controller：`clew forward add` 只是 authenticated Local API client，CLI exit后 listener继续存在；`forward list/remove` 操作同一个 Controller-owned manager。Add前 Controller再次检查 device/site active + EXECUTE + enrollment `effective_grant.tcp_egress=true`；默认/legacy/helper-only fail closed；
+- 每条 accepted local TCP connection在 Open时固定当前 Target **session generation**。Exchange/Close只允许同 generation，generation变化时旧 connection直接关闭，**不**把已建立 TCP流 replay/migrate 到新 session；Controller listener本身保留，新 local connection可在新 generation重新 Open。该行为与V3冻结的TCP non-migration语义一致；
+- `Feature::Forward` 从V3f“known future”提升进当前 `IMPLEMENTED_FEATURES`；Socks5/HttpConnect/FileResume仍不协商，capability_version仍不能替代显式 feature bit；
+- 最终 Windows exact binary SHA-256 `fec92a99e7f97778c5449d311d2445c8a0812d0a1b8326c3c54783559e78f5ca`，cap00 Controller + Gamma Target real product gate：`forward add`返回后CLI已退出，独立local client经Controller listener→InnerSession→Gamma Host→Gamma `127.0.0.1` echo精确返回`CLEW-V4A1-FINAL-PROOF`；默认未签tcp_egress的第二Site对`forward add`精确Controller-side `Denied`且没有新增listener；`forward remove`后端口不再accept；
+- reconnect/non-migration exact gate：positive Target初始generation=1，保持local TCP连接后停止Host，旧连接精确EOF；Controller上的同ForwardId/listen `127.0.0.1:62167`仍存在；同DeviceId Host恢复后全局generation=3，新local connection通过同一listener精确返回`V4A1-FINAL-AFTER-RECONNECT`。首次复测中新连接失败最终定位为测试echo server被旧连接reset异常杀死，改成per-client异常隔离fixture后同产品路径立即PASS，不计产品故障；
+- focused：transport wire **1/1 PASS**；Host real TcpStream/grant **1/1 PASS**；Host pre-connect capacity **1/1 PASS**；Controller manager ownership **1/1 PASS**；generation non-replay **1/1 PASS**；Forward feature matrix **1/1 PASS**。`cargo check --all-targets` 0 warnings；`cargo test --workspace --all-targets` **193 passed / 0 failed / 6 ignored**；所有 cap00/Gamma smoke jobs/state均已清理。
+
+V4a TCP forward至此封板。下一块 V4b：SOCKS5 TCP egress，必须复用同一 Controller-owned loopback listener + signed `tcp_egress` + generation non-migration primitive；只实现 CONNECT，SOCKS5 UDP ASSOCIATE不做，不能复制一套第二TCP数据面。
 
 - TCP forward；
 - SOCKS5 TCP egress；
@@ -1172,13 +1186,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V4 — Dynamic Networking（IN PROGRESS；V4a-0 DONE）**
+**Current block：V4 — Dynamic Networking（IN PROGRESS；V4a TCP forward DONE）**
 
-**Next block：V4a-1 — bounded TCP forward control/data + Controller-owned loopback listener**
+**Next block：V4b — SOCKS5 TCP egress**
 
-V3 已在 `524ba88` 完整封板。V4a-0 先把 TCP egress 变成真正的 signed owner opt-in：legacy/default false、GUI默认false、helper-only剥离、Controller/Host recovery都沿 authoritative effective grant。下一块开始 TCP forward 本身，只允许 Controller-owned loopback listener 到授权 Target 的 outbound TCP destination；不提前混入 SOCKS5/HTTP CONNECT、remote listener 或 V5 file stream。
+V3 已在 `524ba88` 完整封板。V4a 现在也闭合：signed `tcp_egress` owner opt-in、Controller-owned loopback listener、bounded InnerSession TCP chunks、Host pre-connect admission、Local API/CLI add/list/remove、真实双机数据面和 generation non-migration 全有证据。下一块只在该 primitive 上加 SOCKS5 TCP CONNECT adapter；HTTP CONNECT随后，remote/non-loopback listener继续后置。
 
 ### Change log
+
+- **2026-09-03** — V4a-1 Controller-owned bounded TCP forward DONE / V4a closed：新增ForwardId/ConnectionId与InnerSession `tcp_forward` Open/Exchange/Close，12KiB chunks、Host/Controller 64上限；Host改为pre-connect semaphore admission。Controller只绑loopback且持有listener，CLI exit不拆台；每条连接固定session generation，断线旧TCP EOF、不迁移，新connection在新generation重新Open。exact Windows binary `fec92a99...8f5ca` cap00→Gamma真实echo、default Denied、remove port-close、generation 1→3 reconnect全PASS；workspace **193/0/6**。Forward feature现可协商，Socks5/HttpConnect仍false；下一块V4b SOCKS5 TCP。
 
 - **2026-09-03** — V4a-0 signed TCP egress authority DONE：PermissionGrant新增serde-default `tcp_egress=false`与full execute ceiling，owner CLI仅显式 `--allow-tcp-egress`可签出，GUI/legacy/default均false，helper-only继续剥离。真实mint对照确认默认false、opt-in true且write/shell不被顺带打开；grant **3/3**，workspace **188/0/6**。下一块 V4a-1 bounded TCP forward。
 

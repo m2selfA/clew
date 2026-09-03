@@ -169,6 +169,7 @@ pub async fn start_controller(
     let remote = IrohOuter::bind_with_secret(controller_identity.iroh_endpoint_secret()).await?;
     let remote_endpoint_id = remote.addr().id.to_string();
     let remote_hub = RemoteHub::default();
+    let forwards = crate::TcpForwardManager::new(remote_hub.clone());
 
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
@@ -196,6 +197,7 @@ pub async fn start_controller(
         outfits,
         outfit_assets,
         remote: remote_hub,
+        forwards,
         shutdown_tx,
     });
 

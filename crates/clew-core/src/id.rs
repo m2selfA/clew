@@ -108,6 +108,8 @@ define_stable_id!(InviteId);
 define_stable_id!(TaskId);
 define_stable_id!(TransferId);
 define_stable_id!(RequestId);
+define_stable_id!(ForwardId);
+define_stable_id!(ForwardConnectionId);
 
 #[cfg(test)]
 mod tests {

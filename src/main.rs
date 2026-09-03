@@ -10,7 +10,7 @@ mod mcp;
 mod studio;
 
 use clap::{Args, Parser, Subcommand};
-use clew_core::{DeviceId, InviteId, TaskId, select_executable_device};
+use clew_core::{DeviceId, ForwardId, InviteId, TaskId, select_executable_device};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
     acquire_host_instance, resolve_host_launch_with_mode,
@@ -19,7 +19,7 @@ use clew_host::{
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
-    BackupExportRequest, ControllerConfig, ControllerStart, FsWritePrecondition,
+    BackupExportRequest, ControllerConfig, ControllerStart, ForwardAddRequest, FsWritePrecondition,
     InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitCloneRequest,
     OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteEditRequest,
     RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
@@ -193,6 +193,11 @@ enum Command {
         #[command(subcommand)]
         command: ShellCommand,
     },
+    /// Manage Controller-owned local TCP forwards to an enrolled Target.
+    Forward {
+        #[command(subcommand)]
+        command: ForwardCommand,
+    },
     /// Serve Clew's agent tools over Model Context Protocol.
     Mcp {
         #[command(subcommand)]
@@ -289,6 +294,31 @@ enum McpCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ForwardCommand {
+    /// Add a persistent Controller-owned loopback TCP listener. Optional device uses shared selector semantics.
+    Add {
+        #[arg(value_name = "DEVICE")]
+        device: Option<String>,
+        #[arg(long, value_name = "HOST:PORT")]
+        dest: String,
+        #[arg(long, default_value_t = 0)]
+        listen_port: u16,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// List Controller-owned local TCP forwards.
+    List {
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Remove one Controller-owned local TCP forward.
+    Remove {
+        forward_id: ForwardId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
 #[derive(Debug, Subcommand)]
 enum ShellCommand {
     /// Start one Shell task. The optional first operand is a shared device selector.
@@ -683,6 +713,43 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Shell { command } => run_shell_command(command).await?,
+        Command::Forward { command } => match command {
+            ForwardCommand::Add {
+                device,
+                dest,
+                listen_port,
+                state_dir,
+            } => {
+                let (dest_host, dest_port) = parse_host_port(&dest)?;
+                let client = LocalApiClient::new(controller_config(state_dir)?);
+                let devices = client.device_list().await?;
+                let device_id = select_executable_device(&devices.devices, device.as_deref())?;
+                let info = client
+                    .forward_add(ForwardAddRequest {
+                        device_id,
+                        listen_port,
+                        dest_host,
+                        dest_port,
+                    })
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            }
+            ForwardCommand::List { state_dir } => {
+                let result = LocalApiClient::new(controller_config(state_dir)?)
+                    .forward_list()
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            ForwardCommand::Remove {
+                forward_id,
+                state_dir,
+            } => {
+                let info = LocalApiClient::new(controller_config(state_dir)?)
+                    .forward_remove(forward_id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            }
+        },
         Command::Mcp { command } => match command {
             McpCommand::Stdio { state_dir } => {
                 mcp::serve_stdio(controller_config(state_dir)?).await?;
@@ -1229,6 +1296,26 @@ fn print_host_state(state: &HostLaunchState) {
     }
 }
 
+fn parse_host_port(value: &str) -> Result<(String, u16), Box<dyn std::error::Error>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("TCP destination cannot be empty".into());
+    }
+    if let Ok(socket) = value.parse::<SocketAddr>() {
+        return Ok((socket.ip().to_string(), socket.port()));
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err("TCP destination must be HOST:PORT (IPv6 literals require [addr]:port)".into());
+    };
+    if host.is_empty() || host.contains(':') {
+        return Err("TCP destination must be HOST:PORT (IPv6 literals require [addr]:port)".into());
+    }
+    let port: u16 = port.parse()?;
+    if port == 0 {
+        return Err("TCP destination port must be nonzero".into());
+    }
+    Ok((host.to_owned(), port))
+}
 fn backup_passphrase(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     if name.is_empty() {
         return Err("backup passphrase environment variable name cannot be empty".into());

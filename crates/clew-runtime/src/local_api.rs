@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use clew_core::{
     ActivityEvent, ActivityResult, ControllerId, ControllerSiteRecord, DeviceId, DeviceRecord,
-    DeviceSummary, InviteId, ReadPolicy, SiteId, StateLayout, TaskId,
+    DeviceSummary, ForwardId, InviteId, ReadPolicy, SiteId, StateLayout, TaskId,
 };
 use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
@@ -20,7 +20,7 @@ use clew_transport::{
     FsMutationRequest, FsMutationResult, FsPathInfo, FsQueryErrorBody, FsQueryErrorCode,
     FsQueryReply, FsQueryRequest, FsWritePrecondition, IrohOuter, ReadErrorCode, ReadReply,
     ReadRequest, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase, ShellTaskReply,
-    ShellTaskRequest, ShellTaskStatus, noise_static_public,
+    ShellTaskRequest, ShellTaskStatus, TcpForwardDestination, noise_static_public,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -31,9 +31,9 @@ use tokio::{
 };
 
 use crate::{
-    ControllerConfig, ControllerControlStore, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore,
-    OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub, RemoteSessionInfo,
-    RemoteSessionState, export_controller_backup, transport,
+    ControllerConfig, ControllerControlStore, ForwardInfo, LocalEndpoint, OutfitAssetInfo,
+    OutfitAssetStore, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub,
+    RemoteSessionInfo, RemoteSessionState, TcpForwardManager, export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -172,6 +172,19 @@ pub struct RemoteShellAttachRequest {
     pub max_bytes_per_stream: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForwardAddRequest {
+    pub device_id: DeviceId,
+    #[serde(default)]
+    pub listen_port: u16,
+    pub dest_host: String,
+    pub dest_port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForwardList {
+    pub forwards: Vec<ForwardInfo>,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteSessionPathInfo {
     pub device_id: DeviceId,
@@ -367,6 +380,7 @@ pub(crate) struct LocalApiState {
     pub outfits: Arc<Mutex<OutfitLibrary>>,
     pub outfit_assets: Arc<Mutex<OutfitAssetStore>>,
     pub remote: RemoteHub,
+    pub forwards: TcpForwardManager,
     pub shutdown_tx: watch::Sender<bool>,
 }
 
@@ -409,6 +423,11 @@ enum LocalMethod {
     ShellAttach(RemoteShellAttachRequest),
     ShellCancel {
         task_id: TaskId,
+    },
+    ForwardAdd(ForwardAddRequest),
+    ForwardList,
+    ForwardRemove {
+        forward_id: ForwardId,
     },
     ActivityList {
         limit: u32,
@@ -458,6 +477,8 @@ enum LocalResponse {
     FsMutationResult(FsMutationResult),
     FsMutationError(FsMutationErrorBody),
     ShellTask(ShellTaskReply),
+    ForwardInfo(ForwardInfo),
+    ForwardList(ForwardList),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -615,6 +636,11 @@ async fn dispatch(
                 .await,
             false,
         ),
+        LocalMethod::ForwardAdd(request) => (forward_add_response(state, request).await, false),
+        LocalMethod::ForwardList => (forward_list_response(state), false),
+        LocalMethod::ForwardRemove { forward_id } => {
+            (forward_remove_response(state, forward_id).await, false)
+        }
         LocalMethod::ActivityList { limit } => {
             if limit == 0 || limit > MAX_ACTIVITY_LIST_LIMIT {
                 return (
@@ -1250,6 +1276,115 @@ async fn shell_followup_response(
     response
 }
 
+async fn forward_add_response(state: &LocalApiState, request: ForwardAddRequest) -> LocalResponse {
+    let site_id = match authorize_tcp_egress_device(state, request.device_id) {
+        Ok(site_id) => site_id,
+        Err(response) => return response,
+    };
+    let destination = match TcpForwardDestination::new(request.dest_host, request.dest_port) {
+        Ok(destination) => destination,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
+    let summary = format!("{}:{}", destination.host, destination.port);
+    let started = Instant::now();
+    match state
+        .forwards
+        .add(request.device_id, request.listen_port, destination)
+        .await
+    {
+        Ok(info) => {
+            record_shell_activity(
+                state,
+                site_id,
+                request.device_id,
+                "forward_add",
+                Some(summary),
+                ActivityResult::Succeeded,
+                started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                0,
+            );
+            LocalResponse::ForwardInfo(info)
+        }
+        Err(error) => local_error(LocalApiErrorCode::Unavailable, error.to_string()),
+    }
+}
+
+fn forward_list_response(state: &LocalApiState) -> LocalResponse {
+    match state.forwards.list() {
+        Ok(forwards) => LocalResponse::ForwardList(ForwardList { forwards }),
+        Err(error) => local_error(LocalApiErrorCode::Internal, error.to_string()),
+    }
+}
+
+async fn forward_remove_response(state: &LocalApiState, forward_id: ForwardId) -> LocalResponse {
+    match state.forwards.remove(forward_id).await {
+        Ok(info) => {
+            if let Ok(store) = state.control.lock()
+                && let Some(site) = store.snapshot().catalog.device(info.device_id)
+            {
+                let site_id = site.device.site_id;
+                drop(store);
+                record_shell_activity(
+                    state,
+                    site_id,
+                    info.device_id,
+                    "forward_remove",
+                    Some(format!(
+                        "{}:{}",
+                        info.destination.host, info.destination.port
+                    )),
+                    ActivityResult::Cancelled,
+                    0,
+                    0,
+                );
+            }
+            LocalResponse::ForwardInfo(info)
+        }
+        Err(error) => local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    }
+}
+
+fn authorize_tcp_egress_device(
+    state: &LocalApiState,
+    device_id: DeviceId,
+) -> Result<SiteId, LocalResponse> {
+    let store = state.control.lock().map_err(|_| {
+        local_error(
+            LocalApiErrorCode::Internal,
+            "controller state is unavailable",
+        )
+    })?;
+    let Some(device) = store.snapshot().catalog.device(device_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    let Some(enrollment) = store.snapshot().registry.device(device_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    if device.revoked
+        || site.revoked
+        || !device.device.capabilities.execute
+        || !enrollment.effective_grant.tcp_egress
+        || !store.snapshot().registry.is_device_active(device_id)
+    {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "TCP egress is not permitted for this device",
+        ));
+    }
+    Ok(site.site_id)
+}
 fn authorize_shell_device(
     state: &LocalApiState,
     device_id: DeviceId,
@@ -2064,6 +2199,38 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn forward_add(
+        &self,
+        request: ForwardAddRequest,
+    ) -> Result<ForwardInfo, LocalApiClientError> {
+        match self.request(LocalMethod::ForwardAdd(request)).await? {
+            LocalResponse::ForwardInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn forward_list(&self) -> Result<ForwardList, LocalApiClientError> {
+        match self.request(LocalMethod::ForwardList).await? {
+            LocalResponse::ForwardList(forwards) => Ok(forwards),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn forward_remove(
+        &self,
+        forward_id: ForwardId,
+    ) -> Result<ForwardInfo, LocalApiClientError> {
+        match self
+            .request(LocalMethod::ForwardRemove { forward_id })
+            .await?
+        {
+            LocalResponse::ForwardInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
     pub async fn activity_list(&self, limit: u32) -> Result<ActivityList, LocalApiClientError> {
         match self.request(LocalMethod::ActivityList { limit }).await? {
             LocalResponse::ActivityList(result) => Ok(result),
@@ -2416,6 +2583,7 @@ mod tests {
                 OutfitAssetStore::load_or_create(layout).unwrap(),
             )),
             remote: RemoteHub::default(),
+            forwards: TcpForwardManager::new(RemoteHub::default()),
             shutdown_tx: watch::channel(false).0,
         }
     }

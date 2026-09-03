@@ -13,6 +13,7 @@ mod protocol;
 mod rpc;
 mod sealed_bootstrap;
 mod shell_task;
+mod tcp_forward;
 
 pub use connector::{
     CONNECTOR_CONTROL_VERSION, ConnectorControlError, ConnectorOpenRequest, ConnectorReady,
@@ -75,4 +76,10 @@ pub use shell_task::{
     HARD_MAX_SHELL_TASKS_PER_SESSION, HARD_MAX_SHELL_TIMEOUT_MS, SHELL_RECONNECT_GRACE_MS,
     ShellOutputChunk, ShellTaskErrorBody, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase,
     ShellTaskProtocolError, ShellTaskReply, ShellTaskRequest, ShellTaskStatus,
+};
+pub use tcp_forward::{
+    HARD_MAX_TCP_FORWARD_CHUNK_BYTES, HARD_MAX_TCP_FORWARD_CONNECT_TIMEOUT_MS,
+    HARD_MAX_TCP_FORWARD_CONNECTIONS_PER_SESSION, HARD_MAX_TCP_FORWARD_HOST_BYTES,
+    HARD_MAX_TCP_FORWARD_READ_WAIT_MS, TcpForwardDestination, TcpForwardErrorBody,
+    TcpForwardErrorCode, TcpForwardProtocolError, TcpForwardReply, TcpForwardRequest,
 };

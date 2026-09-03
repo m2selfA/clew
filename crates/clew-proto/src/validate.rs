@@ -10,7 +10,11 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 
 /// Features implemented end-to-end by the current runtime and safe to negotiate today.
 /// Enum values not listed here are reserved/known protocol vocabulary only.
-pub const IMPLEMENTED_FEATURES: &[v1::Feature] = &[v1::Feature::ToolRpc, v1::Feature::ShellTask];
+pub const IMPLEMENTED_FEATURES: &[v1::Feature] = &[
+    v1::Feature::ToolRpc,
+    v1::Feature::ShellTask,
+    v1::Feature::Forward,
+];
 
 pub trait ValidateWire {
     fn validate_wire(&self) -> Result<(), WireValidationError>;
@@ -373,8 +377,10 @@ mod tests {
         ];
         peer.features = local.features.clone();
 
+        assert!(hello_advertises_feature(&local, v1::Feature::Forward));
+        assert!(locally_implements_feature(v1::Feature::Forward));
+        assert!(feature_negotiated(&local, &peer, v1::Feature::Forward).unwrap());
         for feature in [
-            v1::Feature::Forward,
             v1::Feature::Socks5,
             v1::Feature::HttpConnect,
             v1::Feature::FileResume,
@@ -383,10 +389,9 @@ mod tests {
             assert!(!locally_implements_feature(feature));
             assert!(!feature_negotiated(&local, &peer, feature).unwrap());
         }
-        assert!(
-            negotiated_implemented_features(&local, &peer)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            negotiated_implemented_features(&local, &peer).unwrap(),
+            vec![v1::Feature::Forward]
         );
     }
 

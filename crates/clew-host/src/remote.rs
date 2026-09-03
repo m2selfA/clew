@@ -14,10 +14,10 @@ use clew_transport::{
     FsQueryRequest, InnerMessage, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
     NearbyConnectorFile, RPC_PROGRESS_INTERVAL_MS, ReadErrorCode, ReadReply, ReadRequest,
     SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode,
-    ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
-    forward_opaque_bidirectional, read_bootstrap, read_connector_open, read_connector_ready,
-    unwrap_rpc_request, wrap_rpc_progress, wrap_rpc_reply, write_bootstrap, write_connector_open,
-    write_connector_ready,
+    ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, TcpForwardErrorCode,
+    TcpForwardReply, TcpForwardRequest, forward_opaque_bidirectional, read_bootstrap,
+    read_connector_open, read_connector_ready, unwrap_rpc_request, wrap_rpc_progress,
+    wrap_rpc_reply, write_bootstrap, write_connector_open, write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
@@ -25,7 +25,7 @@ use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{
     HostLaunchState, HostMembership, HostMembershipStore, HostReadService, HostShellService,
-    NearbyConnectorStore,
+    HostTcpForwardService, NearbyConnectorStore,
 };
 
 const MAX_CONNECTOR_TUNNELS: usize = 64;
@@ -893,6 +893,12 @@ async fn serve_networked_membership_with_outer_timing(
         .effective_grant
         .as_ref()
         .is_some_and(|grant| grant.shell);
+    let tcp_egress_allowed = membership
+        .marker
+        .effective_grant
+        .as_ref()
+        .is_some_and(|grant| grant.tcp_egress);
+    let tcp_forward_service = tcp_egress_allowed.then(HostTcpForwardService::new);
     loop {
         tokio::select! {
             message = inner.recv(&mut stream) => {
@@ -943,6 +949,24 @@ async fn serve_networked_membership_with_outer_timing(
                                 (_, _, Err(_)) => FsMutationReply::error(
                                     FsMutationErrorCode::InvalidRequest,
                                     "malformed bounded filesystem mutation",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        "tcp_forward" => {
+                            let reply = match (
+                                tcp_forward_service.as_ref(),
+                                tcp_egress_allowed,
+                                TcpForwardRequest::from_message(&message),
+                            ) {
+                                (Some(service), true, Ok(request)) => service.execute(request, true).await,
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => TcpForwardReply::error(
+                                    TcpForwardErrorCode::Denied,
+                                    "TCP egress is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => TcpForwardReply::error(
+                                    TcpForwardErrorCode::InvalidRequest,
+                                    "malformed bounded TCP forward request",
                                 ),
                             };
                             reply.into_message()?
@@ -1190,6 +1214,8 @@ pub enum HostRemoteError {
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    TcpForward(#[from] clew_transport::TcpForwardProtocolError),
     #[error(transparent)]
     ShellTask(#[from] clew_transport::ShellTaskProtocolError),
     #[error(transparent)]

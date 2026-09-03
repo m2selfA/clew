@@ -4,6 +4,7 @@ mod backup;
 mod config;
 mod control;
 mod controller;
+mod forward;
 mod local_api;
 mod lock;
 mod outfit;
@@ -16,15 +17,19 @@ pub use clew_transport::{FsMutationResult, FsWritePrecondition, ShellTaskOutput,
 pub use config::{ControllerConfig, ControllerConfigError, LocalEndpoint, default_state_root};
 pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerControlStore};
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
+pub use forward::{
+    ForwardInfo, HARD_MAX_FORWARD_LISTENERS, TcpForwardManager, TcpForwardManagerError,
+};
 pub use local_api::{
-    ActivityList, BackupExportRequest, ControllerStatus, DeviceList, InviteIssueRequest,
-    InviteIssueResult, LOCAL_API_VERSION, LocalApiClient, LocalApiClientError, LocalApiErrorCode,
-    MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
-    OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
-    OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest,
-    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo,
-    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
+    ActivityList, BackupExportRequest, ControllerStatus, DeviceList, ForwardAddRequest,
+    ForwardList, InviteIssueRequest, InviteIssueResult, LOCAL_API_VERSION, LocalApiClient,
+    LocalApiClientError, LocalApiErrorCode, MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE,
+    OutfitAssetDataResponse, OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse,
+    OutfitCloneRequest, OutfitCreateRequest, OutfitList, OutfitSetAssetRequest,
+    OutfitSetFieldRequest, OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest,
+    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
+    RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
+    RemoteWriteRequest,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
