@@ -935,7 +935,7 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 
 ## 10. V3 — Reliability
 
-**Status：IN PROGRESS（V3a DONE）**
+**Status：IN PROGRESS（V3a + V3b-1 DONE）**
 
 ### V3a — Session generation + path telemetry + idle liveness
 
@@ -950,6 +950,18 @@ Acceptance：coding agent 能在不依赖 GUI 手工选机的前提下稳定定�
 - focused generation/stale-event **1/1 PASS**，MCP V3 surface **1/1 PASS**；`cargo check --workspace --all-targets` PASS / 0 warnings；`cargo test --workspace --all-targets` **166 passed / 0 failed / 6 ignored**。
 
 下一块 V3b：request idempotency/replay matrix。先冻结每类现有短 RPC 在“发送前失败 / 已发送未知结果 / 收到结果后 caller 丢失”三种边界下是否可自动 retry；Read/PathInfo/Glob/Grep 可安全 replay，Write/Edit 只能凭现有强 precondition + stable request identity 收口，Shell Start 不能盲 replay。V3b 不把 File resume 或 Shell reattach 偷塞进一次通用 retry wrapper。
+
+### V3b-1 — Stable RequestId + RPC correlation envelope
+
+**Status：DONE（2026-09-03）**
+
+- 新增 `RequestId` stable UUID strong type；它与 `TaskId` 分离，表示一次业务 RPC 的逻辑身份，不使用 InnerSession frame sequence、Local API connection 或 session generation 代替；
+- 所有现有业务短 RPC（Read / FsQuery / FsMutation / ShellTask）统一包入 bounded `rpc_request` / `rpc_reply` envelope：16-byte RequestId + bounded nested kind + exact payload length；Host 解包后执行业务，再以同一 RequestId 封装结果；Controller 对 reply RequestId mismatch fail closed；
+- `session_ping/session_pong` heartbeat 故意保持 envelope 外的独立 liveness frame，避免把 heartbeat 误变成可 replay 业务请求；Connector 仍只搬已有 InnerSession ciphertext；
+- Controller 当前每个新业务调用只生成一次 RequestId，并在当前 live session 内用于 send/reply correlation；**本块不声明自动 retry、Host dedupe 或 exactly-once**。连接在 request 已发送但 reply 未确认时断开，仍返回失败；下一块才基于同一 RequestId 实现按操作分类的 replay/dedupe；
+- focused validation：RPC typed/binary roundtrip + wrong-id/nil/truncation/wrong-kind **2/2 PASS**；真实 no-public NearbyFile Connector 的全业务链在 correlation envelope 下 **1/1 PASS（3.77s）**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS，0 warnings；`cargo test --workspace --all-targets` **168 passed / 0 failed / 6 ignored**。
+
+下一块 V3b-2：冻结并实现 replay matrix。Read/PathInfo/Glob/Grep 可在新 generation 上以**同一 RequestId**安全 replay；Write/Edit 需要 Host bounded RequestId result cache，重复 RequestId只能返回第一次已完成结果，绝不能再次落盘；Shell Start 不自动 replay，Status/Attach/Cancel 仍依赖后续 V3 Shell reattach 语义，不能由通用 RPC retry 擅自恢复。
 
 - connection reconnect；
 - request idempotency/replay matrix；
@@ -1050,13 +1062,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V3 — Reliability（IN PROGRESS；V3a DONE）**
+**Current block：V3 — Reliability（IN PROGRESS；V3a + V3b-1 DONE）**
 
-**Next block：V3b — request idempotency / replay matrix**
+**Next block：V3b-2 — operation-specific replay + mutation dedupe**
 
-V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3a 现在建立了 authoritative session generation/path/liveness projection，并修复 idle hard-kill 长时间误报 online；下一块只在这个 generation 边界上定义和实现 request replay 规则，Shell task reattach 与 File resume 继续分别收口。
+V1.5 已在 `3a20cd2` 正式封板，V2 已在 `e107549` 完成 Agent Minimum。V3a 建立 authoritative session generation/path/liveness；V3b-1 已给所有业务短 RPC 加 stable RequestId + fail-closed reply correlation，但尚未承诺 replay。下一块只实现按操作分类的 retry/dedupe：安全只读可 replay，mutation 需 Host bounded result cache，Shell Start 禁止 blind replay；Shell reattach 与 File resume 继续分别收口。
 
 ### Change log
+
+- **2026-09-03** — V3b-1 stable RequestId / RPC correlation DONE：新增 RequestId 与 bounded `rpc_request/rpc_reply` envelope，Read/FsQuery/FsMutation/ShellTask 全部要求 reply id 精确匹配；heartbeat 保持独立。RPC focused **2/2 PASS**、no-public Connector full business chain **1/1 PASS（3.77s）**、workspace **168/0/6**。本块明确只做 correlation，不宣称 retry/dedupe/exactly-once；下一块 V3b-2 operation-specific replay + mutation dedupe。
 
 - **2026-09-03** — V3a session generation + path telemetry + idle liveness DONE：RemoteHub token 升为 process-local generation；Direct iroh path event 只更新 direct/relay/mixed path、不触发 reconnect，Connector topology 不冒充 Target path。新增 Local API/CLI/MCP `session_path_info`，Devices disconnected 后投影 last_seen。真实 product hard-kill 首轮发现空闲 member 15s 仍误报 connected，修复为 connection-close watcher + E2E InnerSession 5s/5s encrypted heartbeat；修复后 hard-kill **686ms** disconnected，同一 DeviceId 重启 generation **1→2**，空闲 heartbeat 后 Read PASS。workspace **166/0/6**。下一块 V3b replay matrix。
 

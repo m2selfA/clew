@@ -15,8 +15,8 @@ use clew_transport::{
     NearbyConnectorFile, ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext,
     SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply,
     ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, forward_opaque_bidirectional,
-    read_bootstrap, read_connector_open, read_connector_ready, write_bootstrap,
-    write_connector_open, write_connector_ready,
+    read_bootstrap, read_connector_open, read_connector_ready, unwrap_rpc_request, wrap_rpc_reply,
+    write_bootstrap, write_connector_open, write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
@@ -842,8 +842,13 @@ async fn serve_networked_membership_with_outer_timing(
         tokio::select! {
             message = inner.recv(&mut stream) => {
                 let message = message?;
+                if message.kind == "session_ping" {
+                    let reply = InnerMessage::new("session_pong", message.payload)?;
+                    inner.send(&mut stream, &reply).await?;
+                    continue;
+                }
+                let (request_id, message) = unwrap_rpc_request(&message)?;
                 let reply = match message.kind.as_str() {
-                    "session_ping" => InnerMessage::new("session_pong", message.payload)?,
                     "read" => {
                         let reply = match (service.as_ref(), read_allowed, ReadRequest::from_message(&message)) {
                             (Some(service), true, Ok(request)) => service.execute(request).await,
@@ -906,10 +911,11 @@ async fn serve_networked_membership_with_outer_timing(
                     }
                     _ => ReadReply::error(
                         ReadErrorCode::InvalidRequest,
-                        "unsupported v2 host request",
+                        "unsupported v3 RPC request",
                     )
                     .into_message()?,
                 };
+                let reply = wrap_rpc_reply(request_id, reply)?;
                 inner.send(&mut stream, &reply).await?;
             }
             accepted = outer.accept_classified(), if connector && tunnels.len() < MAX_CONNECTOR_TUNNELS => {
@@ -1120,6 +1126,8 @@ pub enum HostRemoteError {
     #[error(transparent)]
     Inner(#[from] clew_transport::InnerSessionError),
     #[error(transparent)]
+    Rpc(#[from] clew_transport::RpcProtocolError),
+    #[error(transparent)]
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
@@ -1154,13 +1162,28 @@ impl HostRemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clew_core::{DeviceNameOrigin, InviteId, ReadPolicy};
+    use clew_core::{DeviceNameOrigin, InviteId, ReadPolicy, RequestId};
     use clew_identity::{
         ControllerIdentity, EnrollmentRegistry, PermissionGrant, SiteBootstrapSpec,
     };
-    use clew_transport::{BootstrapRequest, BootstrapResponse, noise_static_public};
+    use clew_transport::{
+        BootstrapRequest, BootstrapResponse, noise_static_public, unwrap_rpc_reply,
+        wrap_rpc_request,
+    };
     use iroh::{EndpointAddr, SecretKey};
     use tempfile::tempdir;
+
+    async fn rpc_roundtrip(
+        inner: &mut InnerSession,
+        stream: &mut clew_transport::IrohStream,
+        message: InnerMessage,
+    ) -> InnerMessage {
+        let request_id = RequestId::new();
+        let message = wrap_rpc_request(request_id, message).unwrap();
+        inner.send(stream, &message).await.unwrap();
+        let reply = inner.recv(stream).await.unwrap();
+        unwrap_rpc_reply(request_id, &reply).unwrap()
+    }
 
     #[tokio::test]
     async fn activation_retry_is_immediately_cancellable() {
@@ -1826,17 +1849,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                inner
-                    .send(
-                        &mut stream,
-                        &ReadRequest::new(proof_a, 0, 4_096)
-                            .unwrap()
-                            .into_message()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let first_reply = inner.recv(&mut stream).await.unwrap();
+                let first_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    ReadRequest::new(proof_a, 0, 4_096)
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                )
+                .await;
                 assert_eq!(
                     ReadReply::from_message(&first_reply).unwrap(),
                     ReadReply::Data(PROOF_A.to_vec())
@@ -1863,17 +1884,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                inner
-                    .send(
-                        &mut stream,
-                        &ReadRequest::new(proof_b, 0, 4_096)
-                            .unwrap()
-                            .into_message()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let second_reply = inner.recv(&mut stream).await.unwrap();
+                let second_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    ReadRequest::new(proof_b, 0, 4_096)
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                )
+                .await;
                 assert_eq!(
                     ReadReply::from_message(&second_reply).unwrap(),
                     ReadReply::Data(PROOF_B.to_vec())
@@ -2333,33 +2352,29 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                inner
-                    .send(
-                        &mut stream,
-                        &ReadRequest::new(proof_path.clone(), 0, 4_096)
-                            .unwrap()
-                            .into_message()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let reply = inner.recv(&mut stream).await.unwrap();
+                let reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    ReadRequest::new(proof_path.clone(), 0, 4_096)
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                )
+                .await;
                 assert_eq!(
                     ReadReply::from_message(&reply).unwrap(),
                     ReadReply::Data(READ_PROOF.to_vec())
                 );
 
-                inner
-                    .send(
-                        &mut stream,
-                        &FsQueryRequest::path_info(proof_path.clone())
-                            .unwrap()
-                            .into_message()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let info_reply = inner.recv(&mut stream).await.unwrap();
+                let info_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    FsQueryRequest::path_info(proof_path.clone())
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                )
+                .await;
                 let FsQueryReply::PathInfo(info) = FsQueryReply::from_message(&info_reply).unwrap()
                 else {
                     panic!("expected PathInfo reply over Connector InnerSession");
@@ -2368,17 +2383,15 @@ mod tests {
                 assert_eq!(info.size, READ_PROOF.len() as u64);
                 assert!(info.path.ends_with("proof.txt"));
 
-                inner
-                    .send(
-                        &mut stream,
-                        &FsQueryRequest::glob(share_path.clone(), "*.txt", 0, 8, 4_096)
-                            .unwrap()
-                            .into_message()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let glob_reply = inner.recv(&mut stream).await.unwrap();
+                let glob_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    FsQueryRequest::glob(share_path.clone(), "*.txt", 0, 8, 4_096)
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                )
+                .await;
                 let FsQueryReply::Glob(page) = FsQueryReply::from_message(&glob_reply).unwrap()
                 else {
                     panic!("expected Glob reply over Connector InnerSession");
@@ -2387,25 +2400,23 @@ mod tests {
                 assert!(page.entries[0].path.ends_with("proof.txt"));
                 assert!(!page.truncated);
 
-                inner
-                    .send(
-                        &mut stream,
-                        &FsQueryRequest::grep(
-                            share_path.clone(),
-                            "CLEW-V15C",
-                            Some("*.txt".into()),
-                            0,
-                            8,
-                            4_096,
-                            4_096,
-                        )
-                        .unwrap()
-                        .into_message()
-                        .unwrap(),
+                let grep_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    FsQueryRequest::grep(
+                        share_path.clone(),
+                        "CLEW-V15C",
+                        Some("*.txt".into()),
+                        0,
+                        8,
+                        4_096,
+                        4_096,
                     )
-                    .await
-                    .unwrap();
-                let grep_reply = inner.recv(&mut stream).await.unwrap();
+                    .unwrap()
+                    .into_message()
+                    .unwrap(),
+                )
+                .await;
                 let FsQueryReply::Grep(page) = FsQueryReply::from_message(&grep_reply).unwrap()
                 else {
                     panic!("expected Grep reply over Connector InnerSession");
@@ -2416,21 +2427,19 @@ mod tests {
                 assert_eq!(page.matches[0].line, "CLEW-V15C-NO-PUBLIC-CONNECTOR-READ");
                 assert!(!page.truncated);
 
-                inner
-                    .send(
-                        &mut stream,
-                        &FsMutationRequest::write(
-                            mutation_path.clone(),
-                            "alpha OLD omega\n",
-                            clew_transport::FsWritePrecondition::CreateOnly,
-                        )
-                        .unwrap()
-                        .into_message()
-                        .unwrap(),
+                let write_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    FsMutationRequest::write(
+                        mutation_path.clone(),
+                        "alpha OLD omega\n",
+                        clew_transport::FsWritePrecondition::CreateOnly,
                     )
-                    .await
-                    .unwrap();
-                let write_reply = inner.recv(&mut stream).await.unwrap();
+                    .unwrap()
+                    .into_message()
+                    .unwrap(),
+                )
+                .await;
                 let FsMutationReply::Result(created) =
                     FsMutationReply::from_message(&write_reply).unwrap()
                 else {
@@ -2439,22 +2448,15 @@ mod tests {
                 assert!(created.created);
                 assert_eq!(created.size, 16);
 
-                inner
-                    .send(
-                        &mut stream,
-                        &FsMutationRequest::edit(
-                            mutation_path.clone(),
-                            created.sha256,
-                            "OLD",
-                            "NEW",
-                        )
+                let edit_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    FsMutationRequest::edit(mutation_path.clone(), created.sha256, "OLD", "NEW")
                         .unwrap()
                         .into_message()
                         .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let edit_reply = inner.recv(&mut stream).await.unwrap();
+                )
+                .await;
                 let FsMutationReply::Result(edited) =
                     FsMutationReply::from_message(&edit_reply).unwrap()
                 else {
@@ -2463,17 +2465,15 @@ mod tests {
                 assert!(!edited.created);
                 assert_eq!(edited.size, 16);
 
-                inner
-                    .send(
-                        &mut stream,
-                        &ReadRequest::new(mutation_path, 0, 4_096)
-                            .unwrap()
-                            .into_message()
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let mutated_reply = inner.recv(&mut stream).await.unwrap();
+                let mutated_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    ReadRequest::new(mutation_path, 0, 4_096)
+                        .unwrap()
+                        .into_message()
+                        .unwrap(),
+                )
+                .await;
                 assert_eq!(
                     ReadReply::from_message(&mutated_reply).unwrap(),
                     ReadReply::Data(b"alpha NEW omega\n".to_vec())
@@ -2484,22 +2484,20 @@ mod tests {
                 } else {
                     "printf CLEW-SHELL-CONNECTOR"
                 };
-                inner
-                    .send(
-                        &mut stream,
-                        &ShellTaskRequest::start(
-                            shell_command,
-                            share_path,
-                            std::collections::BTreeMap::new(),
-                            5_000,
-                        )
-                        .unwrap()
-                        .into_message()
-                        .unwrap(),
+                let started_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    ShellTaskRequest::start(
+                        shell_command,
+                        share_path,
+                        std::collections::BTreeMap::new(),
+                        5_000,
                     )
-                    .await
-                    .unwrap();
-                let started_reply = inner.recv(&mut stream).await.unwrap();
+                    .unwrap()
+                    .into_message()
+                    .unwrap(),
+                )
+                .await;
                 let ShellTaskReply::Started { task_id } =
                     ShellTaskReply::from_message(&started_reply).unwrap()
                 else {
@@ -2507,14 +2505,12 @@ mod tests {
                 };
                 let status = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        inner
-                            .send(
-                                &mut stream,
-                                &ShellTaskRequest::Status { task_id }.into_message().unwrap(),
-                            )
-                            .await
-                            .unwrap();
-                        let status_reply = inner.recv(&mut stream).await.unwrap();
+                        let status_reply = rpc_roundtrip(
+                            &mut inner,
+                            &mut stream,
+                            ShellTaskRequest::Status { task_id }.into_message().unwrap(),
+                        )
+                        .await;
                         let ShellTaskReply::Status(status) =
                             ShellTaskReply::from_message(&status_reply).unwrap()
                         else {
@@ -2531,21 +2527,19 @@ mod tests {
                 assert_eq!(status.phase, clew_transport::ShellTaskPhase::Exited);
                 assert_eq!(status.exit_code, Some(0));
 
-                inner
-                    .send(
-                        &mut stream,
-                        &ShellTaskRequest::Attach {
-                            task_id,
-                            stdout_offset: 0,
-                            stderr_offset: 0,
-                            max_bytes_per_stream: 4_096,
-                        }
-                        .into_message()
-                        .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let output_reply = inner.recv(&mut stream).await.unwrap();
+                let output_reply = rpc_roundtrip(
+                    &mut inner,
+                    &mut stream,
+                    ShellTaskRequest::Attach {
+                        task_id,
+                        stdout_offset: 0,
+                        stderr_offset: 0,
+                        max_bytes_per_stream: 4_096,
+                    }
+                    .into_message()
+                    .unwrap(),
+                )
+                .await;
                 let ShellTaskReply::Output(output) =
                     ShellTaskReply::from_message(&output_reply).unwrap()
                 else {

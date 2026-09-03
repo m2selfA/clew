@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use clew_core::{DeviceId, DeviceNameOrigin, DeviceRecord, SiteId, TaskId};
+use clew_core::{DeviceId, DeviceNameOrigin, DeviceRecord, RequestId, SiteId, TaskId};
 use clew_host::normalize_hostname;
 use clew_identity::{EnrollmentError, StoredControllerIdentity};
 use clew_transport::{
@@ -14,7 +14,7 @@ use clew_transport::{
     HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
     ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
     ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
-    read_bootstrap, read_connector_open, write_bootstrap,
+    read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -122,18 +122,22 @@ impl Drop for ShellStartReservation {
 #[derive(Debug)]
 enum RemoteCommand {
     Read {
+        request_id: RequestId,
         request: ReadRequest,
         reply: oneshot::Sender<Result<ReadReply, RemoteHubError>>,
     },
     FsQuery {
+        request_id: RequestId,
         request: FsQueryRequest,
         reply: oneshot::Sender<Result<FsQueryReply, RemoteHubError>>,
     },
     FsMutation {
+        request_id: RequestId,
         request: FsMutationRequest,
         reply: oneshot::Sender<Result<FsMutationReply, RemoteHubError>>,
     },
     ShellTask {
+        request_id: RequestId,
         request: ShellTaskRequest,
         reply: oneshot::Sender<Result<ShellTaskReply, RemoteHubError>>,
     },
@@ -208,8 +212,10 @@ impl RemoteHub {
             .get(&device_id)
             .map(|slot| slot.tx.clone())
             .ok_or(RemoteHubError::Offline(device_id))?;
+        let request_id = RequestId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::Read {
+            request_id,
             request,
             reply: reply_tx,
         })
@@ -233,8 +239,10 @@ impl RemoteHub {
             .get(&device_id)
             .map(|slot| slot.tx.clone())
             .ok_or(RemoteHubError::Offline(device_id))?;
+        let request_id = RequestId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::FsQuery {
+            request_id,
             request,
             reply: reply_tx,
         })
@@ -258,8 +266,10 @@ impl RemoteHub {
             .get(&device_id)
             .map(|slot| slot.tx.clone())
             .ok_or(RemoteHubError::Offline(device_id))?;
+        let request_id = RequestId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::FsMutation {
+            request_id,
             request,
             reply: reply_tx,
         })
@@ -301,8 +311,10 @@ impl RemoteHub {
             (generation, tx)
         };
         let reservation = ShellStartReservation::new(self.clone());
+        let request_id = RequestId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::ShellTask {
+            request_id,
             request,
             reply: reply_tx,
         })
@@ -414,8 +426,10 @@ impl RemoteHub {
             }
             (projection.device_id, projection.generation, slot.tx.clone())
         };
+        let request_id = RequestId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(RemoteCommand::ShellTask {
+            request_id,
             request: request.clone(),
             reply: reply_tx,
         })
@@ -1027,10 +1041,16 @@ async fn handle_member(
             }
         };
         match command {
-            RemoteCommand::Read { request, reply } => {
+            RemoteCommand::Read {
+                request_id,
+                request,
+                reply,
+            } => {
                 let result = async {
-                    inner.send(stream, &request.into_message()?).await?;
+                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                    inner.send(stream, &message).await?;
                     let message = inner.recv(stream).await?;
+                    let message = unwrap_rpc_reply(request_id, &message)?;
                     Ok(ReadReply::from_message(&message)?)
                 }
                 .await;
@@ -1040,10 +1060,16 @@ async fn handle_member(
                     break;
                 }
             }
-            RemoteCommand::FsQuery { request, reply } => {
+            RemoteCommand::FsQuery {
+                request_id,
+                request,
+                reply,
+            } => {
                 let result = async {
-                    inner.send(stream, &request.into_message()?).await?;
+                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                    inner.send(stream, &message).await?;
                     let message = inner.recv(stream).await?;
+                    let message = unwrap_rpc_reply(request_id, &message)?;
                     Ok(FsQueryReply::from_message(&message)?)
                 }
                 .await;
@@ -1053,10 +1079,16 @@ async fn handle_member(
                     break;
                 }
             }
-            RemoteCommand::FsMutation { request, reply } => {
+            RemoteCommand::FsMutation {
+                request_id,
+                request,
+                reply,
+            } => {
                 let result = async {
-                    inner.send(stream, &request.into_message()?).await?;
+                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                    inner.send(stream, &message).await?;
                     let message = inner.recv(stream).await?;
+                    let message = unwrap_rpc_reply(request_id, &message)?;
                     Ok(FsMutationReply::from_message(&message)?)
                 }
                 .await;
@@ -1066,10 +1098,16 @@ async fn handle_member(
                     break;
                 }
             }
-            RemoteCommand::ShellTask { request, reply } => {
+            RemoteCommand::ShellTask {
+                request_id,
+                request,
+                reply,
+            } => {
                 let result = async {
-                    inner.send(stream, &request.into_message()?).await?;
+                    let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                    inner.send(stream, &message).await?;
                     let message = inner.recv(stream).await?;
+                    let message = unwrap_rpc_reply(request_id, &message)?;
                     Ok(ShellTaskReply::from_message(&message)?)
                 }
                 .await;
@@ -1209,6 +1247,8 @@ pub enum RemoteHubError {
     ShellReplyTaskMismatch(TaskId),
     #[error("Shell projection request used the wrong Start/follow-up shape")]
     InvalidShellProjectionRequest,
+    #[error(transparent)]
+    Rpc(#[from] clew_transport::RpcProtocolError),
     #[error(transparent)]
     Inner(#[from] clew_transport::InnerSessionError),
     #[error(transparent)]
@@ -1600,7 +1640,8 @@ mod tests {
                 )
                 .await
         });
-        let RemoteCommand::ShellTask { request, reply } = commands_a.recv().await.unwrap() else {
+        let RemoteCommand::ShellTask { request, reply, .. } = commands_a.recv().await.unwrap()
+        else {
             panic!("expected Shell Start on Device-A session");
         };
         assert!(matches!(request, ShellTaskRequest::Start { .. }));
@@ -1618,7 +1659,8 @@ mod tests {
                 .shell_task(ShellTaskRequest::Status { task_id })
                 .await
         });
-        let RemoteCommand::ShellTask { request, reply } = commands_a.recv().await.unwrap() else {
+        let RemoteCommand::ShellTask { request, reply, .. } = commands_a.recv().await.unwrap()
+        else {
             panic!("expected Shell Status on Device-A session");
         };
         assert_eq!(request, ShellTaskRequest::Status { task_id });
@@ -1706,7 +1748,7 @@ mod tests {
                 )
                 .await
         });
-        let RemoteCommand::ShellTask { request, reply } = commands.recv().await.unwrap() else {
+        let RemoteCommand::ShellTask { request, reply, .. } = commands.recv().await.unwrap() else {
             panic!("expected pending Shell Start command");
         };
         assert!(matches!(request, ShellTaskRequest::Start { .. }));
@@ -1716,7 +1758,7 @@ mod tests {
         let task_id = TaskId::new();
         reply.send(Ok(ShellTaskReply::Started { task_id })).unwrap();
 
-        let RemoteCommand::ShellTask { request, reply } =
+        let RemoteCommand::ShellTask { request, reply, .. } =
             tokio::time::timeout(Duration::from_secs(2), commands.recv())
                 .await
                 .expect("orphan Shell task was not cancelled")

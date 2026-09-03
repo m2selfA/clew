@@ -106,6 +106,7 @@ define_stable_id!(SiteId);
 define_stable_id!(DeviceId);
 define_stable_id!(InviteId);
 define_stable_id!(TaskId);
+define_stable_id!(RequestId);
 
 #[cfg(test)]
 mod tests {

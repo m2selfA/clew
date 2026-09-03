@@ -9,6 +9,7 @@ mod lease;
 mod nearby;
 mod outer;
 mod protocol;
+mod rpc;
 mod sealed_bootstrap;
 mod shell_task;
 
@@ -52,6 +53,10 @@ pub use protocol::{
     BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapProtocolError,
     BootstrapRequest, BootstrapResponse, MAX_BOOTSTRAP_FRAME_BYTES, ReadErrorBody, ReadErrorCode,
     ReadProtocolError, ReadReply, ReadRequest, read_bootstrap, write_bootstrap,
+};
+pub use rpc::{
+    RPC_REPLY_MESSAGE_KIND, RPC_REQUEST_MESSAGE_KIND, RpcProtocolError, unwrap_rpc_reply,
+    unwrap_rpc_request, wrap_rpc_reply, wrap_rpc_request,
 };
 pub use sealed_bootstrap::{
     MAX_SEALED_BOOTSTRAP_PLAINTEXT, SealedBootstrapContext, SealedBootstrapError,
