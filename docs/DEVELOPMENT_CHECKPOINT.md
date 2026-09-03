@@ -1139,7 +1139,22 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 
 ## 12. V5 — File Plane
 
-**Status：TODO**
+**Status：IN PROGRESS（V5a-0 DONE）**
+
+### V5a-0 — Single-file manifest / deterministic chunk contract
+
+**Status：DONE（2026-09-04）**
+
+- 复用V3d已经冻结的stable `TransferId + FileResumeDescriptor`，新增peer-visible `FileTransferManifest v1`与`FileTransferChunk`；本块不重新发明resume identity，也不打开文件/创建part文件/增加Local API/CLI/MCP/data plane；
+- manifest绑定`TransferId + ControllerId + SiteId + DeviceId + direction + device_path + total_size + chunk_size + final_sha256`。chunk size只接受 **4–32 KiB power-of-two**；chunk count使用overflow-safe `u64::div_ceil`，`u64::MAX` total_size也不会少算或panic；manifest JSON decode前hard cap **16 KiB**；
+- 单文件chunk采用deterministic contiguous layout：offset必须按manifest chunk_size对齐，非末chunk必须精确full-size，末chunk必须精确剩余长度；raw chunk hard cap **32 KiB**，每chunk独立SHA-256；chunk Base64 string在decode前先按raw上限计算hard cap，整个chunk JSON另有 **48 KiB** pre-parse gate，避免恶意长Base64先进入可增长decode；
+- final SHA-256是manifest必备完整性承诺；empty file必须使用empty SHA。`manifest.initial_resume_descriptor()`直接生成V3d revision=1 / offset=0 / empty-prefix checkpoint并携带同一final SHA，后续runtime必须继续使用V3d successor monotonicity，不允许另一套resume语义；
+- privacy边界冻结：peer manifest**永远不含Controller本机path**。`ControllerToDevice`必须携带device-side conflict policy（Fail/Replace/Rename）；`DeviceToController`的Controller本机destination/conflict policy必须保持Controller-private，peer manifest若携带则fail closed；
+- V5权限映射冻结但本块不执行I/O：`DeviceToController (get)`后续必须同时要求当前device active/executable + signed/effective `read=true` + device_path在signed roots；`ControllerToDevice (put)`必须要求`write=true` +同一roots。不会新增“有EXECUTE就能传文件”的隐式权限；helper-only/legacy缺grant继续fail closed；
+- `Feature::FileResume=6`在本块仍保持V3f reserved/not-implemented，双方广告也不得协商成功；只有真实single-file data plane + resume闭合后才允许加入`IMPLEMENTED_FEATURES`；
+- focused manifest/chunk/privacy/hash/bounds **4/4 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **201 passed / 0 failed / 6 ignored**。
+
+下一块 V5a-1：单文件 data plane + Controller-owned transfer state。先只做一个transfer内的顺序chunk put/get、final hash、atomic finalization、status/cancel与V3d contiguous-prefix resume；不做directory tree或多transfer并发调度。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1218,13 +1233,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V4 — Dynamic Networking（DONE，2026-09-04）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a-0 DONE）**
 
-**Next block：V5a — File Plane single-file manifest/chunk foundation**
+**Next block：V5a-1 — single-file data plane + resume state**
 
-V3已在`524ba88`封板，V4也已完整闭合：signed `tcp_egress` owner opt-in、Controller-owned loopback TCP listener、generation-bound non-migrating TCP primitive、SOCKS5 TCP CONNECT与HTTP CONNECT都复用同一Target↔Controller InnerSession数据面。V4c真实单-write CONNECT+payload gate证明HTTP parser不会吞首批tunnel bytes；默认未授权Site、UDP ASSOCIATE、普通HTTP GET、remove/port-close等负面边界均fail closed。下一阶段进入V5 File Plane；先做单文件manifest/chunk/hash/control contract，不提前混入directory tree或大并发调度。
+V4已在`dfa373d`完整封板。V5a-0现在冻结了与V3d一致的single-file peer contract：stable TransferId、16KiB manifest、4–32KiB deterministic chunks、per-chunk/final SHA、32KiB raw/48KiB encoded chunk hard bounds，以及Controller-private local-path/conflict-policy边界。它尚未启用FileResume feature或文件I/O；下一块才把这套contract接到Controller-owned transfer state与Target file I/O，按read/get、write/put现有signed grant严格授权。
 
 ### Change log
+
+- **2026-09-04** — V5a-0 single-file manifest/chunk foundation DONE：复用V3d TransferId/resume descriptor，新增16KiB manifest与deterministic 4–32KiB chunks，per-chunk/final SHA，Base64 pre-decode与48KiB chunk-doc hard gates；Controller local path永不进入peer manifest，get/put权限明确映射现有read/write grant。focused **4/4**、workspace **201/0/6**；FileResume feature仍未实现，下一块V5a-1 single-file data plane。
 
 - **2026-09-04** — V4c HTTP CONNECT DONE / **V4 Dynamic Networking DONE**：Controller-owned loopback CONNECT adapter复用V4a TCP primitive；16KiB header/5s handshake，只CONNECT，GET=405，支持`host:port`/`[IPv6]:port`。independent review增加initial-tail pump，真实single-write `CONNECT+CLEW-V4C-PIPELINED`经Gamma echo返回200+exact proof；default Site add Denied，remove后port-close。exact binary `92545358...31835`，workspace **197/0/6**。下一阶段V5 File Plane。
 

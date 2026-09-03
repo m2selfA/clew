@@ -3,6 +3,7 @@
 mod connector;
 mod discovery;
 mod file_resume;
+mod file_transfer;
 mod fs_mutation;
 mod fs_query;
 mod inner;
@@ -28,6 +29,12 @@ pub use discovery::{
 pub use file_resume::{
     EMPTY_SHA256_HEX, FILE_RESUME_DESCRIPTOR_VERSION, FileResumeDescriptor, FileResumeError,
     FileTransferDirection, MAX_FILE_RESUME_DESCRIPTOR_BYTES, MAX_FILE_RESUME_PATH_BYTES,
+};
+pub use file_transfer::{
+    FILE_TRANSFER_MANIFEST_VERSION, FileConflictPolicy, FileTransferChunk, FileTransferError,
+    FileTransferManifest, MAX_FILE_CHUNK_BASE64_BYTES, MAX_FILE_CHUNK_BYTES,
+    MAX_FILE_TRANSFER_CHUNK_ENCODED_BYTES, MAX_FILE_TRANSFER_MANIFEST_BYTES, MIN_FILE_CHUNK_BYTES,
+    sha256_hex as file_sha256_hex,
 };
 pub use fs_mutation::{
     FsMutationErrorBody, FsMutationErrorCode, FsMutationProtocolError, FsMutationReply,
