@@ -58,6 +58,11 @@ eframe = { version = "0.36.1", default-features = false, features = ["default_fo
 tray-icon = "0.24.2"
 rfd = "0.17.2"
 
+[build-dependencies]
+image.workspace = true
+resvg.workspace = true
+winresource = "0.1"
+
 [dev-dependencies]
 clew-identity = { path = "crates/clew-identity" }
 tempfile.workspace = true
