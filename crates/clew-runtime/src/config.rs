@@ -76,7 +76,7 @@ impl ControllerConfig {
     pub fn local_endpoint(&self) -> LocalEndpoint {
         #[cfg(windows)]
         {
-            let normalized = self.state_root.to_string_lossy().to_lowercase();
+            let normalized = windows_endpoint_state_key(&self.state_root);
             let mut hasher = Sha256::new();
             hasher.update(PIPE_NAME_DOMAIN);
             hasher.update(normalized.as_bytes());
@@ -100,6 +100,31 @@ impl ControllerConfig {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_endpoint_state_key(state_root: &std::path::Path) -> String {
+    let absolute = if state_root.is_absolute() {
+        state_root.to_path_buf()
+    } else {
+        env::current_dir()
+            .map(|current| current.join(state_root))
+            .unwrap_or_else(|_| state_root.to_path_buf())
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase()
 }
 
 #[cfg(unix)]
@@ -204,6 +229,20 @@ mod tests {
         let config = ControllerConfig::new("/tmp/c");
         let LocalEndpoint::UnixSocket(path) = config.local_endpoint();
         assert_eq!(path, config.state_layout().local_api_socket_path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_equivalent_relative_state_roots_share_pipe_name() {
+        let plain = ControllerConfig::new(r"target\clew-equivalent-state");
+        let dotted = ControllerConfig::new(r".\target\clew-equivalent-state");
+        let absolute = ControllerConfig::new(
+            env::current_dir()
+                .unwrap()
+                .join(r"target\clew-equivalent-state"),
+        );
+        assert_eq!(plain.local_endpoint(), dotted.local_endpoint());
+        assert_eq!(plain.local_endpoint(), absolute.local_endpoint());
     }
 
     #[cfg(windows)]

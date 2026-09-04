@@ -173,6 +173,36 @@ fn spawn_controller(state_dir: &Path) -> ChildGuard {
     )
 }
 
+#[cfg(windows)]
+#[test]
+fn equivalent_relative_state_dir_spellings_share_local_api_endpoint() {
+    let current = std::env::current_dir().unwrap();
+    let temp = tempfile::tempdir_in(&current).unwrap();
+    let relative = temp.path().strip_prefix(&current).unwrap().to_path_buf();
+    let dotted = std::path::PathBuf::from(".").join(&relative);
+
+    let mut controller = spawn_controller(&relative);
+    let status = wait_until_ready(&dotted);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let devices = run_devices(&dotted);
+    assert!(
+        devices.status.success(),
+        "{}",
+        String::from_utf8_lossy(&devices.stderr)
+    );
+    let shutdown = run_shutdown(&dotted);
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    controller.wait_for_exit();
+}
+
 #[test]
 fn authenticated_cli_shutdown_stops_controller_and_allows_restart() {
     let temp = tempdir().unwrap();

@@ -8,6 +8,9 @@ use std::{ffi::OsStr, path::Path};
 use clap::ValueEnum;
 use serde::Serialize;
 
+#[cfg(windows)]
+mod windows;
+
 #[cfg(target_os = "linux")]
 pub const USER_SERVICE_UNIT: &str = "clew-controller.service";
 #[cfg(any(target_os = "linux", test))]
@@ -17,6 +20,7 @@ const MANAGED_HEADER: &str = "# Managed by Clew V7a\n";
 #[value(rename_all = "kebab-case")]
 pub enum ServiceScope {
     User,
+    Machine,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -54,21 +58,85 @@ pub fn manage(
     action: ServiceAction,
     scope: ServiceScope,
     state_dir: Option<PathBuf>,
+    site: Option<PathBuf>,
 ) -> Result<ServiceReport, Box<dyn Error>> {
-    if scope != ServiceScope::User {
-        return Err("only the user service scope is implemented in V7a".into());
+    match scope {
+        ServiceScope::User => {
+            if site.is_some() {
+                return Err(
+                    "--site is only accepted by `clew service install --scope machine`".into(),
+                );
+            }
+            if action != ServiceAction::Install && state_dir.is_some() {
+                return Err(
+                    "--state-dir is only accepted by `clew service install --scope user`".into(),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            {
+                return manage_linux_user(action, state_dir);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (action, state_dir);
+                Err("`clew service --scope user` is currently available on Linux only".into())
+            }
+        }
+        ServiceScope::Machine => {
+            if state_dir.is_some() {
+                return Err("Windows machine service state is fixed under ProgramData; --state-dir is not accepted".into());
+            }
+            if matches!(
+                action,
+                ServiceAction::EnableLinger | ServiceAction::DisableLinger
+            ) {
+                return Err(
+                    "linger is a Linux user-service concept and is not available for machine scope"
+                        .into(),
+                );
+            }
+            if action != ServiceAction::Install && site.is_some() {
+                return Err(
+                    "--site is only accepted by `clew service install --scope machine`".into(),
+                );
+            }
+            #[cfg(windows)]
+            {
+                return windows::manage_machine(action, site);
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (action, site);
+                Err("`clew service --scope machine` is currently available on Windows only".into())
+            }
+        }
     }
-    if action != ServiceAction::Install && state_dir.is_some() {
-        return Err("--state-dir is only accepted by `clew service install`".into());
-    }
-    #[cfg(target_os = "linux")]
+}
+
+#[must_use]
+pub fn is_windows_service_process() -> bool {
+    #[cfg(windows)]
     {
-        return manage_linux_user(action, state_dir);
+        let mut args = std::env::args_os();
+        let _ = args.next();
+        return args
+            .next()
+            .is_some_and(|arg| arg == windows::SERVICE_PROCESS_ARGUMENT);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(windows))]
     {
-        let _ = (action, state_dir);
-        Err("`clew service --scope user` is currently available on Linux only".into())
+        false
+    }
+}
+
+pub fn run_windows_service_process() -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        return windows::run_dispatcher();
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Windows service process mode is unavailable on this platform".into())
     }
 }
 

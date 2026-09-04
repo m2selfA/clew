@@ -38,7 +38,7 @@ use clew_runtime::{
     name = "clew",
     version,
     about = "Agent-facing remote capability bridge",
-    after_help = "Linux user service lifecycle: clew service --help"
+    after_help = "Advanced service lifecycle: clew service --help"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,16 +48,19 @@ struct Cli {
 #[derive(Debug, Parser)]
 #[command(
     name = "clew service",
-    about = "Manage the explicit Linux user service lifecycle. Install never enables or starts it."
+    about = "Manage explicit long-lived service runtimes. Install never enables or starts them."
 )]
 struct ServiceCli {
     #[arg(value_enum)]
     action: service::ServiceAction,
     #[arg(long, value_enum, default_value = "user")]
     scope: service::ServiceScope,
-    /// Controller state root to bake into a newly installed unit. Install-only.
+    /// Controller state root to bake into a Linux user unit. User-scope install only.
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
+    /// Signed Site Kit sidecar copied into a Windows machine service. Machine-scope install only.
+    #[arg(long, value_name = "FILE")]
+    site: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -621,16 +624,20 @@ fn service_cli_from_process_args() -> Option<ServiceCli> {
 }
 
 fn run_service(cli: ServiceCli) -> Result<(), Box<dyn std::error::Error>> {
-    let report = service::manage(cli.action, cli.scope, cli.state_dir)?;
+    let report = service::manage(cli.action, cli.scope, cli.state_dir, cli.site)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let result = match service_cli_from_process_args() {
-        Some(cli) => run_service(cli),
-        None => run(Cli::parse()).await,
+    let result = if service::is_windows_service_process() {
+        service::run_windows_service_process()
+    } else {
+        match service_cli_from_process_args() {
+            Some(cli) => run_service(cli),
+            None => run(Cli::parse()).await,
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
