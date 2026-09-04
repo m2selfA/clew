@@ -1352,9 +1352,22 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6b-2 — macOS bundle + Linux portable layout
 
+**Status：DONE（2026-09-04）**
+
+- release manifest升级为schema **2**，显式记录`layout/app_id/entrypoint/cli_binary`，payload从“单binary+README”扩成按平台native layout；每个payload文件继续逐项记录path/size/SHA-256/mode，ZIP exact-entry、embedded manifest、逐文件hash与解包后native CLI smoke仍由xtask自验证。Windows保持`windows-portable/clew.exe`，没有因schema升级丢失V6b-1 PE identity；
+- macOS产物冻结为`Clew.app/Contents/{Info.plist,MacOS/Clew,Resources/{AppIcon.icns,clew}}`：`CFBundleIdentifier=io.clew.app`、`CFBundleExecutable=Clew`、`CFBundleIconFile=AppIcon`、`CFBundlePackageType=APPL`、display/name/version均绑定Cargo package identity；`AppIcon.icns`由唯一源`assets/icons/app.svg`确定性render 16/32/64/128/256/512/1024 PNG并写`icp4/icp5/icp6/ic07/ic08/ic09/ic10`；
+- 新增macOS专用`clew-app` launcher，`.app`双击入口固定转发到Resources中的真实CLI `clew gui`，过滤Finder `-psn_*`参数并保留其余argv；launcher通过`macos-app-launcher`显式feature gate，默认Windows/Linux/all-targets不会暴露无意义stub，xtask只为macOS单独构建该feature，不污染主`clew` binary fingerprint；
+- 为适配macOS较短Unix-domain `sun_path`，Controller Local API与Host wake endpoint在macOS固定使用按state root hash派生的`temp_dir()`短socket；Linux等Unix仍优先private state path、过长才fallback。macos-3dv0原生focused：Controller short endpoint **1/1 PASS**、Host short wake socket **1/1 PASS**；
+- Linux portable layout冻结为`bin/clew + share/applications/io.clew.app.desktop + share/icons/hicolor/scalable/apps/clew.svg + README`；desktop entry与macOS体验对齐为`Exec=clew gui`、`TryExec=clew`、`Terminal=false`、`Icon=clew`、单一`Categories=Network;`，EL8 native `desktop-file-validate`最终**零输出**，SVG由`file`识别且`xmllint`通过；
+- macos-3dv0 x86_64 macOS 15 native package及系统反读全部通过：`plutil` OK，launcher/CLI均为x86_64 Mach-O且有execute bit，launcher `--help`正确进入`clew gui --help`，`iconutil`可拆出16/32/48/128/256/512/1024资源；`codesign`明确报告当前`.app`未签名，符合V6 unsigned baseline。最终dirty同状态两次ZIP SHA-256均为 **`13b84efbd94176167e9c9aead242a7793d2242f7c3a50ba71edee78bcd3a6a2f`**；
+- wmn02 EL8 x86_64 native release/package通过（首轮cold build只因1800s runner总预算超时、无编译错误；复用同一cache的正式retry完成）。解包`bin/clew`为可执行x86-64 ELF并实际通过`--version/--help`；最终desktop修正后的dirty同状态两次ZIP SHA-256均为 **`24e04b16f29c8b0e4bd5066778395ee0ff58995d749d4f7d0f4181eb4fcb8ffe`**；
+- final local gates：xtask **6/6 PASS**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets --locked` PASS / 0 warnings；`cargo test --workspace --all-targets --locked` **245 passed / 0 failed / 6 ignored**；`git diff --check` PASS。下一块只进入显式签名/notarization管线，不把当前unsigned artifact伪称为已签名。
+
+#### V6b-3 — Windows signing + macOS signing/notarization baseline
+
 **Status：NEXT**
 
-下一步把同一app identity/resource真正映射到macOS `.app/Contents/{MacOS,Resources}` + `Info.plist` + deterministic ICNS，以及Linux `bin/` + `share/applications/` + scalable icon portable layout；xtask manifest必须逐文件hash这些资源，native CI runner继续执行解包binary smoke。完成后再进入Windows signing与macOS signing/notarization；ClientFlavor/Distribution Studio成品签名与cache继续留在后续V6子块。
+下一步建立**显式opt-in、无secret入仓库、可独立verify**的签名管线：Windows Authenticode签名/验签，macOS Developer ID codesign + hardened runtime + notarization/staple/verify；无凭据环境继续稳定产出V6a/V6b-2 unsigned artifact而不是静默ad-hoc签名。签名会改变payload bytes，因此signed manifest必须在签名后重新计算逐文件hash并明确`unsigned=false`/签名身份，不能复用unsigned manifest。ClientFlavor/Distribution Studio成品签名与cache仍后置。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1413,13 +1426,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V6 — Release Packaging（IN PROGRESS；V6a + V6b-1 Windows native metadata DONE）**
+**Current block：V6 — Release Packaging（IN PROGRESS；V6a + V6b-1 + V6b-2 native unsigned artifact DONE）**
 
-**Next block：V6b-2 — macOS bundle + Linux portable layout**
+**Next block：V6b-3 — Windows signing + macOS signing/notarization baseline**
 
-V6a已建立reproducible unsigned baseline；V6b-1进一步把Clew Original app icon与版本身份真正嵌进Windows PE，并通过VersionInfo/icon反读、forced-rebuild reproducibility和clean package smoke。下一步收口macOS `.app` / ICNS / Info.plist与Linux portable `bin+share` layout；三平台unsigned artifact都具备native identity后，再进入签名/notarization和Distribution Studio成品管线。
+V6a建立reproducible unsigned baseline，V6b-1把Clew identity嵌入Windows PE，V6b-2把同一identity扩到macOS `.app`/ICNS/Info.plist与Linux portable `bin+share` layout，并把manifest升级到逐文件hash的schema 2；Windows/macOS/Linux unsigned artifact现在都有native layout和真机解包smoke。下一步只做显式签名/notarization与验签边界；无凭据环境必须继续可复现地产出unsigned artifact，Distribution Studio成品管线继续后置。
 
 ### Change log
+
+- **2026-09-04** — V6b-2 macOS bundle + Linux portable layout DONE：release manifest升级schema 2并逐文件hashnative layout；macOS新增feature-gated `.app` launcher、Info.plist、deterministic 7-chunk ICNS及short Unix socket适配，macos-3dv0系统反读/plutil/iconutil/Mach-O/launcher smoke全过，dirty reproducible ZIP=`13b84efb...a6a2f`；Linux新增`bin+share/applications+share/icons` portable tree，desktop入口统一GUI且`desktop-file-validate`零输出，EL8 native ELF/CLI/SVG smoke全过，dirty reproducible ZIP=`24e04b16...b8ffe`；workspace **245/0/6**。下一块V6b-3 signing/notarization baseline。
 
 - **2026-09-04** — V6b-1 Windows native PE metadata/icon DONE：root build.rs由`assets/icons/app.svg`确定性生成multi-image ICO并嵌PE，同时写入Clew ProductName/description/internal/original filename与Cargo package version。release exe VersionInfo反读全匹配，associated icon可由Windows提取；删除clew target artifact后的两次dirty package SHA仍同为`d800c3e8...a2b8b`。实现commit `bd12538`后的clean artifact `dirty=false`，ZIP SHA=`ed99a58b...577e4`；workspace **243/0/6**。下一块V6b-2 macOS bundle + Linux portable layout。
 

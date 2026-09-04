@@ -7470,6 +7470,8 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "image",
+ "resvg",
  "serde",
  "serde_json",
  "sha2 0.11.0",

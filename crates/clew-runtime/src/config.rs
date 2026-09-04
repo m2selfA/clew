@@ -9,7 +9,7 @@ use thiserror::Error;
 const PIPE_NAME_DOMAIN: &[u8] = b"clew/local-api-pipe/v1\0";
 #[cfg(unix)]
 const UNIX_SOCKET_DOMAIN: &[u8] = b"clew/local-api-socket/v1\0";
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 const UNIX_SOCKET_SAFE_BYTES: usize = 96;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

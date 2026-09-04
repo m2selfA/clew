@@ -41,6 +41,19 @@ name = "clew"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+macos-app-launcher = []
+
+[[bin]]
+name = "clew"
+path = "src/main.rs"
+
+[[bin]]
+name = "clew-app"
+path = "src/bin/clew-app.rs"
+required-features = ["macos-app-launcher"]
+
 [dependencies]
 axum.workspace = true
 base64.workspace = true
