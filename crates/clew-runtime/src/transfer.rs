@@ -1,11 +1,16 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self as std_fs, File as StdFile, OpenOptions},
+    io::{Read as _, Write as _},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
-use clew_core::{ControllerId, DeviceId, SiteId, TransferId};
+use clew_core::{
+    ControllerId, DeviceId, MAX_STATE_DOCUMENT_SIZE, SiteId, StateCodecError, StateLayout,
+    TransferId, decode_state_json, encode_state_json,
+};
 use clew_transport::{
     FileConflictPolicy, FileResumeDescriptor, FileTransferChunk, FileTransferDirection,
     FileTransferErrorCode, FileTransferManifest, FileTransferPhase, FileTransferReply,
@@ -27,6 +32,7 @@ pub const HARD_MAX_CONTROLLER_FILE_TRANSFERS: usize = 16;
 pub const MAX_CONTROLLER_FILE_SOURCE_PATH_BYTES: usize = 4096;
 pub const MAX_CONTROLLER_FILE_DESTINATION_PATH_BYTES: usize = 4096;
 const REMOTE_CANCEL_WINDOW: Duration = Duration::from_secs(30);
+const CONTROLLER_TRANSFER_STATE_MAX_ENTRIES: usize = HARD_MAX_CONTROLLER_FILE_TRANSFERS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,18 +129,44 @@ struct ControllerFileTransferManagerInner {
     remote: RemoteHub,
     controller_id: ControllerId,
     transfers: Mutex<BTreeMap<TransferId, ControllerFileTransferEntry>>,
+    state_store: Option<ControllerFileTransferStateStore>,
 }
 
 #[derive(Debug)]
 enum ControllerFileTransferEntry {
     Put {
         info: FilePutInfo,
+        site_id: SiteId,
+        conflict_policy: FileConflictPolicy,
         cancel: watch::Sender<bool>,
     },
     Get {
         info: FileGetInfo,
+        site_id: SiteId,
+        conflict_policy: FileConflictPolicy,
         cancel: watch::Sender<bool>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ControllerFileTransferSnapshot {
+    controller_id: ControllerId,
+    generation: u64,
+    transfers: Vec<DurableControllerFileTransfer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DurableControllerFileTransfer {
+    site_id: SiteId,
+    conflict_policy: FileConflictPolicy,
+    info: FileTransferInfo,
+}
+
+#[derive(Debug)]
+struct ControllerFileTransferStateStore {
+    layout: StateLayout,
+    controller_id: ControllerId,
+    generation: Mutex<u64>,
 }
 
 impl ControllerFileTransferEntry {
@@ -164,10 +196,181 @@ impl ControllerFileTransferEntry {
             Self::Get { info, .. } => info.phase = ControllerFileTransferPhase::Cancelling,
         }
     }
+
+    fn durable_record(&self) -> DurableControllerFileTransfer {
+        match self {
+            Self::Put {
+                info,
+                site_id,
+                conflict_policy,
+                ..
+            } => DurableControllerFileTransfer {
+                site_id: *site_id,
+                conflict_policy: *conflict_policy,
+                info: FileTransferInfo::Put(info.clone()),
+            },
+            Self::Get {
+                info,
+                site_id,
+                conflict_policy,
+                ..
+            } => DurableControllerFileTransfer {
+                site_id: *site_id,
+                conflict_policy: *conflict_policy,
+                info: FileTransferInfo::Get(info.clone()),
+            },
+        }
+    }
+}
+
+impl ControllerFileTransferSnapshot {
+    fn validate(
+        &self,
+        expected_controller_id: ControllerId,
+    ) -> Result<(), ControllerFileTransferError> {
+        if self.controller_id != expected_controller_id {
+            return Err(ControllerFileTransferError::ControllerMismatch);
+        }
+        if self.transfers.len() > CONTROLLER_TRANSFER_STATE_MAX_ENTRIES {
+            return Err(ControllerFileTransferError::InvalidPersistedState(
+                "controller transfer journal exceeds the hard entry bound".into(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for record in &self.transfers {
+            let transfer_id = record.info.transfer_id();
+            if !ids.insert(transfer_id) {
+                return Err(ControllerFileTransferError::InvalidPersistedState(
+                    "controller transfer journal contains duplicate TransferId".into(),
+                ));
+            }
+            match &record.info {
+                FileTransferInfo::Put(info) => {
+                    validate_start_inputs(&info.source_path, &info.device_path, info.chunk_size)?;
+                    validate_persisted_progress(
+                        info.total_size,
+                        info.final_sha256.as_deref(),
+                        info.confirmed_offset,
+                    )?;
+                }
+                FileTransferInfo::Get(info) => {
+                    validate_get_start_inputs(
+                        &info.device_path,
+                        &info.destination_path,
+                        info.chunk_size,
+                    )?;
+                    validate_persisted_progress(
+                        info.total_size,
+                        info.final_sha256.as_deref(),
+                        info.confirmed_offset,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ControllerFileTransferStateStore {
+    fn load(
+        layout: StateLayout,
+        controller_id: ControllerId,
+    ) -> Result<(Self, ControllerFileTransferSnapshot), ControllerFileTransferError> {
+        let mut valid = Vec::new();
+        let mut first_error = None;
+        let mut any_present = false;
+        for path in [
+            layout.controller_file_transfer_slot_a_path(),
+            layout.controller_file_transfer_slot_b_path(),
+        ] {
+            match read_controller_transfer_slot(&path) {
+                ControllerTransferSlotRead::Missing => {}
+                ControllerTransferSlotRead::Valid(snapshot) => {
+                    any_present = true;
+                    match snapshot.validate(controller_id) {
+                        Ok(()) => valid.push(snapshot),
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                ControllerTransferSlotRead::Invalid(error) => {
+                    any_present = true;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if !valid.is_empty() {
+            valid.sort_by_key(|snapshot| snapshot.generation);
+            if valid.len() == 2 && valid[0].generation == valid[1].generation {
+                return Err(ControllerFileTransferError::StateGenerationConflict(
+                    valid[0].generation,
+                ));
+            }
+            let snapshot = valid.pop().expect("valid transfer snapshot exists");
+            let store = Self {
+                layout,
+                controller_id,
+                generation: Mutex::new(snapshot.generation),
+            };
+            return Ok((store, snapshot));
+        }
+        if any_present {
+            return Err(first_error.unwrap_or_else(|| {
+                ControllerFileTransferError::InvalidPersistedState(
+                    "controller transfer journal has no valid slot".into(),
+                )
+            }));
+        }
+        let snapshot = ControllerFileTransferSnapshot {
+            controller_id,
+            generation: 0,
+            transfers: Vec::new(),
+        };
+        let store = Self {
+            layout,
+            controller_id,
+            generation: Mutex::new(0),
+        };
+        Ok((store, snapshot))
+    }
+
+    fn persist(
+        &self,
+        transfers: &BTreeMap<TransferId, ControllerFileTransferEntry>,
+    ) -> Result<(), ControllerFileTransferError> {
+        let mut generation = self
+            .generation
+            .lock()
+            .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(ControllerFileTransferError::StateGenerationOverflow)?;
+        let snapshot = ControllerFileTransferSnapshot {
+            controller_id: self.controller_id,
+            generation: next_generation,
+            transfers: transfers
+                .values()
+                .map(ControllerFileTransferEntry::durable_record)
+                .collect(),
+        };
+        snapshot.validate(self.controller_id)?;
+        let path = if next_generation % 2 == 0 {
+            self.layout.controller_file_transfer_slot_a_path()
+        } else {
+            self.layout.controller_file_transfer_slot_b_path()
+        };
+        write_controller_transfer_slot(&path, &snapshot)?;
+        *generation = next_generation;
+        Ok(())
+    }
 }
 
 impl Drop for ControllerFileTransferManagerInner {
     fn drop(&mut self) {
+        if self.state_store.is_some() {
+            return;
+        }
         if let Ok(transfers) = self.transfers.get_mut() {
             for entry in transfers.values() {
                 let _ = entry.cancel_sender().send(true);
@@ -184,8 +387,184 @@ impl ControllerFileTransferManager {
                 remote,
                 controller_id,
                 transfers: Mutex::new(BTreeMap::new()),
+                state_store: None,
             }),
         }
+    }
+
+    pub fn load_or_create(
+        remote: RemoteHub,
+        controller_id: ControllerId,
+        layout: StateLayout,
+    ) -> Result<Self, ControllerFileTransferError> {
+        let (state_store, snapshot) =
+            ControllerFileTransferStateStore::load(layout, controller_id)?;
+        let manager = Self {
+            inner: Arc::new(ControllerFileTransferManagerInner {
+                remote,
+                controller_id,
+                transfers: Mutex::new(BTreeMap::new()),
+                state_store: Some(state_store),
+            }),
+        };
+        manager.restore_snapshot(snapshot)?;
+        Ok(manager)
+    }
+
+    fn persist_current(&self) -> Result<(), ControllerFileTransferError> {
+        let transfers = self
+            .inner
+            .transfers
+            .lock()
+            .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
+        if let Some(store) = &self.inner.state_store {
+            store.persist(&transfers)?;
+        }
+        Ok(())
+    }
+
+    fn restore_snapshot(
+        &self,
+        snapshot: ControllerFileTransferSnapshot,
+    ) -> Result<(), ControllerFileTransferError> {
+        snapshot.validate(self.inner.controller_id)?;
+        let mut resume_puts = Vec::new();
+        let mut cancel_puts = Vec::new();
+        {
+            let mut transfers = self
+                .inner
+                .transfers
+                .lock()
+                .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
+            for record in snapshot.transfers {
+                match record.info {
+                    FileTransferInfo::Put(mut info) => {
+                        let (cancel, cancel_rx) = watch::channel(false);
+                        if info.phase == ControllerFileTransferPhase::Cancelling {
+                            cancel_puts.push((info.transfer_id, info.device_id));
+                        } else if !info.phase.terminal() {
+                            info.phase = ControllerFileTransferPhase::WaitingForReconnect;
+                            info.error = None;
+                            resume_puts.push((
+                                info.transfer_id,
+                                info.device_id,
+                                record.site_id,
+                                info.source_path.clone(),
+                                info.device_path.clone(),
+                                info.chunk_size,
+                                record.conflict_policy,
+                                cancel_rx,
+                            ));
+                        }
+                        transfers.insert(
+                            info.transfer_id,
+                            ControllerFileTransferEntry::Put {
+                                info,
+                                site_id: record.site_id,
+                                conflict_policy: record.conflict_policy,
+                                cancel,
+                            },
+                        );
+                    }
+                    FileTransferInfo::Get(mut info) => {
+                        let (cancel, _cancel_rx) = watch::channel(false);
+                        if !info.phase.terminal() {
+                            info.phase = ControllerFileTransferPhase::Failed;
+                            info.error = Some(
+                                "Controller restart get resume awaits durable local part state"
+                                    .into(),
+                            );
+                        }
+                        transfers.insert(
+                            info.transfer_id,
+                            ControllerFileTransferEntry::Get {
+                                info,
+                                site_id: record.site_id,
+                                conflict_policy: record.conflict_policy,
+                                cancel,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        self.persist_current()?;
+        for (
+            transfer_id,
+            device_id,
+            site_id,
+            source_path,
+            device_path,
+            chunk_size,
+            conflict_policy,
+            cancel_rx,
+        ) in resume_puts
+        {
+            self.spawn_put_worker(
+                transfer_id,
+                device_id,
+                site_id,
+                source_path,
+                device_path,
+                chunk_size,
+                conflict_policy,
+                cancel_rx,
+            );
+        }
+        for (transfer_id, device_id) in cancel_puts {
+            let weak = Arc::downgrade(&self.inner);
+            let remote = self.inner.remote.clone();
+            tokio::spawn(async move {
+                cancel_remote(&weak, &remote, device_id, transfer_id).await;
+                if let Err(error) = persist_manager_state(&weak) {
+                    record_journal_warning(&weak, transfer_id, error.to_string());
+                }
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_put_worker(
+        &self,
+        transfer_id: TransferId,
+        device_id: DeviceId,
+        site_id: SiteId,
+        source_path: String,
+        device_path: String,
+        chunk_size: u32,
+        conflict_policy: FileConflictPolicy,
+        cancel_rx: watch::Receiver<bool>,
+    ) {
+        let weak = Arc::downgrade(&self.inner);
+        let remote = self.inner.remote.clone();
+        let controller_id = self.inner.controller_id;
+        tokio::spawn(async move {
+            let result = run_put_task(
+                weak.clone(),
+                remote.clone(),
+                controller_id,
+                transfer_id,
+                device_id,
+                site_id,
+                PathBuf::from(source_path),
+                device_path,
+                chunk_size,
+                conflict_policy,
+                cancel_rx,
+            )
+            .await;
+            match result {
+                Ok(()) => {}
+                Err(ControllerFileTransferError::Cancelled) => {
+                    cancel_remote(&weak, &remote, device_id, transfer_id).await;
+                }
+                Err(error) => set_failed(&weak, transfer_id, error.to_string()),
+            }
+            if let Err(error) = persist_manager_state(&weak) {
+                record_journal_warning(&weak, transfer_id, error.to_string());
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -230,37 +609,28 @@ impl ControllerFileTransferManager {
             transfer_id,
             ControllerFileTransferEntry::Put {
                 info: info.clone(),
+                site_id,
+                conflict_policy,
                 cancel,
             },
         );
         drop(transfers);
-
-        let weak = Arc::downgrade(&self.inner);
-        let remote = self.inner.remote.clone();
-        let controller_id = self.inner.controller_id;
-        tokio::spawn(async move {
-            let result = run_put_task(
-                weak.clone(),
-                remote.clone(),
-                controller_id,
-                transfer_id,
-                device_id,
-                site_id,
-                PathBuf::from(source_path),
-                device_path,
-                chunk_size,
-                conflict_policy,
-                cancel_rx,
-            )
-            .await;
-            match result {
-                Ok(()) => {}
-                Err(ControllerFileTransferError::Cancelled) => {
-                    cancel_remote(&weak, &remote, device_id, transfer_id).await;
-                }
-                Err(error) => set_failed(&weak, transfer_id, error.to_string()),
+        if let Err(error) = self.persist_current() {
+            if let Ok(mut transfers) = self.inner.transfers.lock() {
+                transfers.remove(&transfer_id);
             }
-        });
+            return Err(error);
+        }
+        self.spawn_put_worker(
+            transfer_id,
+            device_id,
+            site_id,
+            source_path,
+            device_path,
+            chunk_size,
+            conflict_policy,
+            cancel_rx,
+        );
         Ok(info)
     }
 
@@ -306,10 +676,18 @@ impl ControllerFileTransferManager {
             transfer_id,
             ControllerFileTransferEntry::Get {
                 info: info.clone(),
+                site_id,
+                conflict_policy,
                 cancel,
             },
         );
         drop(transfers);
+        if let Err(error) = self.persist_current() {
+            if let Ok(mut transfers) = self.inner.transfers.lock() {
+                transfers.remove(&transfer_id);
+            }
+            return Err(error);
+        }
 
         let weak = Arc::downgrade(&self.inner);
         let remote = self.inner.remote.clone();
@@ -338,6 +716,9 @@ impl ControllerFileTransferManager {
                     set_get_failed(&weak, transfer_id, error.to_string());
                     let _ = confirm_remote_cancel(&remote, device_id, transfer_id).await;
                 }
+            }
+            if let Err(error) = persist_manager_state(&weak) {
+                record_journal_warning(&weak, transfer_id, error.to_string());
             }
         });
         Ok(info)
@@ -370,9 +751,21 @@ impl ControllerFileTransferManager {
             .ok_or(ControllerFileTransferError::NotFound(transfer_id))?;
         if !entry.phase().terminal() {
             entry.mark_cancelling();
+        }
+        let info = entry.info();
+        drop(transfers);
+        self.persist_current()?;
+        let mut transfers = self
+            .inner
+            .transfers
+            .lock()
+            .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
+        if let Some(entry) = transfers.get_mut(&transfer_id)
+            && !entry.phase().terminal()
+        {
             let _ = entry.cancel_sender().send(true);
         }
-        Ok(entry.info())
+        Ok(info)
     }
 }
 
@@ -1276,6 +1669,45 @@ fn set_get_failed(
     });
 }
 
+fn persist_manager_state(
+    manager: &Weak<ControllerFileTransferManagerInner>,
+) -> Result<(), ControllerFileTransferError> {
+    let Some(manager) = manager.upgrade() else {
+        return Ok(());
+    };
+    let transfers = manager
+        .transfers
+        .lock()
+        .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
+    if let Some(store) = &manager.state_store {
+        store.persist(&transfers)?;
+    }
+    Ok(())
+}
+
+fn record_journal_warning(
+    manager: &Weak<ControllerFileTransferManagerInner>,
+    transfer_id: TransferId,
+    error: String,
+) {
+    let warning = truncate_error(format!(
+        "transfer state journal persistence failed: {error}"
+    ));
+    let Some(manager) = manager.upgrade() else {
+        return;
+    };
+    let Ok(mut transfers) = manager.transfers.lock() else {
+        return;
+    };
+    let Some(entry) = transfers.get_mut(&transfer_id) else {
+        return;
+    };
+    match entry {
+        ControllerFileTransferEntry::Put { info, .. } => info.error = Some(warning),
+        ControllerFileTransferEntry::Get { info, .. } => info.error = Some(warning),
+    }
+}
+
 fn truncate_error(mut error: String) -> String {
     const MAX_ERROR_BYTES: usize = 2048;
     if error.len() <= MAX_ERROR_BYTES {
@@ -1355,6 +1787,106 @@ fn prune_terminal(transfers: &mut BTreeMap<TransferId, ControllerFileTransferEnt
     }
 }
 
+fn validate_persisted_progress(
+    total_size: Option<u64>,
+    final_sha256: Option<&str>,
+    confirmed_offset: u64,
+) -> Result<(), ControllerFileTransferError> {
+    match (total_size, final_sha256) {
+        (None, None) if confirmed_offset == 0 => Ok(()),
+        (Some(total_size), Some(final_sha256)) => {
+            if confirmed_offset > total_size {
+                return Err(ControllerFileTransferError::InvalidPersistedState(
+                    "confirmed offset exceeds persisted total size".into(),
+                ));
+            }
+            if final_sha256.len() != 64
+                || !final_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                return Err(ControllerFileTransferError::InvalidPersistedState(
+                    "persisted final SHA-256 is not canonical lowercase hex".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(ControllerFileTransferError::InvalidPersistedState(
+            "persisted transfer progress is incomplete or inconsistent".into(),
+        )),
+    }
+}
+
+enum ControllerTransferSlotRead {
+    Missing,
+    Valid(ControllerFileTransferSnapshot),
+    Invalid(ControllerFileTransferError),
+}
+
+fn read_controller_transfer_slot(path: &Path) -> ControllerTransferSlotRead {
+    let mut file = match StdFile::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ControllerTransferSlotRead::Missing;
+        }
+        Err(error) => return ControllerTransferSlotRead::Invalid(error.into()),
+    };
+    let mut encoded = Vec::new();
+    if let Err(error) = std::io::Read::by_ref(&mut file)
+        .take((MAX_STATE_DOCUMENT_SIZE + 1) as u64)
+        .read_to_end(&mut encoded)
+    {
+        return ControllerTransferSlotRead::Invalid(error.into());
+    }
+    if encoded.len() > MAX_STATE_DOCUMENT_SIZE {
+        return ControllerTransferSlotRead::Invalid(
+            ControllerFileTransferError::InvalidPersistedState(
+                "controller transfer journal exceeds the state document hard bound".into(),
+            ),
+        );
+    }
+    match decode_state_json(&encoded) {
+        Ok(snapshot) => ControllerTransferSlotRead::Valid(snapshot),
+        Err(error) => ControllerTransferSlotRead::Invalid(error.into()),
+    }
+}
+
+fn write_controller_transfer_slot(
+    path: &Path,
+    snapshot: &ControllerFileTransferSnapshot,
+) -> Result<(), ControllerFileTransferError> {
+    let parent = path.parent().ok_or_else(|| {
+        ControllerFileTransferError::InvalidPersistedState(
+            "controller transfer journal path has no parent".into(),
+        )
+    })?;
+    std_fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std_fs::set_permissions(parent, std_fs::Permissions::from_mode(0o700))?;
+    }
+    let encoded = encode_state_json(snapshot)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std_fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    StdFile::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 fn digest_hex(digest: impl AsRef<[u8]>) -> String {
     digest
         .as_ref()
@@ -1369,6 +1901,14 @@ pub enum ControllerFileTransferError {
     StatePoisoned,
     #[error("Controller file transfer capacity is exhausted")]
     Capacity,
+    #[error("Controller file transfer state belongs to a different Controller")]
+    ControllerMismatch,
+    #[error("Controller file transfer persisted state is invalid: {0}")]
+    InvalidPersistedState(String),
+    #[error("Controller file transfer state has conflicting generation {0}")]
+    StateGenerationConflict(u64),
+    #[error("Controller file transfer state generation overflow")]
+    StateGenerationOverflow,
     #[error("file transfer {0} was not found")]
     NotFound(TransferId),
     #[error("Controller source path is invalid or too long")]
@@ -1409,6 +1949,201 @@ pub enum ControllerFileTransferError {
     Protocol(#[from] clew_transport::FileTransferError),
     #[error(transparent)]
     Resume(#[from] clew_transport::FileResumeError),
+    #[error(transparent)]
+    StateCodec(#[from] StateCodecError),
     #[error("Controller source I/O failed: {0}")]
     Io(#[from] std::io::Error),
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn durable_put_record(root: &Path) -> (DurableControllerFileTransfer, TransferId) {
+        let source = root.join("source.bin");
+        std::fs::write(&source, b"controller-transfer-journal").unwrap();
+        let transfer_id = TransferId::new();
+        (
+            DurableControllerFileTransfer {
+                site_id: SiteId::new(),
+                conflict_policy: FileConflictPolicy::FailIfExists,
+                info: FileTransferInfo::Put(FilePutInfo {
+                    transfer_id,
+                    device_id: DeviceId::new(),
+                    source_path: source.to_string_lossy().into_owned(),
+                    device_path: "/device/target.bin".into(),
+                    phase: ControllerFileTransferPhase::Preparing,
+                    chunk_size: MIN_FILE_CHUNK_BYTES,
+                    total_size: None,
+                    final_sha256: None,
+                    confirmed_offset: 0,
+                    final_device_path: None,
+                    error: None,
+                }),
+            },
+            transfer_id,
+        )
+    }
+
+    #[test]
+    fn controller_transfer_journal_recovers_previous_valid_slot_and_rejects_bad_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = StateLayout::new(temp.path());
+        let controller_id = ControllerId::new();
+        let (record, transfer_id) = durable_put_record(temp.path());
+        let (store, initial) =
+            ControllerFileTransferStateStore::load(layout.clone(), controller_id).unwrap();
+        assert_eq!(initial.generation, 0);
+        assert!(initial.transfers.is_empty());
+
+        let (cancel, _) = watch::channel(false);
+        let mut transfers = BTreeMap::new();
+        let FileTransferInfo::Put(info) = record.info.clone() else {
+            unreachable!();
+        };
+        transfers.insert(
+            transfer_id,
+            ControllerFileTransferEntry::Put {
+                info,
+                site_id: record.site_id,
+                conflict_policy: record.conflict_policy,
+                cancel,
+            },
+        );
+        store.persist(&transfers).unwrap();
+        if let Some(ControllerFileTransferEntry::Put { info, .. }) = transfers.get_mut(&transfer_id)
+        {
+            info.phase = ControllerFileTransferPhase::WaitingForReconnect;
+        }
+        store.persist(&transfers).unwrap();
+        assert!(matches!(
+            ControllerFileTransferStateStore::load(layout.clone(), ControllerId::new()),
+            Err(ControllerFileTransferError::ControllerMismatch)
+        ));
+
+        let newest = layout.controller_file_transfer_slot_a_path();
+        std::fs::write(&newest, b"{broken").unwrap();
+        let (_reloaded, recovered) =
+            ControllerFileTransferStateStore::load(layout.clone(), controller_id).unwrap();
+        assert_eq!(recovered.generation, 1);
+        assert_eq!(recovered.transfers.len(), 1);
+        assert_eq!(recovered.transfers[0].info.transfer_id(), transfer_id);
+
+        let duplicate = ControllerFileTransferSnapshot {
+            controller_id,
+            generation: 7,
+            transfers: vec![record.clone(), record.clone()],
+        };
+        assert!(matches!(
+            duplicate.validate(controller_id),
+            Err(ControllerFileTransferError::InvalidPersistedState(_))
+        ));
+
+        let mut invalid = record;
+        let FileTransferInfo::Put(info) = &mut invalid.info else {
+            unreachable!();
+        };
+        info.total_size = Some(10);
+        info.final_sha256 = None;
+        let invalid = ControllerFileTransferSnapshot {
+            controller_id,
+            generation: 8,
+            transfers: vec![invalid],
+        };
+        assert!(matches!(
+            invalid.validate(controller_id),
+            Err(ControllerFileTransferError::InvalidPersistedState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_manager_reloads_active_put_and_fails_active_get_until_part_state_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = StateLayout::new(temp.path().join("state"));
+        let source = temp.path().join("source.bin");
+        std::fs::write(&source, vec![0x5a; 8_192]).unwrap();
+        let controller_id = ControllerId::new();
+        let device_id = DeviceId::new();
+        let site_id = SiteId::new();
+        let first = ControllerFileTransferManager::load_or_create(
+            RemoteHub::default(),
+            controller_id,
+            layout.clone(),
+        )
+        .unwrap();
+        let put = first
+            .start_put(
+                device_id,
+                site_id,
+                source.to_string_lossy().into_owned(),
+                "/device/target.bin".into(),
+                MIN_FILE_CHUNK_BYTES,
+                FileConflictPolicy::FailIfExists,
+            )
+            .unwrap();
+        drop(first);
+
+        let second = ControllerFileTransferManager::load_or_create(
+            RemoteHub::default(),
+            controller_id,
+            layout.clone(),
+        )
+        .unwrap();
+        let FileTransferInfo::Put(reloaded) = second.status(put.transfer_id).unwrap() else {
+            panic!("expected durable Put projection");
+        };
+        assert_eq!(reloaded.transfer_id, put.transfer_id);
+        assert_eq!(reloaded.source_path, put.source_path);
+        assert_eq!(reloaded.device_path, put.device_path);
+        assert_eq!(
+            reloaded.phase,
+            ControllerFileTransferPhase::WaitingForReconnect
+        );
+
+        let get_id = TransferId::new();
+        let get_record = DurableControllerFileTransfer {
+            site_id,
+            conflict_policy: FileConflictPolicy::FailIfExists,
+            info: FileTransferInfo::Get(FileGetInfo {
+                transfer_id: get_id,
+                device_id,
+                device_path: "/device/source.bin".into(),
+                destination_path: temp
+                    .path()
+                    .join("download.bin")
+                    .to_string_lossy()
+                    .into_owned(),
+                phase: ControllerFileTransferPhase::Running,
+                chunk_size: MIN_FILE_CHUNK_BYTES,
+                total_size: Some(8_192),
+                final_sha256: Some("ab".repeat(32)),
+                confirmed_offset: MIN_FILE_CHUNK_BYTES as u64,
+                final_controller_path: None,
+                error: None,
+            }),
+        };
+        let snapshot = ControllerFileTransferSnapshot {
+            controller_id,
+            generation: 20,
+            transfers: vec![get_record],
+        };
+        snapshot.validate(controller_id).unwrap();
+        write_controller_transfer_slot(&layout.controller_file_transfer_slot_a_path(), &snapshot)
+            .unwrap();
+        let third = ControllerFileTransferManager::load_or_create(
+            RemoteHub::default(),
+            controller_id,
+            layout,
+        )
+        .unwrap();
+        let FileTransferInfo::Get(reloaded_get) = third.status(get_id).unwrap() else {
+            panic!("expected durable Get projection");
+        };
+        assert_eq!(reloaded_get.phase, ControllerFileTransferPhase::Failed);
+        assert!(
+            reloaded_get
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("durable local part state"))
+        );
+    }
 }

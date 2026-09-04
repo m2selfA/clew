@@ -112,6 +112,16 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn controller_file_transfer_slot_a_path(&self) -> PathBuf {
+        self.version_root().join("controller-file-transfers.a.json")
+    }
+
+    #[must_use]
+    pub fn controller_file_transfer_slot_b_path(&self) -> PathBuf {
+        self.version_root().join("controller-file-transfers.b.json")
+    }
+
+    #[must_use]
     pub fn outfit_library_slot_a_path(&self) -> PathBuf {
         self.version_root().join("outfit-library.a.json")
     }
@@ -198,6 +208,17 @@ impl StateLayout {
         self.membership_dir(controller_id, site_id)
             .join("host")
             .join("nearby-connector.export.json")
+    }
+
+    #[must_use]
+    pub fn host_file_transfers_root(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("file-transfers")
     }
 
     #[must_use]

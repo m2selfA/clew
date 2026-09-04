@@ -1200,7 +1200,20 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 - 真实 8MiB/4KiB reconnect gate：transfer `35bb9c77-4548-4671-95df-f431572dcbdf` 在 generation **1** confirmed_offset **2,375,680** 时启用仅 Gamma `clew.exe` 的 program-scoped outbound block，随后观测同一 Device generation **2**；同一 TransferId confirmed_offset 继续增长到 **8,351,744**（未回0），最终 **8,388,608/8,388,608 Completed**，Controller final SHA=`a5e85ff850b4329a754123d2093d7212620299565775fbd23c49f3b9a1dcb3ad` 与 Gamma source精确一致。此次查询未捕到瞬时 WaitingForReconnect，因此不冒充该瞬时状态证据；generation变化+offset单调续传+最终SHA是正式resume证据；
 - focused：transport file-transfer **6/6 PASS**；Host put/get **3/3 PASS**；Controller Get manifest re-proof/reconnect **1/1 PASS**。final `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS / 0 warnings；`cargo test --workspace --all-targets` **208 passed / 0 failed / 6 ignored**；测试清单总数 214；所有 Gamma/local fixture、program-scoped firewall rule与test jobs均已清理。
 
-V5 single-file双向 data plane至此封板。当前 resume仍只保证同进程的 InnerSession generation变化；Controller/Host进程重启后的 task/part/source state尚未durable恢复，因此 `Feature::FileResume` 继续保持reserved/not-implemented。下一块 V5a-3：process-restart durable single-file transfer state；通过后再评估是否开启 FileResume feature，最后才进入 directory tree 与 bounded multi-transfer concurrency。
+V5 single-file双向 data plane至此封板。当前 resume仍只保证同进程的 InnerSession generation变化；Controller/Host进程重启后的 task/part/source state继续按 V5a-3 分块收口。`Feature::FileResume` 在 Controller/Host 两端 restart gate全部通过前继续保持reserved/not-implemented。
+
+### V5a-3a — Controller durable transfer journal foundation
+
+**Status：DONE（2026-09-04）**
+
+- Controller file-transfer manager新增独立双槽 generation journal `controller-file-transfers.{a,b}.json`，仍使用全局 state envelope/document hard bound；journal最多 **16 transfers**，TransferId重复、progress字段不一致、非canonical SHA等在load阶段fail closed；
+- journal显式绑定当前 `ControllerId`。旧/异Controller identity的transfer state不能被新Controller静默接管；wrong Controller focused直接 `ControllerMismatch`。如果newest slot损坏，仍可回退到上一份完整有效generation；两份同generation冲突直接拒绝；
+- Controller startup改为`ControllerFileTransferManager::load_or_create(...)`。active Put在Controller重启后恢复为`WaitingForReconnect`并重建worker；它不信任journal里的旧confirmed offset，而是在Host重新在线后用既有Status/manifest规则对齐真实part checkpoint，因此无需每4KiB重写整份Controller journal；
+- cancel状态在发cancel signal前先journal化；task终态再persist。durable manager存在时Drop不再把transfer当“CLI/session owned task”统一取消，符合Controller长期ownership；非durable test manager继续保持旧Drop cleanup；
+- active Get在本块**故意**恢复为Failed并写清`durable local part state`尚未实现；不拿只有metadata的journal冒充Controller-local `.part + prefix checkpoint` durability。Host自身put/get store也仍未durable，因此FileResume feature继续reserved；
+- focused journal/identity/corruption fallback **1/1 PASS**，durable manager active-Put restore + active-Get explicit fail **1/1 PASS**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **210 passed / 0 failed / 6 ignored**。
+
+下一块 V5a-3b：Controller Get durable local part/checkpoint。Controller重启后必须重开同目录私有part，验证长度/streaming prefix SHA，并在新session重新GetBegin证明source manifest不变后从本地durable offset继续；完成后再做Host put/get process-restart durability。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1279,13 +1292,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；single-file put/get + generation resume DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；single-file put/get + generation resume + V5a-3a Controller journal DONE）**
 
-**Next block：V5a-3 — process-restart durable single-file transfer state**
+**Next block：V5a-3b — Controller Get durable local part/checkpoint**
 
-V4已在`dfa373d`完整封板。V5a现在已经闭合双向single-file data plane：put由Controller持有私有source、Host持有part/checkpoint；get由Host持有source handle/manifest、Controller持有私有destination/temp/checkpoint；两方向都已在真实Gamma上证明session generation变化后同TransferId继续并final SHA一致，default read-only Get正向且Put Denied。V5当前唯一single-file resume缺口收窄为Controller/Host **process restart durability**；在该gate闭合前FileResume feature继续reserved，不提前进入directory或多transfer调度。
+V4已在`dfa373d`完整封板。V5a双向single-file data plane与generation resume已闭合；V5a-3a又把Controller transfer projection升级成ControllerId-bound双槽durable journal，并允许active Put跨Controller restart恢复。当前明确缺口只剩Controller Get本地part/checkpoint与Host put/get process-restart state；两端都闭合前`Feature::FileResume`继续reserved，不进入directory/multi-transfer调度。
 
 ### Change log
+
+- **2026-09-04** — V5a-3a Controller durable transfer journal DONE：新增ControllerId-bound双槽generation journal、16-entry/document bounds、newest corruption fallback/duplicate generation fail closed；Controller startup恢复active Put为WaitingForReconnect并重建worker，active Get因尚无durable local part明确Failed。wrong Controller与corruption focused PASS；workspace **210/0/6**。下一块V5a-3b Controller Get durable part/checkpoint；FileResume仍reserved。
 
 - **2026-09-04** — V5a-2 Device→Controller single-file get + cross-generation resume DONE：同一file_transfer RPC新增GetBegin/GetChunk，Host readonly can_get/can_put分权，Controller私有destination/temp/checkpoint与manifest re-proof resume；default read-only Gamma 102,523-byte Get SHA一致且同设备Put Denied。8MiB/4KiB真实gate从generation1/offset2,375,680经program-scoped断线到generation2，原TransferId offset继续到8,351,744并Completed 8,388,608，Controller final SHA=`a5e85ff8...b3ad`。真实fresh enrollment同时暴露Windows inline iroh direct dial main-stack overflow，改为JoinSet worker后cap00/Gamma均恢复，不增大线程栈。workspace **208/0/6**。下一块V5a-3 process-restart durable state；FileResume仍reserved。
 

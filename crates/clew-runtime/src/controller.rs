@@ -172,8 +172,11 @@ pub async fn start_controller(
     let forwards = crate::TcpForwardManager::new(remote_hub.clone());
     let socks5 = crate::Socks5ProxyManager::new(remote_hub.clone());
     let http_connect = crate::HttpConnectProxyManager::new(remote_hub.clone());
-    let file_transfers =
-        crate::ControllerFileTransferManager::new(remote_hub.clone(), controller_id);
+    let file_transfers = crate::ControllerFileTransferManager::load_or_create(
+        remote_hub.clone(),
+        controller_id,
+        layout.clone(),
+    )?;
 
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
@@ -233,6 +236,8 @@ pub enum ControllerError {
     OutfitStore(#[from] crate::OutfitStoreError),
     #[error(transparent)]
     OutfitAsset(#[from] crate::OutfitAssetError),
+    #[error(transparent)]
+    FileTransfer(#[from] crate::ControllerFileTransferError),
     #[error(transparent)]
     RemoteTransport(#[from] clew_transport::IrohOuterError),
     #[error("remote accept loop stopped unexpectedly")]
