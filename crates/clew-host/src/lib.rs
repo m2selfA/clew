@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod directory_tree;
 mod file_transfer;
 mod forward;
 mod instance;
@@ -15,6 +16,10 @@ mod site;
 mod ui;
 
 pub use clew_core::{DeviceSelectionError, select_executable_device};
+pub use directory_tree::{
+    DirectoryTreeScanError, ScannedDirectoryTree, scan_authorized_directory_tree,
+    scan_directory_tree,
+};
 pub use file_transfer::{
     HARD_MAX_HOST_FILE_TRANSFERS, HostFileTransferService, HostFileTransferStateError,
 };

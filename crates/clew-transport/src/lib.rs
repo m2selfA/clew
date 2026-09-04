@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod connector;
+mod directory_tree;
 mod discovery;
 mod file_resume;
 mod file_transfer;
@@ -21,6 +22,12 @@ pub use connector::{
     ConnectorTunnelPurpose, MAX_CONNECTOR_CONTROL_FRAME_BYTES, OpaqueForwardStats,
     forward_opaque_bidirectional, read_connector_open, read_connector_ready, write_connector_open,
     write_connector_ready,
+};
+pub use directory_tree::{
+    DIRECTORY_TREE_MANIFEST_VERSION, DirectoryConflictPolicy, DirectoryTreeEntry,
+    DirectoryTreeEntryKind, DirectoryTreeError, DirectoryTreeManifest, MAX_DIRECTORY_DEPTH,
+    MAX_DIRECTORY_FILE_BYTES, MAX_DIRECTORY_RELATIVE_PATH_BYTES, MAX_DIRECTORY_TOTAL_BYTES,
+    MAX_DIRECTORY_TREE_ENTRIES, MAX_DIRECTORY_TREE_MANIFEST_BYTES, validate_relative_path,
 };
 pub use discovery::{
     ConnectorCandidate, ConnectorDiscoveryAdvertisement, ConnectorDiscoveryError,
