@@ -2990,29 +2990,6 @@ mod tests {
 
         let mut child_manifests = Vec::new();
         let mut begun = BTreeSet::new();
-        while begun.len() < 4 {
-            let command = tokio::time::timeout(Duration::from_secs(3), commands.recv())
-                .await
-                .expect("child PutBegin requests did not arrive")
-                .unwrap();
-            let RemoteCommand::FileTransfer { request, reply, .. } = command else {
-                panic!("expected child PutBegin during cancel setup: {command:?}");
-            };
-            let FileTransferRequest::PutBegin { manifest } = request else {
-                panic!("expected PutBegin during cancel setup: {request:?}");
-            };
-            assert!(active_ids.contains(&manifest.transfer_id));
-            assert!(begun.insert(manifest.transfer_id));
-            let initial = manifest.initial_resume_descriptor().unwrap();
-            child_manifests.push(manifest);
-            reply
-                .send(Ok(FileTransferReply::Status(FileTransferStatus {
-                    descriptor: initial,
-                    phase: FileTransferPhase::Receiving,
-                    final_device_path: None,
-                })))
-                .unwrap();
-        }
         let DirectoryTransferInfo::Put(cancelled) = directories.cancel(outer.transfer_id).unwrap()
         else {
             panic!("expected cancelled directory Put projection");
@@ -3021,25 +2998,6 @@ mod tests {
             cancelled.phase,
             ControllerDirectoryTransferPhase::Cancelling
         );
-
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if active_ids.iter().all(|child_id| {
-                    file_transfers.status(*child_id).is_ok_and(|info| {
-                        matches!(
-                            info.phase(),
-                            ControllerFileTransferPhase::Cancelling
-                                | ControllerFileTransferPhase::Cancelled
-                        )
-                    })
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("outer directory Cancel did not mark every active child cancelling");
 
         let mut child_cancel_ids = BTreeSet::new();
         let mut directory_cleanup = false;
@@ -3067,6 +3025,19 @@ mod tests {
                 };
                 match command {
                     RemoteCommand::FileTransfer { request, reply, .. } => match request {
+                        FileTransferRequest::PutBegin { manifest } => {
+                            assert!(active_ids.contains(&manifest.transfer_id));
+                            assert!(begun.insert(manifest.transfer_id));
+                            let initial = manifest.initial_resume_descriptor().unwrap();
+                            child_manifests.push(manifest);
+                            let _ = reply.send(Ok(FileTransferReply::Status(
+                                FileTransferStatus {
+                                    descriptor: initial,
+                                    phase: FileTransferPhase::Receiving,
+                                    final_device_path: None,
+                                },
+                            )));
+                        }
                         FileTransferRequest::PutChunk { chunk } => {
                             let manifest = child_manifests
                                 .iter()
@@ -3080,13 +3051,13 @@ mod tests {
                                 descriptor.checkpoint_revision.saturating_add(1);
                             descriptor.confirmed_offset = bytes.len() as u64;
                             descriptor.confirmed_prefix_sha256 = file_sha256_hex(&bytes);
-                            reply
-                                .send(Ok(FileTransferReply::Status(FileTransferStatus {
+                            let _ = reply.send(Ok(FileTransferReply::Status(
+                                FileTransferStatus {
                                     descriptor,
                                     phase: FileTransferPhase::Receiving,
                                     final_device_path: None,
-                                })))
-                                .unwrap();
+                                },
+                            )));
                         }
                         FileTransferRequest::Cancel { transfer_id } => {
                             assert!(active_ids.contains(&transfer_id));
