@@ -960,7 +960,7 @@ async fn serve_networked_membership_with_outer_timing(
         .as_ref()
         .is_some_and(|grant| grant.tcp_egress);
     let tcp_forward_service = tcp_egress_allowed.then(HostTcpForwardService::new);
-    let directory_tree_service = if write_allowed {
+    let directory_tree_service = if read_allowed || write_allowed {
         service
             .as_ref()
             .map(|read_service| {
@@ -969,7 +969,8 @@ async fn serve_networked_membership_with_outer_timing(
                     membership.marker.controller.controller_id,
                     membership.marker.site_id,
                     membership.marker.device_id,
-                    true,
+                    read_allowed,
+                    write_allowed,
                 )
             })
             .transpose()?
@@ -1052,15 +1053,16 @@ async fn serve_networked_membership_with_outer_timing(
                         "directory_tree" => {
                             let reply = match (
                                 directory_tree_service.as_ref(),
-                                write_allowed,
                                 DirectoryTreeRequest::from_message(&message),
                             ) {
-                                (Some(service), true, Ok(request)) => service.execute(request, true).await,
-                                (_, false, Ok(_)) | (None, true, Ok(_)) => DirectoryTreeReply::error(
+                                (Some(service), Ok(request)) => {
+                                    service.execute(request, read_allowed, write_allowed).await
+                                }
+                                (None, Ok(_)) => DirectoryTreeReply::error(
                                     DirectoryTreeErrorCode::Denied,
-                                    "directory Put is not permitted by this device grant",
+                                    "directory transfer is not permitted by this device grant",
                                 ),
-                                (_, _, Err(_)) => DirectoryTreeReply::error(
+                                (_, Err(_)) => DirectoryTreeReply::error(
                                     DirectoryTreeErrorCode::InvalidRequest,
                                     "malformed bounded directory tree request",
                                 ),

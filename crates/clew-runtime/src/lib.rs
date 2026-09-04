@@ -25,7 +25,8 @@ pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerContro
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
 pub use directory_transfer::{
     ControllerDirectoryTransferError, ControllerDirectoryTransferManager,
-    ControllerDirectoryTransferPhase, DirectoryPutInfo, HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS,
+    ControllerDirectoryTransferPhase, DirectoryGetInfo, DirectoryPutInfo, DirectoryTransferInfo,
+    HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS,
 };
 pub use forward::{
     ForwardInfo, HARD_MAX_FORWARD_LISTENERS, TcpForwardManager, TcpForwardManagerError,
@@ -41,11 +42,11 @@ pub use local_api::{
     MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteDirectoryPutRequest, RemoteEditRequest,
-    RemoteFileGetRequest, RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest,
-    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo,
-    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
-    Socks5List,
+    OutfitUpdateRequest, RecoveryStatus, RemoteDirectoryGetRequest, RemoteDirectoryPutRequest,
+    RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest, RemoteGlobRequest,
+    RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult,
+    RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
+    Socks5AddRequest, Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,

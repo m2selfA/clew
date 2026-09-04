@@ -24,10 +24,10 @@ use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, FileConflictPolicy, ForwardAddRequest,
     FsWritePrecondition, HttpConnectAddRequest, InviteIssueRequest, LocalApiClient,
     OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteDirectoryPutRequest, RemoteEditRequest, RemoteFileGetRequest,
-    RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
-    RemoteReadRequest, RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
-    Socks5AddRequest, restore_controller_backup, start_controller,
+    OutfitSetFieldRequest, RemoteDirectoryGetRequest, RemoteDirectoryPutRequest, RemoteEditRequest,
+    RemoteFileGetRequest, RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest,
+    RemotePathInfoRequest, RemoteReadRequest, RemoteShellAttachRequest, RemoteShellStartRequest,
+    RemoteWriteRequest, Socks5AddRequest, restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -430,7 +430,7 @@ enum FileCommand {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
-    /// Start one device-to-Controller single-file download. The optional device uses shared selector semantics.
+    /// Start one device-to-Controller download. Use --directory for a bounded serial directory Get.
     Get {
         #[arg(value_name = "DEVICE")]
         device: Option<String>,
@@ -442,10 +442,13 @@ enum FileCommand {
         chunk_size: u32,
         #[arg(long, value_enum, default_value = "fail")]
         conflict: FileConflictArg,
+        /// Treat SOURCE/DEST as a directory tree. Directory Get currently supports fail-if-exists only.
+        #[arg(long)]
+        directory: bool,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
-    /// Show Controller-owned progress for one transfer. Use --directory for a directory Put.
+    /// Show Controller-owned progress for one transfer. Use --directory for a directory transfer.
     Status {
         transfer_id: TransferId,
         #[arg(long)]
@@ -453,7 +456,7 @@ enum FileCommand {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
-    /// Request bounded cancellation for one transfer. Use --directory for a directory Put.
+    /// Request bounded cancellation for one transfer. Use --directory for a directory transfer.
     Cancel {
         transfer_id: TransferId,
         #[arg(long)]
@@ -1014,6 +1017,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 source,
                 dest,
                 chunk_size,
+                directory,
                 conflict,
                 state_dir,
             } => {
@@ -1029,16 +1033,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let client = LocalApiClient::new(controller_config(state_dir)?);
                 let devices = client.device_list().await?;
                 let device_id = select_executable_device(&devices.devices, device.as_deref())?;
-                let info = client
-                    .file_get(RemoteFileGetRequest {
-                        device_id,
-                        device_path: source,
-                        destination_path,
-                        chunk_size,
-                        conflict_policy: conflict.into(),
-                    })
-                    .await?;
-                println!("{}", serde_json::to_string_pretty(&info)?);
+                if directory {
+                    if !matches!(conflict, FileConflictArg::Fail) {
+                        return Err("directory Get currently supports --conflict fail only".into());
+                    }
+                    let info = client
+                        .directory_get(RemoteDirectoryGetRequest {
+                            device_id,
+                            device_root: source,
+                            destination_path,
+                            chunk_size,
+                        })
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                } else {
+                    let info = client
+                        .file_get(RemoteFileGetRequest {
+                            device_id,
+                            device_path: source,
+                            destination_path,
+                            chunk_size,
+                            conflict_policy: conflict.into(),
+                        })
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
             }
             FileCommand::Status {
                 transfer_id,

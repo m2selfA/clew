@@ -282,25 +282,71 @@ fn validate_sha256(value: &str) -> Result<(), DirectoryTreeError> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryTreeGetScope {
+    pub transfer_id: TransferId,
+    pub controller_id: ControllerId,
+    pub site_id: SiteId,
+    pub device_id: DeviceId,
+    pub device_root: String,
+}
+
+impl DirectoryTreeGetScope {
+    pub fn new(
+        transfer_id: TransferId,
+        controller_id: ControllerId,
+        site_id: SiteId,
+        device_id: DeviceId,
+        device_root: impl Into<String>,
+    ) -> Result<Self, DirectoryTreeError> {
+        let scope = Self {
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            device_root: device_root.into(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub fn validate(&self) -> Result<(), DirectoryTreeError> {
+        validate_device_root(&self.device_root)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum DirectoryTreeRequest {
     PreparePut { manifest: DirectoryTreeManifest },
     FinalizePut { manifest: DirectoryTreeManifest },
     CancelPut { manifest: DirectoryTreeManifest },
+    PrepareGet { scope: DirectoryTreeGetScope },
+    FinalizeGet { manifest: DirectoryTreeManifest },
 }
 
 impl DirectoryTreeRequest {
     pub fn validate(&self) -> Result<(), DirectoryTreeError> {
-        let manifest = match self {
+        match self {
             Self::PreparePut { manifest }
             | Self::FinalizePut { manifest }
-            | Self::CancelPut { manifest } => manifest,
-        };
-        manifest.validate()?;
-        if manifest.direction != FileTransferDirection::ControllerToDevice
-            || manifest.device_conflict_policy != Some(DirectoryConflictPolicy::FailIfExists)
-        {
-            return Err(DirectoryTreeError::InvalidPutRequest);
+            | Self::CancelPut { manifest } => {
+                manifest.validate()?;
+                if manifest.direction != FileTransferDirection::ControllerToDevice
+                    || manifest.device_conflict_policy
+                        != Some(DirectoryConflictPolicy::FailIfExists)
+                {
+                    return Err(DirectoryTreeError::InvalidPutRequest);
+                }
+            }
+            Self::PrepareGet { scope } => scope.validate()?,
+            Self::FinalizeGet { manifest } => {
+                manifest.validate()?;
+                if manifest.direction != FileTransferDirection::DeviceToController
+                    || manifest.device_conflict_policy.is_some()
+                {
+                    return Err(DirectoryTreeError::InvalidGetRequest);
+                }
+            }
         }
         Ok(())
     }
@@ -355,6 +401,13 @@ pub enum DirectoryTreeReply {
         transfer_id: TransferId,
         staging_device_root: String,
     },
+    Manifest {
+        manifest: DirectoryTreeManifest,
+    },
+    Verified {
+        transfer_id: TransferId,
+        device_root: String,
+    },
     Completed {
         transfer_id: TransferId,
         final_device_root: String,
@@ -407,6 +460,16 @@ fn validate_directory_reply(reply: &DirectoryTreeReply) -> Result<(), DirectoryT
             staging_device_root,
             ..
         } => validate_device_root(staging_device_root),
+        DirectoryTreeReply::Manifest { manifest } => {
+            manifest.validate()?;
+            if manifest.direction != FileTransferDirection::DeviceToController
+                || manifest.device_conflict_policy.is_some()
+            {
+                return Err(DirectoryTreeError::InvalidGetRequest);
+            }
+            Ok(())
+        }
+        DirectoryTreeReply::Verified { device_root, .. } => validate_device_root(device_root),
         DirectoryTreeReply::Completed {
             final_device_root, ..
         } => validate_device_root(final_device_root),
@@ -464,6 +527,10 @@ pub enum DirectoryTreeError {
         "directory tree Put control request must be Controller-to-device with fail-if-exists policy"
     )]
     InvalidPutRequest,
+    #[error(
+        "directory tree Get control request must be Device-to-controller and keep Controller conflict policy private"
+    )]
+    InvalidGetRequest,
     #[error("directory tree RPC payload exceeds {MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES} bytes: {0}")]
     RpcPayloadTooLarge(usize),
     #[error("unexpected directory tree message kind: {0}")]
@@ -572,6 +639,83 @@ mod tests {
         assert!(matches!(
             DirectoryTreeRequest::from_message(&oversized),
             Err(DirectoryTreeError::RpcPayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn directory_get_control_keeps_controller_destination_private_and_roundtrips() {
+        let (transfer_id, controller_id, site_id, device_id) = ids();
+        let scope = DirectoryTreeGetScope::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            "D:/device/source",
+        )
+        .unwrap();
+        let prepare = DirectoryTreeRequest::PrepareGet {
+            scope: scope.clone(),
+        };
+        let encoded = prepare.clone().into_message().unwrap();
+        assert!(!String::from_utf8_lossy(&encoded.payload).contains("controller-destination"));
+        assert_eq!(
+            DirectoryTreeRequest::from_message(&encoded).unwrap(),
+            prepare
+        );
+
+        let manifest = DirectoryTreeManifest::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::DeviceToController,
+            scope.device_root.clone(),
+            vec![
+                DirectoryTreeEntry::file("a.txt", 1, "11".repeat(32)).unwrap(),
+                DirectoryTreeEntry::directory("nested").unwrap(),
+                DirectoryTreeEntry::file("nested/b.txt", 2, "22".repeat(32)).unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        let manifest_reply = DirectoryTreeReply::Manifest {
+            manifest: manifest.clone(),
+        };
+        assert_eq!(
+            DirectoryTreeReply::from_message(&manifest_reply.clone().into_message().unwrap())
+                .unwrap(),
+            manifest_reply
+        );
+        let finalize = DirectoryTreeRequest::FinalizeGet {
+            manifest: manifest.clone(),
+        };
+        assert_eq!(
+            DirectoryTreeRequest::from_message(&finalize.clone().into_message().unwrap()).unwrap(),
+            finalize
+        );
+        let verified = DirectoryTreeReply::Verified {
+            transfer_id,
+            device_root: scope.device_root.clone(),
+        };
+        assert_eq!(
+            DirectoryTreeReply::from_message(&verified.clone().into_message().unwrap()).unwrap(),
+            verified
+        );
+
+        let wrong = DirectoryTreeManifest::new(
+            TransferId::new(),
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            "D:/device/destination",
+            vec![],
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+        assert!(matches!(
+            DirectoryTreeRequest::FinalizeGet { manifest: wrong }.validate(),
+            Err(DirectoryTreeError::InvalidGetRequest)
         ));
     }
 

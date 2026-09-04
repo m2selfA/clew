@@ -208,6 +208,7 @@ pub struct HostDirectoryTreeService {
     controller_id: ControllerId,
     site_id: SiteId,
     device_id: DeviceId,
+    can_get: bool,
     can_put: bool,
 }
 
@@ -217,6 +218,7 @@ impl HostDirectoryTreeService {
         controller_id: ControllerId,
         site_id: SiteId,
         device_id: DeviceId,
+        can_get: bool,
         can_put: bool,
     ) -> Result<Self, DirectoryTreeScanError> {
         policy.validate()?;
@@ -225,6 +227,7 @@ impl HostDirectoryTreeService {
             controller_id,
             site_id,
             device_id,
+            can_get,
             can_put,
         })
     }
@@ -232,6 +235,7 @@ impl HostDirectoryTreeService {
     pub async fn execute(
         &self,
         request: DirectoryTreeRequest,
+        allow_read: bool,
         allow_write: bool,
     ) -> DirectoryTreeReply {
         if request.validate().is_err() {
@@ -240,10 +244,18 @@ impl HostDirectoryTreeService {
                 "invalid bounded directory tree request",
             );
         }
-        if !self.can_put || !allow_write || self.policy.roots.is_empty() {
+        let permitted = match &request {
+            DirectoryTreeRequest::PreparePut { .. }
+            | DirectoryTreeRequest::FinalizePut { .. }
+            | DirectoryTreeRequest::CancelPut { .. } => self.can_put && allow_write,
+            DirectoryTreeRequest::PrepareGet { .. } | DirectoryTreeRequest::FinalizeGet { .. } => {
+                self.can_get && allow_read
+            }
+        };
+        if !permitted || self.policy.roots.is_empty() {
             return DirectoryTreeReply::error(
                 DirectoryTreeErrorCode::Denied,
-                "directory Put is not permitted by this device grant",
+                "directory transfer is not permitted by this device grant",
             );
         }
         let service = self.clone();
@@ -257,25 +269,137 @@ impl HostDirectoryTreeService {
     }
 
     fn execute_blocking(&self, request: DirectoryTreeRequest) -> DirectoryTreeReply {
-        let manifest = match &request {
-            DirectoryTreeRequest::PreparePut { manifest }
-            | DirectoryTreeRequest::FinalizePut { manifest }
-            | DirectoryTreeRequest::CancelPut { manifest } => manifest,
+        match request {
+            DirectoryTreeRequest::PreparePut { manifest } => {
+                if !self.manifest_scope_matches(&manifest) {
+                    return self.scope_denied();
+                }
+                self.prepare_put(&manifest)
+            }
+            DirectoryTreeRequest::FinalizePut { manifest } => {
+                if !self.manifest_scope_matches(&manifest) {
+                    return self.scope_denied();
+                }
+                self.finalize_put(&manifest)
+            }
+            DirectoryTreeRequest::CancelPut { manifest } => {
+                if !self.manifest_scope_matches(&manifest) {
+                    return self.scope_denied();
+                }
+                self.cancel_put(&manifest)
+            }
+            DirectoryTreeRequest::PrepareGet { scope } => {
+                if scope.controller_id != self.controller_id
+                    || scope.site_id != self.site_id
+                    || scope.device_id != self.device_id
+                {
+                    return self.scope_denied();
+                }
+                self.prepare_get(&scope)
+            }
+            DirectoryTreeRequest::FinalizeGet { manifest } => {
+                if !self.manifest_scope_matches(&manifest) {
+                    return self.scope_denied();
+                }
+                self.finalize_get(&manifest)
+            }
+        }
+    }
+
+    fn manifest_scope_matches(&self, manifest: &DirectoryTreeManifest) -> bool {
+        manifest.controller_id == self.controller_id
+            && manifest.site_id == self.site_id
+            && manifest.device_id == self.device_id
+    }
+
+    fn scope_denied(&self) -> DirectoryTreeReply {
+        DirectoryTreeReply::error(
+            DirectoryTreeErrorCode::Denied,
+            "directory tree scope does not match this Host",
+        )
+    }
+
+    fn prepare_get(&self, scope: &clew_transport::DirectoryTreeGetScope) -> DirectoryTreeReply {
+        let root = match self.get_root(&scope.device_root) {
+            Ok(root) => root,
+            Err(reply) => return reply,
         };
-        if manifest.controller_id != self.controller_id
-            || manifest.site_id != self.site_id
-            || manifest.device_id != self.device_id
+        let scan = match scan_authorized_directory_tree(&self.policy, &root) {
+            Ok(scan) => scan,
+            Err(error) => return directory_scan_reply(error),
+        };
+        match scan.into_manifest(
+            scope.transfer_id,
+            self.controller_id,
+            self.site_id,
+            self.device_id,
+            FileTransferDirection::DeviceToController,
+            scope.device_root.clone(),
+            None,
+        ) {
+            Ok(manifest) => DirectoryTreeReply::Manifest { manifest },
+            Err(error) => directory_scan_reply(error),
+        }
+    }
+
+    fn finalize_get(&self, manifest: &DirectoryTreeManifest) -> DirectoryTreeReply {
+        if manifest.validate().is_err()
+            || manifest.direction != FileTransferDirection::DeviceToController
+            || manifest.device_conflict_policy.is_some()
         {
             return DirectoryTreeReply::error(
-                DirectoryTreeErrorCode::Denied,
-                "directory tree manifest scope does not match this Host",
+                DirectoryTreeErrorCode::InvalidRequest,
+                "invalid directory Get manifest",
             );
         }
-        match request {
-            DirectoryTreeRequest::PreparePut { manifest } => self.prepare_put(&manifest),
-            DirectoryTreeRequest::FinalizePut { manifest } => self.finalize_put(&manifest),
-            DirectoryTreeRequest::CancelPut { manifest } => self.cancel_put(&manifest),
+        let root = match self.get_root(&manifest.device_root) {
+            Ok(root) => root,
+            Err(reply) => return reply,
+        };
+        let scan = match scan_authorized_directory_tree(&self.policy, &root) {
+            Ok(scan) => scan,
+            Err(error) => return directory_scan_reply(error),
+        };
+        if scan.entries != manifest.entries || scan.total_file_bytes != manifest.total_file_bytes {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::HashMismatch,
+                "device directory changed during transfer",
+            );
         }
+        DirectoryTreeReply::Verified {
+            transfer_id: manifest.transfer_id,
+            device_root: manifest.device_root.clone(),
+        }
+    }
+
+    fn get_root(&self, device_root: &str) -> Result<PathBuf, DirectoryTreeReply> {
+        let requested = PathBuf::from(device_root);
+        if !requested.is_absolute() {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "device directory source must be absolute",
+            ));
+        }
+        let metadata = fs::symlink_metadata(&requested).map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::NotFound {
+                DirectoryTreeErrorCode::NotFound
+            } else {
+                DirectoryTreeErrorCode::Io
+            };
+            DirectoryTreeReply::error(code, "device directory source metadata failed")
+        })?;
+        if entry_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "device directory source is not a safe regular directory",
+            ));
+        }
+        fs::canonicalize(&requested).map_err(|_| {
+            DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Io,
+                "device directory source could not be canonicalized",
+            )
+        })
     }
 
     fn prepare_put(&self, manifest: &DirectoryTreeManifest) -> DirectoryTreeReply {
@@ -658,7 +782,7 @@ pub enum DirectoryTreeScanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clew_transport::{DirectoryTreeEntryKind, file_sha256_hex};
+    use clew_transport::{DirectoryTreeEntryKind, DirectoryTreeGetScope, file_sha256_hex};
     use tempfile::tempdir;
 
     #[test]
@@ -733,9 +857,15 @@ mod tests {
         let device_id = DeviceId::new();
         let policy =
             ReadPolicy::new(vec![allowed.to_string_lossy().into_owned()], 49_152, 5_000).unwrap();
-        let service =
-            HostDirectoryTreeService::new(policy.clone(), controller_id, site_id, device_id, true)
-                .unwrap();
+        let service = HostDirectoryTreeService::new(
+            policy.clone(),
+            controller_id,
+            site_id,
+            device_id,
+            true,
+            true,
+        )
+        .unwrap();
         let transfer_id = TransferId::new();
         let final_root = allowed.join("project");
         let manifest = DirectoryTreeManifest::new(
@@ -761,6 +891,7 @@ mod tests {
                     manifest: manifest.clone(),
                 },
                 true,
+                true,
             )
             .await;
         let DirectoryTreeReply::Prepared {
@@ -784,6 +915,7 @@ mod tests {
                         manifest: manifest.clone(),
                     },
                     true,
+                    true,
                 )
                 .await,
             DirectoryTreeReply::Completed { transfer_id: actual, .. } if actual == transfer_id
@@ -799,6 +931,7 @@ mod tests {
                     DirectoryTreeRequest::FinalizePut {
                         manifest: manifest.clone(),
                     },
+                    true,
                     true,
                 )
                 .await,
@@ -827,6 +960,7 @@ mod tests {
                     manifest: cancel_manifest.clone(),
                 },
                 true,
+                true,
             )
             .await
         else {
@@ -840,6 +974,7 @@ mod tests {
                     DirectoryTreeRequest::CancelPut {
                         manifest: cancel_manifest,
                     },
+                    true,
                     true,
                 )
                 .await,
@@ -859,9 +994,15 @@ mod tests {
         let device_id = DeviceId::new();
         let policy =
             ReadPolicy::new(vec![allowed.to_string_lossy().into_owned()], 49_152, 5_000).unwrap();
-        let service =
-            HostDirectoryTreeService::new(policy.clone(), controller_id, site_id, device_id, true)
-                .unwrap();
+        let service = HostDirectoryTreeService::new(
+            policy.clone(),
+            controller_id,
+            site_id,
+            device_id,
+            true,
+            true,
+        )
+        .unwrap();
         let manifest = DirectoryTreeManifest::new(
             TransferId::new(),
             controller_id,
@@ -880,13 +1021,14 @@ mod tests {
                     DirectoryTreeRequest::PreparePut {
                         manifest: manifest.clone(),
                     },
+                    true,
                     false,
                 )
                 .await,
             DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::Denied
         ));
         let readonly =
-            HostDirectoryTreeService::new(policy, controller_id, site_id, device_id, false)
+            HostDirectoryTreeService::new(policy, controller_id, site_id, device_id, true, false)
                 .unwrap();
         assert!(matches!(
             readonly
@@ -895,6 +1037,7 @@ mod tests {
                         manifest: manifest.clone(),
                     },
                     true,
+                    false,
                 )
                 .await,
             DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::Denied
@@ -909,6 +1052,7 @@ mod tests {
                     manifest: manifest.clone(),
                 },
                 true,
+                true,
             )
             .await
         else {
@@ -917,9 +1061,135 @@ mod tests {
         fs::write(PathBuf::from(staging_device_root).join("a.txt"), b"b").unwrap();
         assert!(matches!(
             service
-                .execute(DirectoryTreeRequest::FinalizePut { manifest }, true)
+                .execute(DirectoryTreeRequest::FinalizePut { manifest }, true, true)
                 .await,
             DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::HashMismatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn host_directory_get_is_read_authorized_and_reproves_source_tree() {
+        let temp = tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let source = allowed.join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::write(source.join("a.txt"), b"alpha").unwrap();
+        fs::write(source.join("nested/b.txt"), b"beta").unwrap();
+        let controller_id = ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let policy =
+            ReadPolicy::new(vec![allowed.to_string_lossy().into_owned()], 49_152, 5_000).unwrap();
+        let service =
+            HostDirectoryTreeService::new(policy, controller_id, site_id, device_id, true, false)
+                .unwrap();
+        let transfer_id = TransferId::new();
+        let scope = DirectoryTreeGetScope::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            source.to_string_lossy(),
+        )
+        .unwrap();
+
+        let DirectoryTreeReply::Manifest { manifest } = service
+            .execute(
+                DirectoryTreeRequest::PrepareGet {
+                    scope: scope.clone(),
+                },
+                true,
+                false,
+            )
+            .await
+        else {
+            panic!("expected device directory manifest");
+        };
+        assert_eq!(manifest.transfer_id, transfer_id);
+        assert_eq!(
+            manifest.direction,
+            FileTransferDirection::DeviceToController
+        );
+        assert_eq!(manifest.device_conflict_policy, None);
+        assert_eq!(manifest.total_file_bytes, 9);
+        assert!(manifest.entries.iter().any(|entry| {
+            entry.relative_path == "empty" && entry.kind == DirectoryTreeEntryKind::Directory
+        }));
+
+        let put_manifest = DirectoryTreeManifest::new(
+            TransferId::new(),
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            allowed.join("put-denied").to_string_lossy(),
+            vec![],
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::PreparePut {
+                        manifest: put_manifest,
+                    },
+                    true,
+                    false,
+                )
+                .await,
+            DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::Denied
+        ));
+
+        fs::write(source.join("a.txt"), b"changed").unwrap();
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::FinalizeGet {
+                        manifest: manifest.clone(),
+                    },
+                    true,
+                    false,
+                )
+                .await,
+            DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::HashMismatch
+        ));
+        fs::write(source.join("a.txt"), b"alpha").unwrap();
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::FinalizeGet { manifest },
+                    true,
+                    false,
+                )
+                .await,
+            DirectoryTreeReply::Verified {
+                transfer_id: actual,
+                ..
+            } if actual == transfer_id
+        ));
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_scope = DirectoryTreeGetScope::new(
+            TransferId::new(),
+            controller_id,
+            site_id,
+            device_id,
+            outside.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::PrepareGet {
+                        scope: outside_scope,
+                    },
+                    true,
+                    false,
+                )
+                .await,
+            DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::Denied
         ));
     }
 

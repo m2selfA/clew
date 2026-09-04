@@ -34,10 +34,11 @@ use tokio::{
 use crate::{
     ControllerConfig, ControllerControlStore, ControllerDirectoryTransferError,
     ControllerDirectoryTransferManager, ControllerFileTransferError, ControllerFileTransferManager,
-    DirectoryPutInfo, FileGetInfo, FilePutInfo, FileTransferInfo, ForwardInfo, HttpConnectInfo,
-    HttpConnectProxyManager, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore, OutfitEditPatch,
-    OutfitLibrary, OutfitLibraryEntry, RemoteHub, RemoteSessionInfo, RemoteSessionState,
-    Socks5Info, Socks5ProxyManager, TcpForwardManager, export_controller_backup, transport,
+    DirectoryGetInfo, DirectoryPutInfo, DirectoryTransferInfo, FileGetInfo, FilePutInfo,
+    FileTransferInfo, ForwardInfo, HttpConnectInfo, HttpConnectProxyManager, LocalEndpoint,
+    OutfitAssetInfo, OutfitAssetStore, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry,
+    RemoteHub, RemoteSessionInfo, RemoteSessionState, Socks5Info, Socks5ProxyManager,
+    TcpForwardManager, export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -237,6 +238,14 @@ pub struct RemoteDirectoryPutRequest {
     pub device_id: DeviceId,
     pub source_path: String,
     pub device_root: String,
+    pub chunk_size: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteDirectoryGetRequest {
+    pub device_id: DeviceId,
+    pub device_root: String,
+    pub destination_path: String,
     pub chunk_size: u32,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -506,6 +515,7 @@ enum LocalMethod {
         transfer_id: TransferId,
     },
     DirectoryPut(RemoteDirectoryPutRequest),
+    DirectoryGet(RemoteDirectoryGetRequest),
     DirectoryStatus {
         transfer_id: TransferId,
     },
@@ -570,6 +580,8 @@ enum LocalResponse {
     FileGetInfo(FileGetInfo),
     FileTransferInfo(FileTransferInfo),
     DirectoryPutInfo(DirectoryPutInfo),
+    DirectoryGetInfo(DirectoryGetInfo),
+    DirectoryTransferInfo(DirectoryTransferInfo),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -753,6 +765,7 @@ async fn dispatch(
             (file_cancel_response(state, transfer_id), false)
         }
         LocalMethod::DirectoryPut(request) => (directory_put_response(state, request), false),
+        LocalMethod::DirectoryGet(request) => (directory_get_response(state, request), false),
         LocalMethod::DirectoryStatus { transfer_id } => {
             (directory_status_response(state, transfer_id), false)
         }
@@ -1690,16 +1703,48 @@ fn directory_put_response(
     }
 }
 
+fn directory_get_response(
+    state: &LocalApiState,
+    request: RemoteDirectoryGetRequest,
+) -> LocalResponse {
+    let site_id = match authorize_file_get_device(state, request.device_id) {
+        Ok(site_id) => site_id,
+        Err(response) => return response,
+    };
+    match state.directory_transfers.start_get(
+        request.device_id,
+        site_id,
+        request.device_root.clone(),
+        request.destination_path,
+        request.chunk_size,
+    ) {
+        Ok(info) => {
+            record_shell_activity(
+                state,
+                site_id,
+                request.device_id,
+                "directory_get_start",
+                Some(request.device_root),
+                ActivityResult::Succeeded,
+                0,
+                0,
+            );
+            LocalResponse::DirectoryGetInfo(info)
+        }
+        Err(error) => directory_transfer_manager_error(error),
+    }
+}
+
 fn directory_status_response(state: &LocalApiState, transfer_id: TransferId) -> LocalResponse {
     match state.directory_transfers.status(transfer_id) {
-        Ok(info) => LocalResponse::DirectoryPutInfo(info),
+        Ok(info) => LocalResponse::DirectoryTransferInfo(info),
         Err(error) => directory_transfer_manager_error(error),
     }
 }
 
 fn directory_cancel_response(state: &LocalApiState, transfer_id: TransferId) -> LocalResponse {
     match state.directory_transfers.cancel(transfer_id) {
-        Ok(info) => LocalResponse::DirectoryPutInfo(info),
+        Ok(info) => LocalResponse::DirectoryTransferInfo(info),
         Err(error) => directory_transfer_manager_error(error),
     }
 }
@@ -1708,6 +1753,8 @@ fn directory_transfer_manager_error(error: ControllerDirectoryTransferError) -> 
     let code = match error {
         ControllerDirectoryTransferError::InvalidSourcePath
         | ControllerDirectoryTransferError::InvalidDeviceRoot
+        | ControllerDirectoryTransferError::InvalidDestinationPath
+        | ControllerDirectoryTransferError::DestinationConflict
         | ControllerDirectoryTransferError::InvalidChunkSize(_)
         | ControllerDirectoryTransferError::NotFound(_) => LocalApiErrorCode::InvalidRequest,
         ControllerDirectoryTransferError::Capacity => LocalApiErrorCode::Unavailable,
@@ -2826,15 +2873,26 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn directory_get(
+        &self,
+        request: RemoteDirectoryGetRequest,
+    ) -> Result<DirectoryGetInfo, LocalApiClientError> {
+        match self.request(LocalMethod::DirectoryGet(request)).await? {
+            LocalResponse::DirectoryGetInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn directory_status(
         &self,
         transfer_id: TransferId,
-    ) -> Result<DirectoryPutInfo, LocalApiClientError> {
+    ) -> Result<DirectoryTransferInfo, LocalApiClientError> {
         match self
             .request(LocalMethod::DirectoryStatus { transfer_id })
             .await?
         {
-            LocalResponse::DirectoryPutInfo(info) => Ok(info),
+            LocalResponse::DirectoryTransferInfo(info) => Ok(info),
             LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
@@ -2843,12 +2901,12 @@ impl LocalApiClient {
     pub async fn directory_cancel(
         &self,
         transfer_id: TransferId,
-    ) -> Result<DirectoryPutInfo, LocalApiClientError> {
+    ) -> Result<DirectoryTransferInfo, LocalApiClientError> {
         match self
             .request(LocalMethod::DirectoryCancel { transfer_id })
             .await?
         {
-            LocalResponse::DirectoryPutInfo(info) => Ok(info),
+            LocalResponse::DirectoryTransferInfo(info) => Ok(info),
             LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }

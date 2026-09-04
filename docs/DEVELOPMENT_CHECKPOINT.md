@@ -1278,7 +1278,19 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - focused：transport directory RPC/contract **4/4 PASS**，Host preflight/finalize/replay/tamper **2/2 PASS**，既有Controller CLI **7/7 PASS**；`cargo check --workspace --all-targets` PASS，`cargo test --workspace --all-targets` **222 passed / 0 failed / 6 ignored**；
 - 本块**不宣称directory-level Controller process-restart journal**：Controller重启时outer directory task暂不自动恢复；已经启动的single-file child仍保持V5a既有durability。directory Get、directory task journal与bounded multi-file concurrency继续分块处理，不把它们偷塞进V5b-1a。
 
-下一块 V5b-1b：Device→Controller bounded serial directory Get。先复用同一canonical tree contract和durable single-file Get，保持串行、Controller-local destination/conflict policy不进peer；directory-level Controller process-restart durability与多文件bounded concurrency随后单独收口。
+### V5b-1b — Bounded serial Device→Controller directory Get
+
+**Status：DONE（2026-09-04）**
+
+- `directory_tree`控制面扩成双向但不泄露Controller本机目的地：新增`DirectoryTreeGetScope { TransferId, ControllerId, SiteId, DeviceId, device_root }`、`PrepareGet`与`FinalizeGet`；Host返回`DeviceToController` canonical manifest，manifest继续禁止Controller-local conflict policy。`FinalizeGet`只接受同scope原manifest；
+- Host directory service把read/write authority拆开：read-only executable membership可执行directory Get但仍不能directory Put。`PrepareGet`对Device-side source root再次做absolute/canonical/signed-root/symlink-reparse gate并bounded scan/hash整树；所有文件传完后`FinalizeGet`重新scan源树，entries/size/hash任一变化都`HashMismatch`，避免把逐文件成功误认为一致目录快照；
+- Controller创建destination同父目录、由outer `TransferId`决定的private `.clew-dir-<id>.part` staging tree，先建立manifest中的空目录，再按manifest稳定顺序**一次只启动一个**V5a durable single-file Get。child progress聚合到outer directory task；Cancel会cancel当前child并best-effort清理private staging；
+- child全部Completed后先要求Host用原manifest整树re-proof，再在Controller本地重新scan/hash staging并与原manifest精确比较；两侧都通过后才atomic rename到最终destination。rename一旦成功即视为commit：Unix parent-dir sync若后置失败，不把已可见目录谎报成Failed，而保持Completed并附带durability warning；
+- Local API新增directory Get并把directory Status/Cancel统一投影为方向化`DirectoryTransferInfo`；CLI继续复用既有树，不新增subcommand：`clew file get --directory`，`file status|cancel --directory`同时支持Put/Get；directory Get仍只允许Controller-private `--conflict fail`；
+- focused：transport directory **5/5 PASS**，Host directory **3/3 PASS**，Controller local staging/atomic commit **2/2 PASS**；`cargo check --all-targets` 0 warnings，`cargo test --workspace --all-targets` **226 passed / 0 failed / 6 ignored**；Windows `clew --help`与`file get --help`均正常，无V5b-1a曾出现的clap main-stack回归；
+- 本块仍**不宣称outer directory task能跨Controller process restart恢复**。child single-file Get/Put自身保留V5a durability，但目录级manifest、已完成文件集合、finalize状态仍需下一块持久化。
+
+下一块 V5b-2：directory-level Controller process-restart durability。Put/Get都必须在Controller hard-kill/restart后保留outer TransferId、原manifest/私有路径与已确认文件前缀，只恢复未完成child；随后才进入bounded multi-file concurrency。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1357,13 +1369,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 contract + V5b-1a serial directory Put DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 contract + V5b-1a/1b serial directory Put/Get DONE）**
 
-**Next block：V5b-1b — bounded serial directory Get data plane**
+**Next block：V5b-2 — directory-level Controller process-restart durability**
 
-V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume已全部闭合；V5b-0冻结canonical directory tree contract，V5b-1a现在又把Controller→Device目录Put接到真实InnerSession/Host staging/既有durable single-file primitive，严格串行并在整树复验后atomic finalize。下一步对称实现Device→Controller serial directory Get；directory-level Controller process-restart journal与bounded multi-file concurrency继续后置为独立块，不一次塞进巨大scheduler。
+V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume已全部闭合；V5b现在也有对称的bounded serial directory Put/Get：两向都复用canonical tree manifest与durable single-file primitive，并在整树re-proof后atomic finalize。下一步不加并发，先让outer directory task本身在Controller process restart后恢复同一TransferId、manifest、private staging/source binding和已完成文件前缀；只有这层durability闭合后才进入bounded multi-file concurrency。
 
 ### Change log
+
+- **2026-09-04** — V5b-1b bounded serial directory Get DONE：新增privacy-preserving `DirectoryTreeGetScope` + PrepareGet/FinalizeGet，Host read/write分权、源树Prepare/Finalize双scan re-proof；Controller用TransferId private staging，严格串行复用durable single-file Get，Host复验后再本地整树hash并atomic rename。Local API/CLI扩成`file get/status/cancel --directory`且仍只允许fail conflict；rename后parent sync失败保持Committed事实并附warning。transport **5/5**、Host **3/3**、runtime staging **2/2**，workspace **226/0/6**；Windows help正常。下一块V5b-2 directory-level Controller restart durability。
 
 - **2026-09-04** — V5b-1a bounded serial directory Put DONE：新增`directory_tree` Prepare/Finalize/Cancel RPC、Host deterministic TransferId staging + whole-tree verify/atomic rename/replay、Controller hard-cap-8 directory task并按manifest一次只复用一个durable single-file Put；Local API支持Put/Status/Cancel，CLI收敛为`file put/status/cancel --directory`，修复扩张clap tree引发的Windows main-stack overflow。Preparing cancel可打断reconnect wait，Finalizing明确不可撤销；transport **4/4**、Host **2/2**、Controller CLI **7/7**，workspace **222/0/6**。directory-level Controller process-restart journal未在本块伪称完成。下一块V5b-1b serial directory Get。
 
