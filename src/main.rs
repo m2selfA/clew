@@ -9,8 +9,10 @@ mod mcp;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
-use clap::{Args, Parser, Subcommand};
-use clew_core::{DeviceId, ForwardId, InviteId, ProxyId, TaskId, select_executable_device};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use clew_core::{
+    DeviceId, ForwardId, InviteId, ProxyId, TaskId, TransferId, select_executable_device,
+};
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
     acquire_host_instance, resolve_host_launch_with_mode,
@@ -19,12 +21,13 @@ use clew_host::{
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
 use clew_runtime::{
-    BackupExportRequest, ControllerConfig, ControllerStart, ForwardAddRequest, FsWritePrecondition,
-    HttpConnectAddRequest, InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest,
-    OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
-    RemoteReadRequest, RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
-    Socks5AddRequest, restore_controller_backup, start_controller,
+    BackupExportRequest, ControllerConfig, ControllerStart, FileConflictPolicy, ForwardAddRequest,
+    FsWritePrecondition, HttpConnectAddRequest, InviteIssueRequest, LocalApiClient,
+    OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
+    OutfitSetFieldRequest, RemoteEditRequest, RemoteFilePutRequest, RemoteGlobRequest,
+    RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest, RemoteShellAttachRequest,
+    RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest, restore_controller_backup,
+    start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -203,6 +206,11 @@ enum Command {
         #[command(subcommand)]
         command: ProxyCommand,
     },
+    /// Manage resumable single-file transfers owned by the Controller.
+    File {
+        #[command(subcommand)]
+        command: FileCommand,
+    },
     /// Serve Clew's agent tools over Model Context Protocol.
     Mcp {
         #[command(subcommand)]
@@ -380,6 +388,54 @@ enum HttpConnectCommand {
     /// Remove one Controller-owned HTTP CONNECT listener.
     Remove {
         proxy_id: ProxyId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FileConflictArg {
+    Fail,
+    Replace,
+    Rename,
+}
+
+impl From<FileConflictArg> for FileConflictPolicy {
+    fn from(value: FileConflictArg) -> Self {
+        match value {
+            FileConflictArg::Fail => Self::FailIfExists,
+            FileConflictArg::Replace => Self::ReplaceExisting,
+            FileConflictArg::Rename => Self::RenameIfExists,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum FileCommand {
+    /// Start one Controller-to-device single-file upload. The optional device uses shared selector semantics.
+    Put {
+        #[arg(value_name = "DEVICE")]
+        device: Option<String>,
+        #[arg(long, value_name = "LOCAL_FILE")]
+        source: PathBuf,
+        #[arg(long, value_name = "DEVICE_PATH")]
+        dest: String,
+        #[arg(long, default_value_t = 32_768)]
+        chunk_size: u32,
+        #[arg(long, value_enum, default_value = "fail")]
+        conflict: FileConflictArg,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show Controller-owned progress for one transfer.
+    Status {
+        transfer_id: TransferId,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Request bounded cancellation for one transfer.
+    Cancel {
+        transfer_id: TransferId,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -883,6 +939,53 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", serde_json::to_string_pretty(&info)?);
                 }
             },
+        },
+        Command::File { command } => match command {
+            FileCommand::Put {
+                device,
+                source,
+                dest,
+                chunk_size,
+                conflict,
+                state_dir,
+            } => {
+                let source = std::fs::canonicalize(&source)?;
+                let source_path = source
+                    .to_str()
+                    .ok_or("Controller source path must be valid UTF-8")?
+                    .to_owned();
+                let client = LocalApiClient::new(controller_config(state_dir)?);
+                let devices = client.device_list().await?;
+                let device_id = select_executable_device(&devices.devices, device.as_deref())?;
+                let info = client
+                    .file_put(RemoteFilePutRequest {
+                        device_id,
+                        source_path,
+                        device_path: dest,
+                        chunk_size,
+                        conflict_policy: conflict.into(),
+                    })
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            }
+            FileCommand::Status {
+                transfer_id,
+                state_dir,
+            } => {
+                let info = LocalApiClient::new(controller_config(state_dir)?)
+                    .file_status(transfer_id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            }
+            FileCommand::Cancel {
+                transfer_id,
+                state_dir,
+            } => {
+                let info = LocalApiClient::new(controller_config(state_dir)?)
+                    .file_cancel(transfer_id)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            }
         },
         Command::Mcp { command } => match command {
             McpCommand::Stdio { state_dir } => {

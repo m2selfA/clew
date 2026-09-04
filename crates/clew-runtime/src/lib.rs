@@ -12,10 +12,13 @@ mod outfit;
 mod outfit_asset;
 mod remote;
 mod socks5;
+mod transfer;
 mod transport;
 
 pub use backup::{ControllerBackupIoError, export_controller_backup, restore_controller_backup};
-pub use clew_transport::{FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus};
+pub use clew_transport::{
+    FileConflictPolicy, FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus,
+};
 pub use config::{ControllerConfig, ControllerConfigError, LocalEndpoint, default_state_root};
 pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerControlStore};
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
@@ -33,10 +36,10 @@ pub use local_api::{
     MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteGlobRequest, RemoteGrepRequest,
-    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo,
-    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
-    Socks5List,
+    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteFilePutRequest,
+    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
+    RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
+    RemoteWriteRequest, Socks5AddRequest, Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
@@ -53,4 +56,8 @@ pub use remote::{
 };
 pub use socks5::{
     HARD_MAX_SOCKS5_LISTENERS, Socks5Info, Socks5ProxyManager, Socks5ProxyManagerError,
+};
+pub use transfer::{
+    ControllerFileTransferError, ControllerFileTransferManager, ControllerFileTransferPhase,
+    FilePutInfo, HARD_MAX_CONTROLLER_FILE_TRANSFERS, MAX_CONTROLLER_FILE_SOURCE_PATH_BYTES,
 };

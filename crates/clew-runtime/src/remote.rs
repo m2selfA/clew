@@ -10,12 +10,13 @@ use clew_identity::{EnrollmentError, StoredControllerIdentity};
 use clew_transport::{
     BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest,
     BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
-    ControllerSessionAuthority, FsMutationReply, FsMutationRequest, FsQueryReply, FsQueryRequest,
-    HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
-    ReadReply, ReadRequest, SHELL_RECONNECT_GRACE_MS, SealedBootstrapContext, SealedBootstrapError,
-    SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest,
-    SignedConnectorLease, SiteDiscoveryTag, TcpForwardReply, TcpForwardRequest, is_rpc_progress,
-    read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
+    ControllerSessionAuthority, FileTransferReply, FileTransferRequest, FsMutationReply,
+    FsMutationRequest, FsQueryReply, FsQueryRequest, HARD_MAX_SHELL_TASKS_PER_SESSION,
+    InnerMessage, InnerSession, IrohProtocol, IrohStream, ReadReply, ReadRequest,
+    SHELL_RECONNECT_GRACE_MS, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
+    ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
+    TcpForwardReply, TcpForwardRequest, is_rpc_progress, read_bootstrap, read_connector_open,
+    unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -178,6 +179,11 @@ enum RemoteCommand {
         request_id: RequestId,
         request: FsMutationRequest,
         reply: oneshot::Sender<Result<FsMutationReply, RemoteHubError>>,
+    },
+    FileTransfer {
+        request_id: RequestId,
+        request: FileTransferRequest,
+        reply: oneshot::Sender<Result<FileTransferReply, RemoteHubError>>,
     },
     TcpForward {
         request_id: RequestId,
@@ -377,6 +383,53 @@ impl RemoteHub {
                 Ok(Err(_)) | Err(_) => previous_generation = Some(generation),
             }
         }
+    }
+
+    /// Executes one file-transfer RPC on the current/new session without generic replay.
+    ///
+    /// When `previous_generation` is Some, this waits for a different authenticated generation.
+    /// The transfer owner must reconcile Host Status/confirmed_offset before deciding what to send
+    /// next; generic RequestId replay is deliberately not used for file chunks.
+    pub async fn file_transfer_attempt(
+        &self,
+        device_id: DeviceId,
+        previous_generation: Option<u64>,
+        request: FileTransferRequest,
+    ) -> Result<(u64, Result<FileTransferReply, RemoteHubError>), RemoteHubError> {
+        request.validate()?;
+        let (generation, tx) = self
+            .replay_session_after(device_id, previous_generation)
+            .await?;
+        Ok((
+            generation,
+            send_file_transfer_command(&tx, device_id, request).await,
+        ))
+    }
+
+    pub async fn file_transfer_on_generation(
+        &self,
+        device_id: DeviceId,
+        expected_generation: u64,
+        request: FileTransferRequest,
+    ) -> Result<Result<FileTransferReply, RemoteHubError>, RemoteHubError> {
+        request.validate()?;
+        let tx = {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|_| RemoteHubError::StatePoisoned)?;
+            let Some(slot) = state.sessions.get(&device_id) else {
+                return Ok(Err(RemoteHubError::Offline(device_id)));
+            };
+            if slot.generation != expected_generation {
+                return Ok(Err(RemoteHubError::SessionGenerationChanged {
+                    expected: expected_generation,
+                    actual: slot.generation,
+                }));
+            }
+            slot.tx.clone()
+        };
+        Ok(send_file_transfer_command(&tx, device_id, request).await)
     }
 
     pub async fn tcp_forward_open(
@@ -902,6 +955,25 @@ fn validate_tcp_forward_reply_correlation(
         Err(RemoteHubError::TcpForwardReplyMismatch)
     }
 }
+async fn send_file_transfer_command(
+    tx: &mpsc::Sender<RemoteCommand>,
+    device_id: DeviceId,
+    request: FileTransferRequest,
+) -> Result<FileTransferReply, RemoteHubError> {
+    let request_id = RequestId::new();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(RemoteCommand::FileTransfer {
+        request_id,
+        request,
+        reply: reply_tx,
+    })
+    .await
+    .map_err(|_| RemoteHubError::Offline(device_id))?;
+    reply_rx
+        .await
+        .map_err(|_| RemoteHubError::Offline(device_id))?
+}
+
 async fn send_shell_task_command(
     tx: &mpsc::Sender<RemoteCommand>,
     device_id: DeviceId,
@@ -1562,6 +1634,39 @@ async fn handle_member(
                     break;
                 }
             }
+            RemoteCommand::FileTransfer {
+                request_id,
+                request,
+                reply,
+            } => {
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
+                        Ok(FileTransferReply::from_message(&message)?)
+                    } => result,
+                };
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
             RemoteCommand::TcpForward {
                 request_id,
                 request,
@@ -1746,6 +1851,8 @@ pub enum RemoteHubError {
     StatePoisoned,
     #[error("remote session generation overflow")]
     GenerationOverflow,
+    #[error("remote session generation changed: expected {expected}, got {actual}")]
+    SessionGenerationChanged { expected: u64, actual: u64 },
     #[error("remote session continuity was lost across a long process pause or wall-clock jump")]
     SessionContinuityLost,
     #[error("remote RPC {0} stopped making progress")]
@@ -1776,6 +1883,8 @@ pub enum RemoteHubError {
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    FileTransfer(#[from] clew_transport::FileTransferError),
     #[error(transparent)]
     TcpForward(#[from] clew_transport::TcpForwardProtocolError),
     #[error(transparent)]
@@ -1939,6 +2048,164 @@ impl RemoteConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ControllerFileTransferManager, ControllerFileTransferPhase};
+    use clew_transport::{
+        FileConflictPolicy, FileTransferPhase, FileTransferReply, FileTransferRequest,
+        FileTransferStatus, file_sha256_hex,
+    };
+
+    #[tokio::test]
+    async fn controller_file_put_recovers_by_status_before_resuming_next_chunk() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.bin");
+        let source = vec![0x5a_u8; 5_000];
+        std::fs::write(&source_path, &source).unwrap();
+        let controller_id = clew_core::ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let hub = RemoteHub::default();
+        let (generation_one, mut commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_000,
+            )
+            .unwrap();
+        let manager = ControllerFileTransferManager::new(hub.clone(), controller_id);
+        let info = manager
+            .start_put(
+                device_id,
+                site_id,
+                source_path.to_string_lossy().into_owned(),
+                "/device/target.bin".into(),
+                4096,
+                FileConflictPolicy::FailIfExists,
+            )
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected PutBegin on generation one");
+        };
+        let FileTransferRequest::PutBegin { manifest } = request else {
+            panic!("first file-transfer request must be PutBegin");
+        };
+        assert_eq!(manifest.transfer_id, info.transfer_id);
+        let initial = manifest.initial_resume_descriptor().unwrap();
+        reply
+            .send(Ok(FileTransferReply::Status(FileTransferStatus {
+                descriptor: initial.clone(),
+                phase: FileTransferPhase::Receiving,
+                final_device_path: None,
+            })))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected first PutChunk");
+        };
+        let FileTransferRequest::PutChunk { chunk: first_chunk } = request else {
+            panic!("expected first PutChunk");
+        };
+        assert_eq!(first_chunk.offset, 0);
+        assert_eq!(first_chunk.decode_bytes().unwrap(), source[..4096]);
+        // Simulate unknown result: Host applied the chunk, but Controller never got its reply.
+        drop(reply);
+        hub.unregister(device_id, generation_one, Some(1_100));
+        let (_generation_two, mut commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                1_200,
+            )
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } =
+            tokio::time::timeout(Duration::from_secs(2), commands_two.recv())
+                .await
+                .expect("Controller did not query Host status after reconnect")
+                .unwrap()
+        else {
+            panic!("expected Status after reconnect");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::Status {
+                transfer_id: info.transfer_id
+            }
+        );
+        let mut after_first = initial.clone();
+        after_first.checkpoint_revision = 2;
+        after_first.confirmed_offset = 4096;
+        after_first.confirmed_prefix_sha256 = file_sha256_hex(&source[..4096]);
+        reply
+            .send(Ok(FileTransferReply::Status(FileTransferStatus {
+                descriptor: after_first.clone(),
+                phase: FileTransferPhase::Receiving,
+                final_device_path: None,
+            })))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_two.recv().await.unwrap()
+        else {
+            panic!("expected resumed second PutChunk");
+        };
+        let FileTransferRequest::PutChunk { chunk: last_chunk } = request else {
+            panic!("Controller replayed the wrong request after Status recovery");
+        };
+        assert_eq!(last_chunk.offset, 4096);
+        assert_eq!(last_chunk.decode_bytes().unwrap(), source[4096..]);
+        let mut ready = after_first.clone();
+        ready.checkpoint_revision = 3;
+        ready.confirmed_offset = source.len() as u64;
+        ready.confirmed_prefix_sha256 = manifest.final_sha256.clone();
+        reply
+            .send(Ok(FileTransferReply::Status(FileTransferStatus {
+                descriptor: ready.clone(),
+                phase: FileTransferPhase::ReadyToFinalize,
+                final_device_path: None,
+            })))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_two.recv().await.unwrap()
+        else {
+            panic!("expected Finalize after all chunks");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::Finalize {
+                transfer_id: info.transfer_id
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Status(FileTransferStatus {
+                descriptor: ready,
+                phase: FileTransferPhase::Completed,
+                final_device_path: Some(manifest.device_path.clone()),
+            })))
+            .unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = manager.status(info.transfer_id).unwrap();
+                if status.phase.terminal() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Controller put task did not finish");
+        assert_eq!(status.phase, ControllerFileTransferPhase::Completed);
+        assert_eq!(status.confirmed_offset, source.len() as u64);
+        assert_eq!(
+            status.final_device_path.as_deref(),
+            Some("/device/target.bin")
+        );
+        assert!(status.error.is_none());
+    }
 
     #[tokio::test]
     async fn authenticated_connector_member_receives_endpoint_bound_controller_lease() {

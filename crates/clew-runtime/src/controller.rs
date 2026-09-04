@@ -172,6 +172,8 @@ pub async fn start_controller(
     let forwards = crate::TcpForwardManager::new(remote_hub.clone());
     let socks5 = crate::Socks5ProxyManager::new(remote_hub.clone());
     let http_connect = crate::HttpConnectProxyManager::new(remote_hub.clone());
+    let file_transfers =
+        crate::ControllerFileTransferManager::new(remote_hub.clone(), controller_id);
 
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
@@ -202,6 +204,7 @@ pub async fn start_controller(
         forwards,
         socks5,
         http_connect,
+        file_transfers,
         shutdown_tx,
     });
 

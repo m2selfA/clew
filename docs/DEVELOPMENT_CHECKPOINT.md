@@ -58,9 +58,9 @@
 | V1.25 | Distribution Studio foundation | DONE | preset → preview → branded Site Kit，不增加朋友步骤 |
 | V1.5 | Zero-config Site Connector | DONE | 三物理机 no-public enrollment + stable Read，helper 看不到业务明文 |
 | V2 | Agent minimum | DONE | selector + bounded filesystem + live-session Shell + MCP stdio/Streamable HTTP 全闭合 |
-| V3 | Reliability | IN PROGRESS | V3a session generation/path telemetry/liveness DONE；继续 replay matrix + Shell reattach + compatibility |
-| V4 | Dynamic networking | IN PROGRESS | V4a signed TCP egress + Controller-owned TCP forward DONE；继续 SOCKS5/HTTP CONNECT |
-| V5 | File plane | TODO | chunk/hash/resume/directory/bounds/progress/cancel |
+| V3 | Reliability | DONE | reconnect/replay/Shell reattach/sleep-resume/compatibility 已闭合 |
+| V4 | Dynamic networking | DONE | Controller-owned TCP forward / SOCKS5 CONNECT / HTTP CONNECT + non-migration |
+| V5 | File plane | IN PROGRESS | single-file put + cross-generation resume DONE；继续 get / durable restart / directory |
 | V6 | Release packaging | TODO | Windows signing、macOS signing/notarization、Linux artifact、ClientFlavor pipeline |
 | V7 | Advanced Service Runtime | TODO | systemd --user → Windows Service/Linux system service，显式 opt-in |
 | V8+ | Deferred expansion | TODO | 仅按真实需求评估 Directory、dedicated relay、第二 transport 等 |
@@ -1139,7 +1139,7 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 
 ## 12. V5 — File Plane
 
-**Status：IN PROGRESS（V5a-0 + V5a-1a DONE）**
+**Status：IN PROGRESS（V5a-0 + V5a-1a/1b DONE；single-file put + cross-generation resume DONE）**
 
 ### V5a-0 — Single-file manifest / deterministic chunk contract
 
@@ -1169,7 +1169,23 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 - independent consistency checks：每次chunk前核对part长度/checkpoint；completed entry可被bounded prune，active/in-flight不会因capacity被静默驱逐；Host transfer store hard cap **16**。Controller-private source path仍不进入peer state；
 - focused transport file-transfer RPC/manifest/chunk **5/5 PASS**；Host put/resume/finalize/cancel/scope/authority/conflict **2/2 PASS**；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **204 passed / 0 failed / 6 ignored**。
 
-下一块 V5a-1b：Controller-owned single-file put task。Controller私有保存source path/manifest/current Host descriptor，后台顺序读chunk；session loss后同TransferId先Status拿confirmed_offset再seek续传，CLI退出不拆task；完成后再做真实跨generation hard-kill/firewall resume gate。
+### V5a-1b — Controller-owned single-file put task + cross-generation resume
+
+**Status：DONE（2026-09-04）**
+
+- 新增 `ControllerFileTransferManager`，生命周期归长期 Controller，不归 `clew file put` CLI。Controller-private state保留 source path / device path / manifest / progress；peer-visible manifest仍绝不包含Controller本机source。active/history hard cap **16 transfers**，terminal entry仅在新start需要容量时有界prune；
+- CLI新增 `clew file put/status/cancel`。只有Put使用V2 shared device selector；Status/Cancel只接受stable `TransferId`。`--source`在短命令进程中先canonicalize为absolute UTF-8 path，manager也拒绝relative source，避免CLI cwd与长期Controller cwd不同导致路径漂移；默认conflict=`fail`，不会静默覆盖Target文件；
+- Controller source预处理用**同一个打开的File handle**流式计算full SHA-256并seek回0，64KiB hash buffer有界；不把source读进内存。source在传输过程中若被本机其它进程修改，Target final SHA gate会使transfer Failed而不是错误成功；这不是跨进程snapshot/locking承诺；
+- RemoteHub为file-transfer暴露“**单次attempt + generation**”API，而不是套V3通用blind replay。PutBegin/Chunk/Finalize结果未知或session loss时，manager必须等**新generation**并先发Status；Host confirmed_offset不变才可重发当前deterministic chunk，若已前进则seek source到新offset继续；任何非0/单chunk增长、scope/hash/revision异常都fail closed；Finalize未知结果同样先Status区分Ready/Completed再决定是否重发；
+- Cancel语义统一收口：Preparing/hash阶段、Running阶段、WaitingForReconnect阶段都先进入Cancelling，manager task若收到Cancelled会执行bounded remote Cancel/NotFound reconcile并最终落Cancelled。independent review修复了首版“Preparing cancel后wrapper跳过set_failed，可能永久卡Cancelling”的真实bug；
+- Controller Local API新增 DeviceId-only `file.put/status/cancel`；Put再次检查site/device active、EXECUTE、registry `effective_grant.write=true`和非空signed filesystem roots。Host仍独立检查persisted grant/root，形成双端fail closed；Activity只记录`file_put_start + device path`，不记录Controller source path或file bytes；
+- synthetic reconnect gate **1/1 PASS**：generation 1首chunk reply故意丢失，generation 2恢复后Controller第一条请求精确为Status；Host报告confirmed_offset=4096后Controller直接发offset=4096的第二chunk而非重放offset0，随后ReadyToFinalize→Finalize→Completed；
+- exact final Windows binary SHA-256 `e2f0d95599125179f8b9bf66c11e75ef859f56764a3e30b90b60d52429cab4cb`（98,104,832 bytes），cap00/Gamma完全一致。真实write-capable DeviceId `9bb5d798-1e4d-46e5-b4e7-be7cc7457372`：8MiB/4KiB transfer在generation **3** 的confirmed_offset **4,177,920**时用仅Gamma `clew.exe` 的program-scoped outbound block强制断线，Controller进入`waiting_for_reconnect`；解除后同Host进程generation **4**，原TransferId `dc372e24-...`自动续到 **8,388,608/8,388,608 Completed**，Gamma独立SHA精确为 `2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74`；
+- cancellation真实gate：512MiB source在`Preparing`阶段立即cancel，**Preparing→Cancelling→Cancelled**且Target/part residual=0；另一个64MiB transfer在真实resume后confirmed_offset **18,792,448**时cancel，同样Cancelled且Target/part residual=0；说明修复覆盖pre-remote与mid-transfer两条路径；
+- 默认未签write的final-binary readonly DeviceId `a70d8243-5056-4816-9d68-50dafb412669` 对file put精确Controller-side `Denied: file put is not permitted for this device`，目标不存在。Host file-transfer focused **2/2 PASS**；Controller reconnect synthetic **1/1 PASS**；final `cargo fmt -- --check` PASS、`cargo check --workspace --all-targets` PASS / 0 warnings、`cargo test --workspace --all-targets` **205 passed / 0 failed / 6 ignored**；
+- 当前resume能力明确只跨**同Host进程的InnerSession generation**。Controller manager和Host transfer store仍是process-memory state，Controller/Host进程重启后不保证恢复。因此`Feature::FileResume`继续保持reserved/not-implemented，不能把本块宣传为durable restart resume。
+
+V5 Controller→Device single-file put至此封板。下一块 V5a-2：Device→Controller single-file get，必须保持Controller destination/conflict policy私有、只要求signed read grant，并复用同一chunk/final-hash/TransferId语义。之后再收Controller/Host process-restart durable transfer store，最后才做directory tree与bounded multi-transfer concurrency。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1248,13 +1264,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a-0 + V5a-1a DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；single-file put + generation resume DONE）**
 
-**Next block：V5a-1b — Controller-owned single-file put task + reconnect resume**
+**Next block：V5a-2 — Device→Controller single-file get**
 
-V4已在`dfa373d`完整封板。V5a-0冻结single-file manifest/chunk contract；V5a-1a已经把Controller→Device方向接到真实Host part/checkpoint/finalize state machine，并把service提升到membership reconnect owner。当前仍缺Controller-owned source/task/Local API，因此尚未宣称用户可用put；下一块由Controller后台task持有source私有path与TransferId，跨generation按Host Status confirmed_offset续传。
+V4已在`dfa373d`完整封板。V5a现在已经从V3d的TransferId/resume descriptor一路闭合到真实Controller→Device put：Controller持有后台task与私有source path，Host持有同进程part/checkpoint，session loss后以同TransferId先Status再从confirmed_offset续传；真实Gamma program-scoped断线已证明generation 3→4自动resume并final SHA一致。当前不再缺用户可用put；下一步补反向get，且继续明确process restart durability、directory tree和multi-transfer调度尚未完成，FileResume feature因此仍不协商。
 
 ### Change log
+
+- **2026-09-04** — V5a-1b Controller-owned single-file put + cross-generation resume DONE：Local API/CLI新增file put/status/cancel，Controller后台manager hard cap16并私有持有source；unknown chunk/finalize结果不blind replay，新generation先Status对齐confirmed_offset。independent review修复Preparing cancel永久Cancelling风险。exact final binary `e2f0d955...b4cb` cap00/Gamma一致；真实8MiB transfer在generation3/offset4,177,920断线后generation4续到Completed，Gamma final SHA一致；Preparing与Running cancel均Cancelled且part residual=0；default Site Denied。workspace **205/0/6**。下一块V5a-2 Device→Controller get；process-restart durable resume仍未完成，FileResume feature继续reserved。
 
 - **2026-09-04** — V5a-1a Host put state machine DONE：新增`file_transfer` PutBegin/Chunk/Status/Finalize/Cancel与Receiving/Ready/Completed phase；membership-owned HostFileTransferService在signed write grant下持有同目录secure part、durable chunk checkpoint/prefix SHA、final SHA pre-write gate、atomic conflict-policy finalize与Cancel。wire **5/5**、Host **2/2**、workspace **204/0/6**。下一块V5a-1b Controller-owned put task/reconnect resume。
 
