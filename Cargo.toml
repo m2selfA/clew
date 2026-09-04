@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/clew-core", "crates/clew-host", "crates/clew-identity", "crates/clew-proto", "crates/clew-runtime", "crates/clew-transport"]
+members = ["crates/clew-core", "crates/clew-host", "crates/clew-identity", "crates/clew-proto", "crates/clew-runtime", "crates/clew-transport", "xtask"]
 resolver = "3"
 
 [workspace.package]
