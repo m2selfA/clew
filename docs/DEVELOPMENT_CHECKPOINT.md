@@ -1252,7 +1252,21 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - 本块与V4三次feature提升保持相同架构：当前生产InnerSession仍没有额外塞入一套Hello exchange，本块只推进既有V3f compatibility contract，不改变ALPN/Noise/Connector业务路径。single-file runtime已经由V5a-0..3c真实实现，feature contract现在终于与runtime事实一致；
 - proto focused **11/11 PASS**，包括FileResume frozen number/current implementation、bilateral advertisement、old-peer缺bit、capability-version independence、unknown feature roundtrip与wrong-major gate；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **213 passed / 0 failed / 6 ignored**。
 
-**V5a single-file FileResume至此 DONE。** 下一块 V5b-0：directory tree manifest / bounded traversal contract。先冻结树结构、relative-path规范、entry/file/total-byte hard bounds、symlink policy与目录级conflict语义；随后才复用现有single-file primitive做directory data plane，不先引入无界并发调度。
+**V5a single-file FileResume至此 DONE。**
+
+### V5b-0 — Bounded directory tree manifest contract
+
+**Status：DONE（2026-09-04）**
+
+- 新增 peer-visible `DirectoryTreeManifest v1`：绑定 TransferId / ControllerId / SiteId / DeviceId / direction / Device-side root；Controller本机 source/destination path继续完全留在Controller private state，不进入manifest；
+- tree entry只允许 `Directory` / `File`，symlink不进入V5b树模型；relative path必须使用 `/`，拒绝absolute、drive colon、反斜杠、NUL、空segment、`.` / `..`，depth hard cap **64**、relative path **1024 bytes**；
+- manifest最多 **256 entries**，单文件最多 **1 TiB**，整树文件总量最多 **4 TiB**，manifest encoded hard cap **48 KiB**；file entry必须携canonical lowercase SHA-256，empty file必须使用empty SHA；目录entry固定size=0/no hash；
+- entries constructor固定按relative path排序，validator要求strict sort、no duplicate、每个child parent必须已存在且为Directory，防止目录/文件层级歧义；总字节数重新计算核对，overflow/declared mismatch fail closed；
+- directory conflict当前刻意只冻结 `FailIfExists`；Controller→Device manifest必须显式携带该policy，Device→Controller不得携带Controller-local conflict policy，避免把本机目标策略泄到peer；Rename/Replace目录语义后续若真实需要再单独设计，不从single-file policy机械继承；
+- 本块只冻结tree/traversal contract，不实现directory data plane/并发scheduler；后续data plane复用已验收的single-file Put/Get/FileResume primitive，先串行有界，再单独引入bounded concurrency；
+- commit：`b53fd01 feat: define bounded directory tree contract`；focused directory contract **3/3 PASS**；`cargo test --workspace --all-targets` **218 passed / 0 failed / 6 ignored**。
+
+下一块 V5b-1a：Controller→Device directory Put。Controller先bounded traversal+hash整树，Host按manifest preflight目录冲突/创建目录，再按manifest稳定顺序复用single-file Put；默认串行，不引入无界并发。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1331,13 +1345,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a single-file FileResume DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 directory contract DONE）**
 
-**Next block：V5b-0 — directory tree manifest / bounded traversal contract**
+**Next block：V5b-1a — bounded serial directory Put data plane**
 
-V4已在`dfa373d`完整封板。V5a现已完整闭合single-file Put/Get：deterministic chunk/final SHA、Controller-owned task、generation replay、Controller/Host process-restart durable checkpoint，以及`Feature::FileResume=6`的current-build implementation/bilateral compatibility gate全部DONE。下一块只建立directory tree的bounded manifest/traversal contract；directory data plane继续复用single-file primitive，bounded multi-transfer scheduling另行分块，不把二者一次塞进巨大实现。
+V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume已全部闭合；V5b-0又冻结了256-entry/64-depth/1TiB-per-file/4TiB-total的canonical directory tree contract、symlink exclusion与FailIfExists-only目录冲突边界。下一步只做Controller→Device directory Put，并串行复用single-file primitive；directory Get与bounded multi-file concurrency继续分块，不一次塞进巨大scheduler。
 
 ### Change log
+
+- **2026-09-04** — V5b-0 bounded directory tree contract DONE：新增`DirectoryTreeManifest v1`，Device-side root + canonical relative entries，Controller-local path不进peer；拒绝absolute/`..`/backslash/colon/NUL，depth64、entries256、单文件1TiB、总4TiB、manifest48KiB，symlink不建模；hierarchy/parent/sort/hash/total/conflict scope全fail closed。commit `b53fd01`；focused **3/3**，workspace **218/0/6**。下一块V5b-1a serial directory Put。
 
 - **2026-09-04** — V5a-3d FileResume feature compatibility gate DONE / **V5a single-file DONE**：`Feature::FileResume=6`正式加入`IMPLEMENTED_FEATURES`，wire/capability version不变；只有current-build implemented + 双方Hello显式广告才协商，旧peer缺bit=false，capability_version 1↔999不推断，unknown999保真但忽略，wrong wire-major即使同bit也硬拒绝。与V4一致不新增runtime Hello handshake；proto **11/11**、workspace **213/0/6**。下一块V5b-0 directory tree manifest/bounded traversal。
 
