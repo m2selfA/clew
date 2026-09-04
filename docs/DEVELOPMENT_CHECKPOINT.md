@@ -1139,7 +1139,7 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 
 ## 12. V5 — File Plane
 
-**Status：IN PROGRESS（V5a-0 + V5a-1a/1b + V5a-2 DONE；single-file put/get + cross-generation resume DONE）**
+**Status：IN PROGRESS（V5a single-file + process-restart durability + FileResume feature gate DONE；next directory tree）**
 
 ### V5a-0 — Single-file manifest / deterministic chunk contract
 
@@ -1239,7 +1239,20 @@ V5 single-file双向 data plane至此封板。当前 resume仍只保证同进程
 - 真实Get transfer `eb6c7f7d-a023-4fb5-b3fe-9ca9e6941040`：generation **2** 下Controller可见offset **4,395,008** 时强杀Gamma Host；Controller local durable part继续到 **12,083,200** 并进入WaitingForReconnect，Gamma最新journal明确持同TransferId/get-source binding；同Host state重启后generation **3**，不重发`file get`，原TransferId直接完成 **16,777,216**；Controller destination SHA=`c5adb75f6a9a5a991eda7dbf64ed635cc63e6fda44315299a2151a71eb2cc329` 与Gamma source一致，Controller part消失。成功后的Host journal generation **8** 已无Get binding；generation7仅作为双槽历史fallback；
 - focused Host durability **2/2 PASS**（normal Put/Get service restart + crash-after-atomic-commit-before-Completed-journal），完整Host file-transfer **5/5 PASS**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **213 passed / 0 failed / 6 ignored**。两端真实smoke进程/fixture已清理。
 
-V5a-3 process-restart durability至此双端封板：Controller与Host都能在单文件Put/Get中保住同一TransferId与durable checkpoint。`Feature::FileResume`此刻仍保持reserved；下一块 V5a-3d 只做feature advertisement/negotiation与compatibility gate，确认旧peer/未实现peer不会误协商后才正式开启，不直接进入directory transfer。
+V5a-3 process-restart durability至此双端封板：Controller与Host都能在单文件Put/Get中保住同一TransferId与durable checkpoint。
+
+### V5a-3d — FileResume feature implementation / compatibility gate
+
+**Status：DONE（2026-09-04）**
+
+- `Feature::FileResume=6`保持V3d冻结的wire编号不变，并正式加入当前build的 `IMPLEMENTED_FEATURES`；`WIRE_MAJOR=1`、`CAPABILITY_VERSION=1`均不变，不用版本号暗示/替代feature bit；
+- 沿用V3f/V4已经冻结的三层语义：认识enum值 ≠ 当前build实现 ≠ 双边协商成功。`feature_negotiated(FileResume)`仍必须同时满足“当前build实现 + local Hello显式广告 + peer Hello显式广告”，任意一侧缺bit都为false；旧peer因此继续安全使用基础面；
+- compatibility matrix继续验证 capability_version **1 ↔ 999**不影响共同feature；高版本peer的unknown feature `999`仍由Hello wire roundtrip保真，但`negotiated_implemented_features`只从当前实现白名单取交集，不会把unknown位带进可用能力；
+- wrong `WIRE_MAJOR`仍先于feature negotiation硬拒绝：即使双方都广告FileResume，也精确返回`UnsupportedWireMajor`；没有新增第二major/fallback/自动协议升级；
+- 本块与V4三次feature提升保持相同架构：当前生产InnerSession仍没有额外塞入一套Hello exchange，本块只推进既有V3f compatibility contract，不改变ALPN/Noise/Connector业务路径。single-file runtime已经由V5a-0..3c真实实现，feature contract现在终于与runtime事实一致；
+- proto focused **11/11 PASS**，包括FileResume frozen number/current implementation、bilateral advertisement、old-peer缺bit、capability-version independence、unknown feature roundtrip与wrong-major gate；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **213 passed / 0 failed / 6 ignored**。
+
+**V5a single-file FileResume至此 DONE。** 下一块 V5b-0：directory tree manifest / bounded traversal contract。先冻结树结构、relative-path规范、entry/file/total-byte hard bounds、symlink policy与目录级conflict语义；随后才复用现有single-file primitive做directory data plane，不先引入无界并发调度。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1318,13 +1331,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；single-file process-restart durability DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a single-file FileResume DONE）**
 
-**Next block：V5a-3d — enable FileResume feature negotiation / compatibility gate**
+**Next block：V5b-0 — directory tree manifest / bounded traversal contract**
 
-V4已在`dfa373d`完整封板。V5a-3a/3b/3c现已让Controller与Host两端的single-file Put/Get都可跨自身进程重启恢复：Controller durable journal/Get part、Host Put part/Get source binding以及finalize crash window均有focused与真实Gamma证据。当前single-file data/durability本身已闭合；下一块只把`Feature::FileResume`从reserved提升为真正implemented/negotiated capability，并冻结旧peer/unknown feature/wire-major compatibility。feature gate通过前仍不进入directory/multi-transfer调度。
+V4已在`dfa373d`完整封板。V5a现已完整闭合single-file Put/Get：deterministic chunk/final SHA、Controller-owned task、generation replay、Controller/Host process-restart durable checkpoint，以及`Feature::FileResume=6`的current-build implementation/bilateral compatibility gate全部DONE。下一块只建立directory tree的bounded manifest/traversal contract；directory data plane继续复用single-file primitive，bounded multi-transfer scheduling另行分块，不把二者一次塞进巨大实现。
 
 ### Change log
+
+- **2026-09-04** — V5a-3d FileResume feature compatibility gate DONE / **V5a single-file DONE**：`Feature::FileResume=6`正式加入`IMPLEMENTED_FEATURES`，wire/capability version不变；只有current-build implemented + 双方Hello显式广告才协商，旧peer缺bit=false，capability_version 1↔999不推断，unknown999保真但忽略，wrong wire-major即使同bit也硬拒绝。与V4一致不新增runtime Hello handshake；proto **11/11**、workspace **213/0/6**。下一块V5b-0 directory tree manifest/bounded traversal。
 
 - **2026-09-04** — V5a-3c Host process-restart durability DONE：Host新增per-membership Controller/Site/Device-bound双槽transfer journal，Put按part实际length+prefix SHA恢复、Get重开source并重证manifest；Finalize先journal private finalizing path再atomic commit，crash-after-commit只按该路径size/SHA恢复。真机首轮发现跨Host进程checkpoint revision reset会被旧strict successor拒绝，改为同进程strict revision、跨generation以scope/hash/offset re-proof。exact binary `41e5a8dc...0f3b9`；Put在Controller offset2,998,272/Host part6,496,256时hard-kill，原TransferId重启续到16MiB/SHA一致；Get generation2 offset4,395,008时hard-kill，Controller part12,083,200，Host重启generation3后原TransferId完成16MiB/SHA一致。workspace **213/0/6**。下一块V5a-3d FileResume feature negotiation；feature仍reserved。
 

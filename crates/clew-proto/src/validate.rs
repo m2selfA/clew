@@ -16,6 +16,7 @@ pub const IMPLEMENTED_FEATURES: &[v1::Feature] = &[
     v1::Feature::Forward,
     v1::Feature::Socks5,
     v1::Feature::HttpConnect,
+    v1::Feature::FileResume,
 ];
 
 pub trait ValidateWire {
@@ -323,7 +324,7 @@ mod tests {
         hello.validate_wire().unwrap();
         assert!(hello_advertises_file_resume(&hello));
         assert!(hello_advertises_feature(&hello, v1::Feature::FileResume));
-        assert!(!locally_implements_feature(v1::Feature::FileResume));
+        assert!(locally_implements_feature(v1::Feature::FileResume));
     }
 
     #[test]
@@ -345,6 +346,7 @@ mod tests {
         );
         assert!(feature_negotiated(&local, &old_peer, v1::Feature::ToolRpc).unwrap());
         assert!(!feature_negotiated(&local, &old_peer, v1::Feature::ShellTask).unwrap());
+        assert!(!feature_negotiated(&local, &old_peer, v1::Feature::FileResume).unwrap());
 
         let mut newer_peer = old_peer.clone();
         newer_peer.capability_version = 999;
@@ -359,16 +361,19 @@ mod tests {
         newer_peer.features.push(v1::Feature::FileResume as i32);
         assert!(hello_advertises_file_resume(&local));
         assert!(hello_advertises_file_resume(&newer_peer));
-        assert!(!feature_negotiated(&local, &newer_peer, v1::Feature::FileResume).unwrap());
-        assert!(
-            !negotiated_implemented_features(&local, &newer_peer)
-                .unwrap()
-                .contains(&v1::Feature::FileResume)
+        assert!(feature_negotiated(&local, &newer_peer, v1::Feature::FileResume).unwrap());
+        assert_eq!(
+            negotiated_implemented_features(&local, &newer_peer).unwrap(),
+            vec![
+                v1::Feature::ToolRpc,
+                v1::Feature::ShellTask,
+                v1::Feature::FileResume,
+            ]
         );
     }
 
     #[test]
-    fn known_future_features_are_not_negotiated_until_runtime_implementation_exists() {
+    fn current_implemented_features_require_bilateral_advertisement() {
         let mut local = sample_hello();
         let mut peer = sample_hello();
         local.features = vec![
@@ -383,15 +388,11 @@ mod tests {
             v1::Feature::Forward,
             v1::Feature::Socks5,
             v1::Feature::HttpConnect,
+            v1::Feature::FileResume,
         ] {
             assert!(hello_advertises_feature(&local, feature));
             assert!(locally_implements_feature(feature));
             assert!(feature_negotiated(&local, &peer, feature).unwrap());
-        }
-        for feature in [v1::Feature::FileResume] {
-            assert!(hello_advertises_feature(&local, feature));
-            assert!(!locally_implements_feature(feature));
-            assert!(!feature_negotiated(&local, &peer, feature).unwrap());
         }
         assert_eq!(
             negotiated_implemented_features(&local, &peer).unwrap(),
@@ -399,7 +400,17 @@ mod tests {
                 v1::Feature::Forward,
                 v1::Feature::Socks5,
                 v1::Feature::HttpConnect,
+                v1::Feature::FileResume,
             ]
+        );
+
+        peer.features
+            .retain(|feature| *feature != v1::Feature::FileResume as i32);
+        assert!(!feature_negotiated(&local, &peer, v1::Feature::FileResume).unwrap());
+        assert!(
+            !negotiated_implemented_features(&local, &peer)
+                .unwrap()
+                .contains(&v1::Feature::FileResume)
         );
     }
 
@@ -434,12 +445,17 @@ mod tests {
     fn wrong_wire_major_blocks_negotiation_even_with_matching_feature_bits() {
         let mut local = sample_hello();
         let mut peer = sample_hello();
-        local.features = vec![v1::Feature::ToolRpc as i32];
+        local.features = vec![v1::Feature::ToolRpc as i32, v1::Feature::FileResume as i32];
         peer.features = local.features.clone();
         peer.wire_major = WIRE_MAJOR + 1;
 
         assert!(matches!(
             feature_negotiated(&local, &peer, v1::Feature::ToolRpc),
+            Err(WireValidationError::UnsupportedWireMajor { found, supported })
+                if found == WIRE_MAJOR + 1 && supported == WIRE_MAJOR
+        ));
+        assert!(matches!(
+            feature_negotiated(&local, &peer, v1::Feature::FileResume),
             Err(WireValidationError::UnsupportedWireMajor { found, supported })
                 if found == WIRE_MAJOR + 1 && supported == WIRE_MAJOR
         ));
