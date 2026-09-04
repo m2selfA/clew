@@ -202,6 +202,7 @@ pub async fn start_controller(
             started_unix_ms,
             state_schema_version: STATE_SCHEMA_VERSION,
             local_api_version: crate::LOCAL_API_VERSION,
+            lifecycle_owner: config.lifecycle_owner(),
             remote_endpoint_id: Some(remote_endpoint_id),
         },
         controller_identity: controller_identity.clone(),

@@ -62,7 +62,7 @@
 | V4 | Dynamic networking | DONE | Controller-owned TCP forward / SOCKS5 CONNECT / HTTP CONNECT + non-migration |
 | V5 | File plane | IN PROGRESS | single-file put + cross-generation resume DONE；继续 get / durable restart / directory |
 | V6 | Release packaging | IN PROGRESS | reproducible unsigned baseline DONE；继续 native metadata/branding、signing/notarization、ClientFlavor pipeline |
-| V7 | Advanced Service Runtime | TODO | systemd --user → Windows Service/Linux system service，显式 opt-in |
+| V7 | Advanced Service Runtime | IN PROGRESS | V7a `systemd --user` implementation/workspace gate DONE；exact-commit native lifecycle acceptance pending |
 | V8+ | Deferred expansion | TODO | 仅按真实需求评估 Directory、dedicated relay、第二 transport 等 |
 
 **第一条对外可用版本仍是 V1.4 完成后的 V1。** Studio 和 Connector 都不能阻塞 direct Read。
@@ -1393,7 +1393,7 @@ Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”�
 
 ## 14. V7 — Advanced Service Runtime
 
-**Status：TODO**
+**Status：IN PROGRESS**
 
 服务化是高级显式 opt-in，不改变 v1 portable/tray/foreground 默认路径。
 
@@ -1411,6 +1411,8 @@ Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”�
 - machine EXECUTE 必须显式设置 execution identity、filesystem roots、Shell policy；
 - Windows Service 不把 GUI 放进 Session 0；
 - install/enable/stop/uninstall 全部可见，不做隐蔽 persistence。
+
+V7a implementation baseline 已落到当前 worktree：新增独立浅层 `clew service` parser（不扩大原 root Clap tree）、Linux user unit install/enable/start/stop/disable/uninstall/status，以及独立 enable/disable-linger；unit 固定 `default.target`、`Restart=on-failure`、`UMask=0077`、`NoNewPrivileges=true`，不会在 install/enable/start 中隐式开启 linger。Controller 新增 `foreground/systemd_user` lifecycle owner；service-owned Local API `shutdown` 返回 `Denied`，必须由 `clew service stop` 交还 systemd lifecycle owner。unmanaged unit不覆盖/不卸载，managed unit更新若 daemon-reload 失败会恢复旧配置。Windows root/controller/service help stack regression 已固化；workspace **257/0/6**、all-target check 0 warning。V7a 尚需把固定 implementation commit 投到真实 Linux user manager，完成 install→enable→start→Local API→shutdown-denied→stop→disable→uninstall，并证明原 linger 状态不被普通 lifecycle 动作改变后才能封板。
 
 ## 15. V8+ — 明确后置
 
@@ -1448,11 +1450,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel next implementation block：V7a — Linux `systemd --user`（不依赖签名凭据）**
+**Parallel current implementation block：V7a — Linux `systemd --user`（IN PROGRESS：exact-commit native acceptance pending）**
 
-V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；签名侧没有未解决的代码/测试 blocker。V6b-3b唯一剩余条件是当前环境不存在的正式Windows private-key certificate与Apple Developer ID/notary profile，因此保留为release acceptance pending而不伪造完成。服务runtime与签名凭据无耦合，下面可继续按V7既定顺序推进Linux `systemd --user`；Distribution Studio signed-output/cache仍后置到真实签名acceptance。
+V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；V6b-3b只剩外部正式签名凭据。V7a代码/文档/Windows stack regression与workspace **257/0/6** 已通过，当前只差将固定 implementation commit 投到 wmn02 的真实 systemd user manager做完整 lifecycle acceptance；普通 install/enable/start/stop/disable/uninstall不得改变该账号原有 linger 状态。Distribution Studio signed-output/cache仍后置到真实签名acceptance。
 
 ### Change log
+
+- **2026-09-04** — V7a Linux `systemd --user` implementation baseline IN PROGRESS：新增显式 `clew service` user-scope lifecycle、独立 linger动作、Clew-owned unit防覆盖/更新rollback、Controller `systemd_user` lifecycle telemetry与Local API shutdown-denied语义；为避免再次触发Windows大Clap树stack overflow，service使用argv[1]独立小parser，systemd lifecycle内部标记也改为固定环境变量而不进入root Clap。root/controller/service help与未知lifecycle marker均有integration regression；workspace **257/0/6**、check 0 warning。下一步固定commit后在wmn02做真实 install→enable→start→status→shutdown-denied→stop→disable→uninstall，且保持既有linger不变。
 
 - **2026-09-04** — V6b-3a secret-free signing + independent verification baseline DONE：`0a257fd`新增clean schema-2→private staging→Windows Authenticode/macOS Developer ID+notary→schema-3的显式签名管线；`0d17e42`再补无私钥`verify-package`与frozen exact-file/mode gate，拒绝异常但自洽payload。Windows真实SignTool无证书与macOS真实codesign无Developer ID均fail closed且不改unsigned/build-tree bytes、不产出partial signed artifact；Windows/macOS clean schema-2均由独立verifier真机通过，unsigned路径保持schema2且重复ZIP deterministic。workspace **251/0/6**。V6b-3b只剩正式证书/Developer ID外部acceptance；并行进入V7a systemd user runtime。
 

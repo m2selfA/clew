@@ -424,3 +424,42 @@ fn second_controller_becomes_client_and_crash_recovery_reclaims_ownership() {
         first_controller_id
     );
 }
+
+#[test]
+fn top_level_help_surfaces_remain_bounded() {
+    for args in [
+        &["--help"][..],
+        &["controller", "--help"][..],
+        &["service", "--help"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_clew"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "help {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn unknown_controller_lifecycle_marker_fails_closed() {
+    let temp = tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_clew"))
+        .arg("controller")
+        .arg("--state-dir")
+        .arg(temp.path())
+        .env("CLEW_CONTROLLER_LIFECYCLE", "unexpected")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unsupported CLEW_CONTROLLER_LIFECYCLE value"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

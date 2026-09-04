@@ -6,6 +6,7 @@ mod gui;
 mod host_gui;
 mod invite_io;
 mod mcp;
+mod service;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
@@ -20,6 +21,8 @@ use clew_host::{
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
+#[cfg(target_os = "linux")]
+use clew_runtime::ControllerLifecycleOwner;
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, FileConflictPolicy, ForwardAddRequest,
     FsWritePrecondition, HttpConnectAddRequest, InviteIssueRequest, LocalApiClient,
@@ -34,11 +37,27 @@ use clew_runtime::{
 #[command(
     name = "clew",
     version,
-    about = "Agent-facing remote capability bridge"
+    about = "Agent-facing remote capability bridge",
+    after_help = "Linux user service lifecycle: clew service --help"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "clew service",
+    about = "Manage the explicit Linux user service lifecycle. Install never enables or starts it."
+)]
+struct ServiceCli {
+    #[arg(value_enum)]
+    action: service::ServiceAction,
+    #[arg(long, value_enum, default_value = "user")]
+    scope: service::ServiceScope,
+    /// Controller state root to bake into a newly installed unit. Install-only.
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -574,9 +593,46 @@ enum OutfitCommand {
     },
 }
 
+async fn wait_for_controller_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+fn service_cli_from_process_args() -> Option<ServiceCli> {
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    if !args.next().is_some_and(|arg| arg == "service") {
+        return None;
+    }
+    Some(ServiceCli::parse_from(
+        std::iter::once(std::ffi::OsString::from("clew service")).chain(args),
+    ))
+}
+
+fn run_service(cli: ServiceCli) -> Result<(), Box<dyn std::error::Error>> {
+    let report = service::manage(cli.action, cli.scope, cli.state_dir)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    let result = match service_cli_from_process_args() {
+        Some(cli) => run_service(cli),
+        None => run(Cli::parse()).await,
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("clew: {error}");
@@ -602,6 +658,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Controller { state_dir } => {
             let config = controller_config(state_dir)?;
+            let config = match std::env::var_os("CLEW_CONTROLLER_LIFECYCLE") {
+                None => config,
+                Some(value) if value == "systemd-user" => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        config.with_lifecycle_owner(ControllerLifecycleOwner::SystemdUser)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return Err(
+                            "systemd-user controller lifecycle is available on Linux only".into(),
+                        );
+                    }
+                }
+                Some(_) => {
+                    return Err("unsupported CLEW_CONTROLLER_LIFECYCLE value".into());
+                }
+            };
             match start_controller(config).await? {
                 ControllerStart::Primary(runtime) => {
                     let status = runtime.status().clone();
@@ -609,11 +683,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "Clew controller ready (pid {}, instance {}).",
                         status.pid, status.instance_id
                     );
-                    runtime
-                        .serve_until(async {
-                            let _ = tokio::signal::ctrl_c().await;
-                        })
-                        .await?;
+                    runtime.serve_until(wait_for_controller_signal()).await?;
                 }
                 ControllerStart::Existing(status) => {
                     println!(

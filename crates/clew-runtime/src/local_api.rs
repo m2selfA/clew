@@ -63,6 +63,8 @@ pub struct ControllerStatus {
     pub started_unix_ms: u64,
     pub state_schema_version: u32,
     pub local_api_version: u32,
+    #[serde(default)]
+    pub lifecycle_owner: crate::ControllerLifecycleOwner,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_endpoint_id: Option<String>,
 }
@@ -928,7 +930,19 @@ async fn dispatch(
             .unwrap_or_else(LocalResponse::Error);
             (response, false)
         }
-        LocalMethod::ControllerShutdown => (LocalResponse::Ack, true),
+        LocalMethod::ControllerShutdown => {
+            if state.status.lifecycle_owner == crate::ControllerLifecycleOwner::SystemdUser {
+                (
+                    local_error(
+                        LocalApiErrorCode::Denied,
+                        "controller lifecycle is owned by the systemd user service; use `clew service stop --scope user`",
+                    ),
+                    false,
+                )
+            } else {
+                (LocalResponse::Ack, true)
+            }
+        }
     }
 }
 
@@ -3249,6 +3263,7 @@ mod tests {
                 started_unix_ms: 1,
                 state_schema_version: clew_core::STATE_SCHEMA_VERSION,
                 local_api_version: LOCAL_API_VERSION,
+                lifecycle_owner: crate::ControllerLifecycleOwner::Foreground,
                 remote_endpoint_id: None,
             },
             controller_identity,
@@ -3293,6 +3308,31 @@ mod tests {
             response,
             LocalResponse::Error(LocalApiErrorBody {
                 code: LocalApiErrorCode::Unauthorized,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn systemd_user_lifecycle_rejects_local_api_shutdown() {
+        let mut state = test_state();
+        state.status.lifecycle_owner = crate::ControllerLifecycleOwner::SystemdUser;
+        let secret = LocalApiSecret("a".repeat(SECRET_HEX_LEN));
+        let (response, shutdown_after_reply) = dispatch(
+            LocalRequest {
+                api_version: LOCAL_API_VERSION,
+                auth: secret.0.clone(),
+                method: LocalMethod::ControllerShutdown,
+            },
+            &secret,
+            &state,
+        )
+        .await;
+        assert!(!shutdown_after_reply);
+        assert!(matches!(
+            response,
+            LocalResponse::Error(LocalApiErrorBody {
+                code: LocalApiErrorCode::Denied,
                 ..
             })
         ));

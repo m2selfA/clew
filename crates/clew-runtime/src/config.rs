@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 use clew_core::StateLayout;
+use serde::{Deserialize, Serialize};
 #[cfg(any(windows, unix))]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -12,9 +13,18 @@ const UNIX_SOCKET_DOMAIN: &[u8] = b"clew/local-api-socket/v1\0";
 #[cfg(all(unix, not(target_os = "macos")))]
 const UNIX_SOCKET_SAFE_BYTES: usize = 96;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerLifecycleOwner {
+    #[default]
+    Foreground,
+    SystemdUser,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControllerConfig {
     state_root: PathBuf,
+    lifecycle_owner: ControllerLifecycleOwner,
 }
 
 impl ControllerConfig {
@@ -22,6 +32,7 @@ impl ControllerConfig {
     pub fn new(state_root: impl Into<PathBuf>) -> Self {
         Self {
             state_root: state_root.into(),
+            lifecycle_owner: ControllerLifecycleOwner::Foreground,
         }
     }
 
@@ -32,6 +43,17 @@ impl ControllerConfig {
     #[must_use]
     pub fn state_root(&self) -> &std::path::Path {
         &self.state_root
+    }
+
+    #[must_use]
+    pub fn lifecycle_owner(&self) -> ControllerLifecycleOwner {
+        self.lifecycle_owner
+    }
+
+    #[must_use]
+    pub fn with_lifecycle_owner(mut self, lifecycle_owner: ControllerLifecycleOwner) -> Self {
+        self.lifecycle_owner = lifecycle_owner;
+        self
     }
 
     #[must_use]

@@ -20,7 +20,10 @@ pub use backup::{ControllerBackupIoError, export_controller_backup, restore_cont
 pub use clew_transport::{
     FileConflictPolicy, FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus,
 };
-pub use config::{ControllerConfig, ControllerConfigError, LocalEndpoint, default_state_root};
+pub use config::{
+    ControllerConfig, ControllerConfigError, ControllerLifecycleOwner, LocalEndpoint,
+    default_state_root,
+};
 pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerControlStore};
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
 pub use directory_transfer::{
