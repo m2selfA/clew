@@ -122,6 +122,18 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn controller_directory_transfer_slot_a_path(&self) -> PathBuf {
+        self.version_root()
+            .join("controller-directory-transfers.a.json")
+    }
+
+    #[must_use]
+    pub fn controller_directory_transfer_slot_b_path(&self) -> PathBuf {
+        self.version_root()
+            .join("controller-directory-transfers.b.json")
+    }
+
+    #[must_use]
     pub fn outfit_library_slot_a_path(&self) -> PathBuf {
         self.version_root().join("outfit-library.a.json")
     }
@@ -333,6 +345,18 @@ mod tests {
             PathBuf::from("state-root")
                 .join("v1")
                 .join("controller.lock")
+        );
+        assert_eq!(
+            layout.controller_directory_transfer_slot_a_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("controller-directory-transfers.a.json")
+        );
+        assert_eq!(
+            layout.controller_directory_transfer_slot_b_path(),
+            PathBuf::from("state-root")
+                .join("v1")
+                .join("controller-directory-transfers.b.json")
         );
         assert_eq!(
             layout.local_api_secret_path(),

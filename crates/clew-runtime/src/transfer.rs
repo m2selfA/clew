@@ -708,9 +708,45 @@ impl ControllerFileTransferManager {
         });
     }
 
+    fn next_transfer_id(&self) -> Result<TransferId, ControllerFileTransferError> {
+        let transfers = self
+            .inner
+            .transfers
+            .lock()
+            .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
+        let mut transfer_id = TransferId::new();
+        while transfers.contains_key(&transfer_id) {
+            transfer_id = TransferId::new();
+        }
+        Ok(transfer_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn start_put(
         &self,
+        device_id: DeviceId,
+        site_id: SiteId,
+        source_path: String,
+        device_path: String,
+        chunk_size: u32,
+        conflict_policy: FileConflictPolicy,
+    ) -> Result<FilePutInfo, ControllerFileTransferError> {
+        let transfer_id = self.next_transfer_id()?;
+        self.start_put_with_transfer_id(
+            transfer_id,
+            device_id,
+            site_id,
+            source_path,
+            device_path,
+            chunk_size,
+            conflict_policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_put_with_transfer_id(
+        &self,
+        transfer_id: TransferId,
         device_id: DeviceId,
         site_id: SiteId,
         source_path: String,
@@ -725,12 +761,11 @@ impl ControllerFileTransferManager {
             .lock()
             .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
         prune_terminal(&mut transfers);
+        if transfers.contains_key(&transfer_id) {
+            return Err(ControllerFileTransferError::TransferIdConflict(transfer_id));
+        }
         if transfers.len() >= HARD_MAX_CONTROLLER_FILE_TRANSFERS {
             return Err(ControllerFileTransferError::Capacity);
-        }
-        let mut transfer_id = TransferId::new();
-        while transfers.contains_key(&transfer_id) {
-            transfer_id = TransferId::new();
         }
         let info = FilePutInfo {
             transfer_id,
@@ -785,6 +820,29 @@ impl ControllerFileTransferManager {
         chunk_size: u32,
         conflict_policy: FileConflictPolicy,
     ) -> Result<FileGetInfo, ControllerFileTransferError> {
+        let transfer_id = self.next_transfer_id()?;
+        self.start_get_with_transfer_id(
+            transfer_id,
+            device_id,
+            site_id,
+            device_path,
+            destination_path,
+            chunk_size,
+            conflict_policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_get_with_transfer_id(
+        &self,
+        transfer_id: TransferId,
+        device_id: DeviceId,
+        site_id: SiteId,
+        device_path: String,
+        destination_path: String,
+        chunk_size: u32,
+        conflict_policy: FileConflictPolicy,
+    ) -> Result<FileGetInfo, ControllerFileTransferError> {
         validate_get_start_inputs(&device_path, &destination_path, chunk_size)?;
         let mut transfers = self
             .inner
@@ -792,12 +850,11 @@ impl ControllerFileTransferManager {
             .lock()
             .map_err(|_| ControllerFileTransferError::StatePoisoned)?;
         prune_terminal(&mut transfers);
+        if transfers.contains_key(&transfer_id) {
+            return Err(ControllerFileTransferError::TransferIdConflict(transfer_id));
+        }
         if transfers.len() >= HARD_MAX_CONTROLLER_FILE_TRANSFERS {
             return Err(ControllerFileTransferError::Capacity);
-        }
-        let mut transfer_id = TransferId::new();
-        while transfers.contains_key(&transfer_id) {
-            transfer_id = TransferId::new();
         }
         let info = FileGetInfo {
             transfer_id,
@@ -2358,6 +2415,8 @@ pub enum ControllerFileTransferError {
     StateGenerationOverflow,
     #[error("file transfer {0} was not found")]
     NotFound(TransferId),
+    #[error("file transfer TransferId is already in use: {0}")]
+    TransferIdConflict(TransferId),
     #[error("Controller source path is invalid or too long")]
     InvalidSourcePath,
     #[error("device destination path is invalid or too long")]
@@ -2430,6 +2489,68 @@ mod tests {
             },
             transfer_id,
         )
+    }
+
+    #[tokio::test]
+    async fn caller_reserved_transfer_id_is_persisted_before_worker_and_rejects_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.bin");
+        std::fs::write(&source, vec![0x4d; 8_192]).unwrap();
+        let destination = temp.path().join("download.bin");
+        let manager = ControllerFileTransferManager::new(RemoteHub::default(), ControllerId::new());
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let put_id = TransferId::new();
+        let put = manager
+            .start_put_with_transfer_id(
+                put_id,
+                device_id,
+                site_id,
+                source.to_string_lossy().into_owned(),
+                "/device/reserved.bin".into(),
+                MIN_FILE_CHUNK_BYTES,
+                FileConflictPolicy::FailIfExists,
+            )
+            .unwrap();
+        assert_eq!(put.transfer_id, put_id);
+        assert!(matches!(
+            manager.start_put_with_transfer_id(
+                put_id,
+                device_id,
+                site_id,
+                source.to_string_lossy().into_owned(),
+                "/device/other.bin".into(),
+                MIN_FILE_CHUNK_BYTES,
+                FileConflictPolicy::FailIfExists,
+            ),
+            Err(ControllerFileTransferError::TransferIdConflict(actual)) if actual == put_id
+        ));
+
+        let get_id = TransferId::new();
+        let get = manager
+            .start_get_with_transfer_id(
+                get_id,
+                device_id,
+                site_id,
+                "/device/source.bin".into(),
+                destination.to_string_lossy().into_owned(),
+                MIN_FILE_CHUNK_BYTES,
+                FileConflictPolicy::FailIfExists,
+            )
+            .unwrap();
+        assert_eq!(get.transfer_id, get_id);
+        assert!(matches!(
+            manager.start_get_with_transfer_id(
+                get_id,
+                device_id,
+                site_id,
+                "/device/source2.bin".into(),
+                destination.to_string_lossy().into_owned(),
+                MIN_FILE_CHUNK_BYTES,
+                FileConflictPolicy::FailIfExists,
+            ),
+            Err(ControllerFileTransferError::TransferIdConflict(actual)) if actual == get_id
+        ));
     }
 
     #[test]

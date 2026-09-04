@@ -177,11 +177,12 @@ pub async fn start_controller(
         controller_id,
         layout.clone(),
     )?;
-    let directory_transfers = crate::ControllerDirectoryTransferManager::new(
+    let directory_transfers = crate::ControllerDirectoryTransferManager::load_or_create(
         remote_hub.clone(),
         file_transfers.clone(),
         controller_id,
-    );
+        layout.clone(),
+    )?;
 
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
@@ -244,6 +245,8 @@ pub enum ControllerError {
     OutfitAsset(#[from] crate::OutfitAssetError),
     #[error(transparent)]
     FileTransfer(#[from] crate::ControllerFileTransferError),
+    #[error(transparent)]
+    DirectoryTransfer(#[from] crate::ControllerDirectoryTransferError),
     #[error(transparent)]
     RemoteTransport(#[from] clew_transport::IrohOuterError),
     #[error("remote accept loop stopped unexpectedly")]

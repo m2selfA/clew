@@ -2120,11 +2120,15 @@ impl RemoteConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ControllerFileTransferManager, ControllerFileTransferPhase, FileTransferInfo};
+    use crate::{
+        ControllerDirectoryTransferManager, ControllerDirectoryTransferPhase,
+        ControllerFileTransferManager, ControllerFileTransferPhase, DirectoryTransferInfo,
+        FileTransferInfo,
+    };
     use clew_transport::{
-        FileConflictPolicy, FileTransferChunk, FileTransferDirection, FileTransferManifest,
-        FileTransferPhase, FileTransferReply, FileTransferRequest, FileTransferStatus,
-        file_sha256_hex,
+        DirectoryTreeEntry, DirectoryTreeManifest, FileConflictPolicy, FileTransferChunk,
+        FileTransferDirection, FileTransferManifest, FileTransferPhase, FileTransferReply,
+        FileTransferRequest, FileTransferStatus, file_sha256_hex,
     };
 
     #[tokio::test]
@@ -2281,6 +2285,538 @@ mod tests {
             Some("/device/target.bin")
         );
         assert!(status.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn controller_directory_put_survives_manager_reload_with_same_outer_and_child_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_layout = clew_core::StateLayout::new(temp.path().join("state"));
+        let source_root = temp.path().join("source-tree");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let source = vec![0x6b_u8; 5_000];
+        std::fs::write(source_root.join("a.bin"), &source).unwrap();
+        let controller_id = clew_core::ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let hub_one = RemoteHub::default();
+        let file_one = ControllerFileTransferManager::load_or_create(
+            hub_one.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let directory_one = ControllerDirectoryTransferManager::load_or_create(
+            hub_one.clone(),
+            file_one.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let (generation_one, mut commands_one) = hub_one
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                10_000,
+            )
+            .unwrap();
+        let outer = directory_one
+            .start_put(
+                device_id,
+                site_id,
+                source_root.to_string_lossy().into_owned(),
+                "/device/target-tree".into(),
+                4096,
+            )
+            .unwrap();
+
+        let RemoteCommand::DirectoryTree { request, reply, .. } =
+            commands_one.recv().await.unwrap()
+        else {
+            panic!("expected directory PreparePut before child Put");
+        };
+        let DirectoryTreeRequest::PreparePut {
+            manifest: outer_manifest,
+        } = request
+        else {
+            panic!("expected PreparePut");
+        };
+        assert_eq!(outer_manifest.transfer_id, outer.transfer_id);
+        let staging_root = format!("/device/.clew-directory-{}.part", outer.transfer_id);
+        reply
+            .send(Ok(DirectoryTreeReply::Prepared {
+                transfer_id: outer.transfer_id,
+                staging_device_root: staging_root.clone(),
+            }))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected child PutBegin");
+        };
+        let FileTransferRequest::PutBegin {
+            manifest: child_manifest,
+        } = request
+        else {
+            panic!("expected child PutBegin");
+        };
+        assert_eq!(child_manifest.device_path, format!("{staging_root}/a.bin"));
+        let child_id = child_manifest.transfer_id;
+        let initial = child_manifest.initial_resume_descriptor().unwrap();
+        reply
+            .send(Ok(FileTransferReply::Status(FileTransferStatus {
+                descriptor: initial.clone(),
+                phase: FileTransferPhase::Receiving,
+                final_device_path: None,
+            })))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected first child PutChunk");
+        };
+        let FileTransferRequest::PutChunk { chunk: first_chunk } = request else {
+            panic!("expected child PutChunk");
+        };
+        assert_eq!(first_chunk.transfer_id, child_id);
+        assert_eq!(first_chunk.offset, 0);
+        assert_eq!(first_chunk.decode_bytes().unwrap(), source[..4096]);
+        // Host durably applied the first chunk, but the Controller process died before the reply.
+        drop(reply);
+        let mut after_first = initial.clone();
+        after_first.checkpoint_revision = 2;
+        after_first.confirmed_offset = 4096;
+        after_first.confirmed_prefix_sha256 = file_sha256_hex(&source[..4096]);
+        let DirectoryTransferInfo::Put(before_restart) =
+            directory_one.status(outer.transfer_id).unwrap()
+        else {
+            panic!("expected directory Put projection");
+        };
+        assert_eq!(before_restart.current_file_transfer_id, Some(child_id));
+        assert_eq!(
+            before_restart.current_relative_path.as_deref(),
+            Some("a.bin")
+        );
+        hub_one.unregister(device_id, generation_one, Some(10_100));
+        drop(directory_one);
+        drop(file_one);
+        drop(commands_one);
+        drop(hub_one);
+
+        let hub_two = RemoteHub::default();
+        let file_two = ControllerFileTransferManager::load_or_create(
+            hub_two.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let directory_two = ControllerDirectoryTransferManager::load_or_create(
+            hub_two.clone(),
+            file_two.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let DirectoryTransferInfo::Put(reloaded) = directory_two.status(outer.transfer_id).unwrap()
+        else {
+            panic!("expected reloaded directory Put projection");
+        };
+        assert_eq!(reloaded.transfer_id, outer.transfer_id);
+        assert_eq!(reloaded.current_file_transfer_id, Some(child_id));
+        let (_generation_two, mut commands_two) = hub_two
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                10_200,
+            )
+            .unwrap();
+
+        let mut child_status = FileTransferStatus {
+            descriptor: after_first.clone(),
+            phase: FileTransferPhase::Receiving,
+            final_device_path: None,
+        };
+        let final_root = "/device/target-tree".to_string();
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DirectoryTransferInfo::Put(status) =
+                    directory_two.status(outer.transfer_id).unwrap()
+                    && status.phase == ControllerDirectoryTransferPhase::Completed
+                {
+                    break status;
+                }
+                let command = tokio::select! {
+                    command = commands_two.recv() => command.expect("replacement session closed"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => continue,
+                };
+                match command {
+                    RemoteCommand::DirectoryTree { request, reply, .. } => match request {
+                        DirectoryTreeRequest::PreparePut { manifest } => {
+                            assert_eq!(manifest, outer_manifest);
+                            reply
+                                .send(Ok(DirectoryTreeReply::Prepared {
+                                    transfer_id: outer.transfer_id,
+                                    staging_device_root: staging_root.clone(),
+                                }))
+                                .unwrap();
+                        }
+                        DirectoryTreeRequest::FinalizePut { manifest } => {
+                            assert_eq!(manifest, outer_manifest);
+                            reply
+                                .send(Ok(DirectoryTreeReply::Completed {
+                                    transfer_id: outer.transfer_id,
+                                    final_device_root: final_root.clone(),
+                                }))
+                                .unwrap();
+                        }
+                        other => panic!("unexpected directory request after reload: {other:?}"),
+                    },
+                    RemoteCommand::FileTransfer { request, reply, .. } => match request {
+                        FileTransferRequest::PutBegin { manifest } => {
+                            assert_eq!(manifest, child_manifest);
+                            reply
+                                .send(Ok(FileTransferReply::Status(child_status.clone())))
+                                .unwrap();
+                        }
+                        FileTransferRequest::Status { transfer_id } => {
+                            assert_eq!(transfer_id, child_id);
+                            reply
+                                .send(Ok(FileTransferReply::Status(child_status.clone())))
+                                .unwrap();
+                        }
+                        FileTransferRequest::PutChunk { chunk } => {
+                            assert_eq!(chunk.transfer_id, child_id);
+                            assert_eq!(chunk.offset, 4096);
+                            assert_eq!(chunk.decode_bytes().unwrap(), source[4096..]);
+                            let mut ready = after_first.clone();
+                            ready.checkpoint_revision = 3;
+                            ready.confirmed_offset = source.len() as u64;
+                            ready.confirmed_prefix_sha256 = child_manifest.final_sha256.clone();
+                            child_status = FileTransferStatus {
+                                descriptor: ready,
+                                phase: FileTransferPhase::ReadyToFinalize,
+                                final_device_path: None,
+                            };
+                            reply
+                                .send(Ok(FileTransferReply::Status(child_status.clone())))
+                                .unwrap();
+                        }
+                        FileTransferRequest::Finalize { transfer_id } => {
+                            assert_eq!(transfer_id, child_id);
+                            child_status.phase = FileTransferPhase::Completed;
+                            child_status.final_device_path =
+                                Some(child_manifest.device_path.clone());
+                            reply
+                                .send(Ok(FileTransferReply::Status(child_status.clone())))
+                                .unwrap();
+                        }
+                        other => panic!("unexpected child request after reload: {other:?}"),
+                    },
+                    other => panic!("unexpected remote command after reload: {other:?}"),
+                }
+            }
+        })
+        .await;
+        let completed = match completed {
+            Ok(status) => status,
+            Err(error) => {
+                let directory_status = directory_two.status(outer.transfer_id).unwrap();
+                let child_status = file_two.status(child_id);
+                panic!(
+                    "directory Put did not complete after manager reload: {error:?}; directory={directory_status:?}; child={child_status:?}"
+                );
+            }
+        };
+        assert_eq!(completed.transfer_id, outer.transfer_id);
+        assert_eq!(completed.completed_files, 1);
+        assert_eq!(completed.confirmed_file_bytes, source.len() as u64);
+        assert_eq!(
+            completed.final_device_root.as_deref(),
+            Some(final_root.as_str())
+        );
+        assert!(completed.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn controller_directory_get_survives_manager_reload_and_commits_same_outer_transfer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_layout = clew_core::StateLayout::new(temp.path().join("state"));
+        let destination_root = temp.path().join("download-tree");
+        let source = vec![0x73_u8; 5_000];
+        let controller_id = clew_core::ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let hub_one = RemoteHub::default();
+        let file_one = ControllerFileTransferManager::load_or_create(
+            hub_one.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let directory_one = ControllerDirectoryTransferManager::load_or_create(
+            hub_one.clone(),
+            file_one.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let (generation_one, mut commands_one) = hub_one
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                11_000,
+            )
+            .unwrap();
+        let outer = directory_one
+            .start_get(
+                device_id,
+                site_id,
+                "/device/source-tree".into(),
+                destination_root.to_string_lossy().into_owned(),
+                4096,
+            )
+            .unwrap();
+        let outer_manifest = DirectoryTreeManifest::new(
+            outer.transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::DeviceToController,
+            "/device/source-tree",
+            vec![
+                DirectoryTreeEntry::file("a.bin", source.len() as u64, file_sha256_hex(&source))
+                    .unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let RemoteCommand::DirectoryTree { request, reply, .. } =
+            commands_one.recv().await.unwrap()
+        else {
+            panic!("expected directory PrepareGet before child Get");
+        };
+        let DirectoryTreeRequest::PrepareGet { scope } = request else {
+            panic!("expected PrepareGet");
+        };
+        assert_eq!(scope.transfer_id, outer.transfer_id);
+        assert_eq!(scope.device_root, "/device/source-tree");
+        reply
+            .send(Ok(DirectoryTreeReply::Manifest {
+                manifest: outer_manifest.clone(),
+            }))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected child GetBegin");
+        };
+        let FileTransferRequest::GetBegin {
+            transfer_id: child_id,
+            device_path,
+            chunk_size,
+        } = request
+        else {
+            panic!("expected child GetBegin");
+        };
+        assert_eq!(device_path, "/device/source-tree/a.bin");
+        assert_eq!(chunk_size, 4096);
+        let child_manifest = FileTransferManifest::new(
+            child_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::DeviceToController,
+            device_path.clone(),
+            source.len() as u64,
+            chunk_size,
+            file_sha256_hex(&source),
+            None,
+        )
+        .unwrap();
+        reply
+            .send(Ok(FileTransferReply::Manifest(child_manifest.clone())))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected first child GetChunk");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetChunk {
+                transfer_id: child_id,
+                offset: 0,
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Chunk(
+                FileTransferChunk::from_bytes(child_id, 0, &source[..4096]).unwrap(),
+            )))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected second child GetChunk before simulated process death");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetChunk {
+                transfer_id: child_id,
+                offset: 4096,
+            }
+        );
+        drop(reply);
+        let DirectoryTransferInfo::Get(before_restart) =
+            directory_one.status(outer.transfer_id).unwrap()
+        else {
+            panic!("expected directory Get projection");
+        };
+        assert_eq!(before_restart.current_file_transfer_id, Some(child_id));
+        assert_eq!(
+            before_restart.current_relative_path.as_deref(),
+            Some("a.bin")
+        );
+        hub_one.unregister(device_id, generation_one, Some(11_100));
+        drop(directory_one);
+        drop(file_one);
+        drop(commands_one);
+        drop(hub_one);
+
+        let hub_two = RemoteHub::default();
+        let file_two = ControllerFileTransferManager::load_or_create(
+            hub_two.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let directory_two = ControllerDirectoryTransferManager::load_or_create(
+            hub_two.clone(),
+            file_two.clone(),
+            controller_id,
+            state_layout.clone(),
+        )
+        .unwrap();
+        let DirectoryTransferInfo::Get(reloaded) = directory_two.status(outer.transfer_id).unwrap()
+        else {
+            panic!("expected reloaded directory Get projection");
+        };
+        assert_eq!(reloaded.transfer_id, outer.transfer_id);
+        assert_eq!(reloaded.current_file_transfer_id, Some(child_id));
+        let (_generation_two, mut commands_two) = hub_two
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                11_200,
+            )
+            .unwrap();
+
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DirectoryTransferInfo::Get(status) =
+                    directory_two.status(outer.transfer_id).unwrap()
+                    && status.phase == ControllerDirectoryTransferPhase::Completed
+                {
+                    break status;
+                }
+                let command = tokio::select! {
+                    command = commands_two.recv() => command.expect("replacement session closed"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => continue,
+                };
+                match command {
+                    RemoteCommand::DirectoryTree { request, reply, .. } => match request {
+                        DirectoryTreeRequest::PrepareGet { scope } => {
+                            assert_eq!(scope.transfer_id, outer.transfer_id);
+                            assert_eq!(scope.device_root, "/device/source-tree");
+                            reply
+                                .send(Ok(DirectoryTreeReply::Manifest {
+                                    manifest: outer_manifest.clone(),
+                                }))
+                                .unwrap();
+                        }
+                        DirectoryTreeRequest::FinalizeGet { manifest } => {
+                            assert_eq!(manifest, outer_manifest);
+                            reply
+                                .send(Ok(DirectoryTreeReply::Verified {
+                                    transfer_id: outer.transfer_id,
+                                    device_root: outer_manifest.device_root.clone(),
+                                }))
+                                .unwrap();
+                        }
+                        other => panic!("unexpected directory Get request after reload: {other:?}"),
+                    },
+                    RemoteCommand::FileTransfer { request, reply, .. } => match request {
+                        FileTransferRequest::GetBegin {
+                            transfer_id,
+                            device_path,
+                            chunk_size,
+                        } => {
+                            assert_eq!(transfer_id, child_id);
+                            assert_eq!(device_path, child_manifest.device_path);
+                            assert_eq!(chunk_size, 4096);
+                            reply
+                                .send(Ok(FileTransferReply::Manifest(child_manifest.clone())))
+                                .unwrap();
+                        }
+                        FileTransferRequest::GetChunk {
+                            transfer_id,
+                            offset,
+                        } => {
+                            assert_eq!(transfer_id, child_id);
+                            assert_eq!(offset, 4096);
+                            reply
+                                .send(Ok(FileTransferReply::Chunk(
+                                    FileTransferChunk::from_bytes(child_id, 4096, &source[4096..])
+                                        .unwrap(),
+                                )))
+                                .unwrap();
+                        }
+                        FileTransferRequest::Cancel { transfer_id } => {
+                            assert_eq!(transfer_id, child_id);
+                            reply
+                                .send(Ok(FileTransferReply::Cancelled {
+                                    transfer_id: child_id,
+                                }))
+                                .unwrap();
+                        }
+                        other => panic!("unexpected child Get request after reload: {other:?}"),
+                    },
+                    other => panic!("unexpected remote command after reload: {other:?}"),
+                }
+            }
+        })
+        .await;
+        let completed = match completed {
+            Ok(status) => status,
+            Err(error) => {
+                let directory_status = directory_two.status(outer.transfer_id).unwrap();
+                let child_status = file_two.status(child_id);
+                panic!(
+                    "directory Get did not complete after manager reload: {error:?}; directory={directory_status:?}; child={child_status:?}; destination_exists={} staging_entries={:?}",
+                    destination_root.exists(),
+                    std::fs::read_dir(temp.path()).ok().map(|entries| entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .collect::<Vec<_>>())
+                );
+            }
+        };
+        assert_eq!(completed.transfer_id, outer.transfer_id);
+        assert_eq!(completed.completed_files, 1);
+        assert_eq!(completed.confirmed_file_bytes, source.len() as u64);
+        assert!(completed.error.is_none());
+        assert_eq!(
+            std::fs::read(destination_root.join("a.bin")).unwrap(),
+            source
+        );
+        let canonical_destination = std::fs::canonicalize(&destination_root).unwrap();
+        assert_eq!(
+            completed.final_destination_path.as_deref(),
+            Some(canonical_destination.to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]

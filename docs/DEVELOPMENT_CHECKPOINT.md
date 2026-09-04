@@ -1290,14 +1290,28 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - focused：transport directory **5/5 PASS**，Host directory **3/3 PASS**，Controller local staging/atomic commit **2/2 PASS**；`cargo check --all-targets` 0 warnings，`cargo test --workspace --all-targets` **226 passed / 0 failed / 6 ignored**；Windows `clew --help`与`file get --help`均正常，无V5b-1a曾出现的clap main-stack回归；
 - 本块仍**不宣称outer directory task能跨Controller process restart恢复**。child single-file Get/Put自身保留V5a durability，但目录级manifest、已完成文件集合、finalize状态仍需下一块持久化。
 
-下一块 V5b-2：directory-level Controller process-restart durability。Put/Get都必须在Controller hard-kill/restart后保留outer TransferId、原manifest/私有路径与已确认文件前缀，只恢复未完成child；随后才进入bounded multi-file concurrency。
+### V5b-2 — Directory-level Controller process-restart durability
 
-- block/chunk manifest；
-- hash/final verification；
-- resume；
-- directory transfer；
-- bounded concurrency；
-- progress/cancel/conflict policy。
+**Status：DONE（2026-09-04）**
+
+- Controller新增独立的directory transfer双槽generation journal（`controller-directory-transfers.a/b.json`），与ControllerId绑定并沿用bounded state document / corruption fallback / duplicate-generation fail-closed约束；Put持久化canonical manifest + Host deterministic staging root，Get持久化canonical manifest + Controller private staging/final root + Host source re-proof状态，outer TransferId、方向、scope、总量与进度均纳入恢复校验；
+- outer scheduler在启动single-file child前先把`relative_path + child TransferId`持久化，再允许child创建；single-file manager新增内部caller-reserved TransferId入口并在spawn前持久化，duplicate ID fail closed。这样即使crash发生在“outer已记child、child尚未创建”的窗口，restart也会用同一个child ID补启动；若child journal已存在则直接接管，并重新核对direction/device/path/chunk scope；
+- Put restart重新发现Host同TransferId staging/final state，并要求Controller local source重扫仍与原manifest一致后才继续；已完成child prefix不重传，当前child从V5a durable Host status恢复。Get restart重新`PrepareGet`证明Device源树仍等于原manifest，保留并安全重开`.clew-dir-<outer>.part`及`.clew-<child>.part`；fresh staging若在journal落盘后被别的对象抢占会fail closed，不把未知目录当自己的part；
+- Get finalization把Host `FinalizeGet`成功事实先以`source_verified=true`持久化，再做Controller整树hash与atomic rename；若crash恰好发生在rename后、Completed journal前，restart只在final root重新scan/hash与原manifest精确一致时恢复Completed。Put继续复用Host V5b-1a atomic-finalize/idempotent replay；
+- 修复一个真实lifecycle边界：旧directory manager被销毁导致watch sender关闭时，worker过去会把“owner gone”误当显式Cancel并删除durable staging。现在显式`Cancel=true`与owner/channel关闭分离；owner退出只停止旧worker并保留journal/staging给新Controller接管；
+- focused regression：directory journal/staging/reload/crash-window **9/9 PASS**，caller-reserved single-file child ID **1/1 PASS**；`cargo fmt -- --check` PASS，`cargo check --workspace --all-targets` 0 warnings，`cargo test --workspace --all-targets` **233 passed / 0 failed / 6 ignored**；
+- 真实Windows进程hard-kill gate（Host全程保持同一foreground进程）：directory Put outer `fe98f718-8642-4e11-b442-314c1ed534b5`在`12,689,408 / 16,777,216` bytes、`1/2` files、child `e445e729-c033-45ac-a19b-37fbdacbe12b`时强杀Controller PID 104252；同state replacement PID 106252保留原outer ID继续超过断点并完成`2/2`，Host最终两文件SHA-256与Controller源一致；
+- 对称directory Get outer `c71617c4-6820-4bcc-bc7b-ffef32b69dc2`在`1,646,592 / 16,777,216` bytes、`0/2` files、child `62208f31-a2a4-49be-8d3d-d4e56243cc70`时强杀Controller PID 106252；kill后final destination仍不存在，而private staging与child part（1,740,800 bytes）均存在。replacement PID 105944用同outer ID续到`16,777,216 / 16,777,216`、`2/2`，final tree hash一致、private staging清理、Host仍online。
+
+### V5b-3 — Bounded multi-file concurrency
+
+**Status：TODO**
+
+- 只在V5b-2 durable outer journal之上增加有界并发，不改canonical manifest、whole-tree re-proof或atomic finalize语义；
+- 设计必须同时给出**per-directory window**与**Controller-wide child budget**，不能让最多8个outer task各自无界占用V5a hard-cap-16 single-file manager；
+- 并发child允许乱序完成后，不能继续把`completed_files`误当唯一事实来源。journal需要持久化bounded in-flight child集合/文件index，并只推进contiguous completed prefix；restart必须复用每个已保留child TransferId，Cancel必须覆盖全部in-flight child；
+- progress需聚合所有in-flight confirmed offsets且不重复计数；Local API/GUI若展示并发状态，应保持bounded projection，不泄露Controller-private path；
+- 先做deterministic window scheduler + restart/cancel tests，再做真实multi-file并发/断线/hard-kill gate；验证通过后才考虑目录Rename/Replace等更复杂conflict policy。
 
 ## 13. V6 — Release Packaging
 
@@ -1369,13 +1383,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 contract + V5b-1a/1b serial directory Put/Get DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 contract + V5b-1a/1b serial Put/Get + V5b-2 Controller restart durability DONE）**
 
-**Next block：V5b-2 — directory-level Controller process-restart durability**
+**Next block：V5b-3 — bounded multi-file concurrency**
 
-V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume已全部闭合；V5b现在也有对称的bounded serial directory Put/Get：两向都复用canonical tree manifest与durable single-file primitive，并在整树re-proof后atomic finalize。下一步不加并发，先让outer directory task本身在Controller process restart后恢复同一TransferId、manifest、private staging/source binding和已完成文件前缀；只有这层durability闭合后才进入bounded multi-file concurrency。
+V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume与V5b serial directory Put/Get都已闭合；V5b-2进一步让outer directory task本身跨Controller hard-kill/restart保持同一TransferId、canonical manifest、private staging/source binding、child IDs与已完成前缀，并通过真实16MiB双向hard-kill验证。下一步才允许在这个durable模型上引入bounded multi-file concurrency：必须先冻结per-directory window + Controller-wide child budget，并把journal从“单current child”升级为bounded in-flight set/contiguous prefix，不能为了吞吐牺牲restart/cancel/whole-tree atomicity。
 
 ### Change log
+
+- **2026-09-04** — V5b-2 directory-level Controller process-restart durability DONE：新增ControllerId-bound directory双槽journal，outer先durable reserve child TransferId再spawn，single-file manager支持caller-reserved ID；Put/Get restart均复用原outer/child ID并重新证明manifest/source/staging scope，Get持久化Host source-verified事实并覆盖atomic rename→Completed journal crash window；同时修复manager owner消失被误判Cancel而删staging。focused directory **9/9** + reserved-child **1/1**，workspace **233/0/6**。真实16MiB Put在12,689,408 bytes/1-of-2时hard-kill后原outer续完且hash一致；Get在1,646,592 bytes/0-of-2时hard-kill，private staging/child part保留，原outer续到2/2并atomic commit/hash一致。下一块V5b-3 bounded multi-file concurrency。
 
 - **2026-09-04** — V5b-1b bounded serial directory Get DONE：新增privacy-preserving `DirectoryTreeGetScope` + PrepareGet/FinalizeGet，Host read/write分权、源树Prepare/Finalize双scan re-proof；Controller用TransferId private staging，严格串行复用durable single-file Get，Host复验后再本地整树hash并atomic rename。Local API/CLI扩成`file get/status/cancel --directory`且仍只允许fail conflict；rename后parent sync失败保持Committed事实并附warning。transport **5/5**、Host **3/3**、runtime staging **2/2**，workspace **226/0/6**；Windows help正常。下一块V5b-2 directory-level Controller restart durability。
 
