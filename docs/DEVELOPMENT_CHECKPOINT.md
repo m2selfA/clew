@@ -1337,9 +1337,24 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ### V6b — Native release metadata + branding + portable layout
 
+**Status：IN PROGRESS**
+
+#### V6b-1 — Windows native PE metadata/icon
+
+**Status：DONE（2026-09-04）**
+
+- 新增root `build.rs`，Windows target从唯一源`assets/icons/app.svg`确定性render 16/24/32/48/64/128/256 PNG并自行写入multi-image ICO，不维护手工位图副本；`winresource`只负责把生成的ICO和version resource链接进最终PE；
+- PE string table固定`ProductName=Clew`、`FileDescription=Agent-facing remote capability bridge`、`InternalName=clew`、`OriginalFilename=clew.exe`，`FileVersion/ProductVersion`直接来自`CARGO_PKG_VERSION`，避免发布版本和二进制属性分叉；
+- Windows release反读gate通过：PowerShell `VersionInfo`六项全部精确匹配，`System.Drawing.Icon::ExtractAssociatedIcon`可从PE提取32×32 icon；
+- reproducibility gate刻意在第一次package后执行`cargo clean -p clew --target x86_64-pc-windows-msvc`再重编；dirty-state两份ZIP SHA均为`d800c3e843d07ecf6ebc39594d5c4988ed04765c6f2b866b690ed0f0f6da2b8b`，证明RC/icon/link没有引入时间漂移；
+- 实现提交`bd12538 build: embed windows release metadata`后clean package通过archive smoke，manifest `dirty=false/source_commit=bd12538a5e1265b8c91f9731502bb568bdc8ef7e`，最终clean ZIP SHA-256=`ed99a58b29033ea6d53d0a86c7373a1cad56defd2dd3dbd528ef57599ec577e4`；
+- `cargo check --workspace --all-targets --locked` PASS / 0 warnings；`cargo test --workspace --all-targets --locked` **243 passed / 0 failed / 6 ignored**。
+
+#### V6b-2 — macOS bundle + Linux portable layout
+
 **Status：NEXT**
 
-在不依赖外部证书/账号的范围内先收口：Windows PE VERSIONINFO/icon/application metadata、macOS `.app` bundle naming/icon/Info.plist/localization、Linux portable artifact layout/desktop-facing metadata，以及三平台package manifest对这些资源的可验证描述。完成后再进入Windows signing与macOS signing/notarization；ClientFlavor/Distribution Studio成品签名与cache继续留在后续V6子块。
+下一步把同一app identity/resource真正映射到macOS `.app/Contents/{MacOS,Resources}` + `Info.plist` + deterministic ICNS，以及Linux `bin/` + `share/applications/` + scalable icon portable layout；xtask manifest必须逐文件hash这些资源，native CI runner继续执行解包binary smoke。完成后再进入Windows signing与macOS signing/notarization；ClientFlavor/Distribution Studio成品签名与cache继续留在后续V6子块。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1398,13 +1413,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V6 — Release Packaging（IN PROGRESS；V6a reproducible unsigned artifact baseline DONE）**
+**Current block：V6 — Release Packaging（IN PROGRESS；V6a + V6b-1 Windows native metadata DONE）**
 
-**Next block：V6b — Native release metadata + branding + portable layout**
+**Next block：V6b-2 — macOS bundle + Linux portable layout**
 
-V5已完整封板。V6a现在也完成：pinned Rust 1.96、locked xtask、deterministic ZIP、embedded/external manifest、Cargo.lock/toolchain provenance、archive-extracted native smoke、checksum与Windows clean双构建可复现证据均已建立；CI矩阵已覆盖Windows/macOS/Linux但远端平台运行结果仍需实际workflow补证。下一步先做不依赖证书的Windows/macOS/Linux native metadata与portable layout，再进入真实signing/notarization和Distribution Studio成品管线。
+V6a已建立reproducible unsigned baseline；V6b-1进一步把Clew Original app icon与版本身份真正嵌进Windows PE，并通过VersionInfo/icon反读、forced-rebuild reproducibility和clean package smoke。下一步收口macOS `.app` / ICNS / Info.plist与Linux portable `bin+share` layout；三平台unsigned artifact都具备native identity后，再进入签名/notarization和Distribution Studio成品管线。
 
 ### Change log
+
+- **2026-09-04** — V6b-1 Windows native PE metadata/icon DONE：root build.rs由`assets/icons/app.svg`确定性生成multi-image ICO并嵌PE，同时写入Clew ProductName/description/internal/original filename与Cargo package version。release exe VersionInfo反读全匹配，associated icon可由Windows提取；删除clew target artifact后的两次dirty package SHA仍同为`d800c3e8...a2b8b`。实现commit `bd12538`后的clean artifact `dirty=false`，ZIP SHA=`ed99a58b...577e4`；workspace **243/0/6**。下一块V6b-2 macOS bundle + Linux portable layout。
 
 - **2026-09-04** — V6a reproducible unsigned artifact baseline DONE：新增pinned Rust 1.96 + locked `cargo xtask package`，deterministic ZIP、embedded/external release manifest、rustc/Cargo.lock/source provenance、ZIP内binary hash复核与解包后`--version/--help` smoke、ZIP+sidecar `SHA256SUMS`，以及Windows/macOS/Linux CI package矩阵。clean Windows commit `7a090744...`双构建ZIP SHA均`6587bb27...5689c`，manifest `dirty=false/unsigned=true`；workspace **243/0/6**。release gate还顺带修复V5b concurrent cancel test harness对PutBegin顺序的错误假设（`9237323`，压力20/20）。下一块V6b native metadata/branding/portable layout。
 
