@@ -62,7 +62,7 @@
 | V4 | Dynamic networking | DONE | Controller-owned TCP forward / SOCKS5 CONNECT / HTTP CONNECT + non-migration |
 | V5 | File plane | IN PROGRESS | single-file put + cross-generation resume DONE；继续 get / durable restart / directory |
 | V6 | Release packaging | IN PROGRESS | reproducible unsigned baseline DONE；继续 native metadata/branding、signing/notarization、ClientFlavor pipeline |
-| V7 | Advanced Service Runtime | IN PROGRESS | V7a `systemd --user` implementation/workspace gate DONE；exact-commit native lifecycle acceptance pending |
+| V7 | Advanced Service Runtime | IN PROGRESS | V7a Linux `systemd --user` DONE；继续 V7b Windows Service / V7c Linux system service |
 | V8+ | Deferred expansion | TODO | 仅按真实需求评估 Directory、dedicated relay、第二 transport 等 |
 
 **第一条对外可用版本仍是 V1.4 完成后的 V1。** Studio 和 Connector 都不能阻塞 direct Read。
@@ -1412,7 +1412,9 @@ Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”�
 - Windows Service 不把 GUI 放进 Session 0；
 - install/enable/stop/uninstall 全部可见，不做隐蔽 persistence。
 
-V7a implementation baseline 已落到当前 worktree：新增独立浅层 `clew service` parser（不扩大原 root Clap tree）、Linux user unit install/enable/start/stop/disable/uninstall/status，以及独立 enable/disable-linger；unit 固定 `default.target`、`Restart=on-failure`、`UMask=0077`、`NoNewPrivileges=true`，不会在 install/enable/start 中隐式开启 linger。Controller 新增 `foreground/systemd_user` lifecycle owner；service-owned Local API `shutdown` 返回 `Denied`，必须由 `clew service stop` 交还 systemd lifecycle owner。unmanaged unit不覆盖/不卸载，managed unit更新若 daemon-reload 失败会恢复旧配置。Windows root/controller/service help stack regression 已固化；workspace **257/0/6**、all-target check 0 warning。V7a 尚需把固定 implementation commit 投到真实 Linux user manager，完成 install→enable→start→Local API→shutdown-denied→stop→disable→uninstall，并证明原 linger 状态不被普通 lifecycle 动作改变后才能封板。
+**V7a Linux `systemd --user`：DONE。** 实现 commit `0106e88a578b0015a0cc3e47a08882447f0cc973` 新增独立浅层 `clew service` parser（不扩大原 root Clap tree）、Linux user unit install/enable/start/stop/disable/uninstall/status，以及独立 enable/disable-linger；unit 固定 `default.target`、`Restart=on-failure`、`UMask=0077`、`NoNewPrivileges=true`。Controller 新增 `foreground/systemd_user` lifecycle owner；service-owned Local API `shutdown` 返回 `Denied`，必须由 `clew service stop` 交还 systemd lifecycle owner。unmanaged unit不覆盖/不卸载，managed unit更新若 daemon-reload 失败会恢复旧配置。Windows root/controller/service help stack regression 已固化；workspace **257/0/6**、all-target check 0 warning。
+
+wmn02 exact-commit native acceptance：使用仓库固定 Rust/Cargo **1.96.0**（系统默认1.62.1未被修改），`cargo check --workspace --all-targets --locked` PASS，service **3/3**、controller CLI **9/9**、shutdown-owner focused **1/1**、debug binary build PASS。原 user unit 不存在、user manager available、linger 基线 `yes`；install 后 `managed=true / enable_state=disabled / active_state=inactive`，`systemd-analyze --user verify` PASS，linger仍`yes`；enable 后仍 inactive；start 后 Local API明确 `lifecycle_owner=systemd_user`。普通 `clew shutdown` 返回 `Denied` 且原 pid/instance继续存活，第二 foreground Controller只 attach existing owner。stop→start 后 ControllerId保持 `c97f885f-213a-84ff-bd61-e91ea5bf55f3`，instance从 `0976df41-...` 变为 `ccdc02db-...`，pid变化，证明同user identity/state由systemd重新持有。最终 stop→disable→uninstall 后 unit不存在、service inactive，linger **yes→yes**，普通 lifecycle没有修改既有linger。V7a封板，下一块V7b Windows Service。
 
 ## 15. V8+ — 明确后置
 
@@ -1450,13 +1452,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel current implementation block：V7a — Linux `systemd --user`（IN PROGRESS：exact-commit native acceptance pending）**
+**Parallel next implementation block：V7b — Windows Service（machine runtime + user-session GUI/CLI Local API client）**
 
-V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；V6b-3b只剩外部正式签名凭据。V7a代码/文档/Windows stack regression与workspace **257/0/6** 已通过，当前只差将固定 implementation commit 投到 wmn02 的真实 systemd user manager做完整 lifecycle acceptance；普通 install/enable/start/stop/disable/uninstall不得改变该账号原有 linger 状态。Distribution Studio signed-output/cache仍后置到真实签名acceptance。
+V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；V6b-3b只剩外部正式签名凭据。V7a `systemd --user` 已在 exact commit `0106e88a578b...` 上完成 wmn02 native lifecycle acceptance并封板。下一块按既定顺序进入 V7b Windows Service；必须先解决 machine scope state/identity、SCM lifecycle、Session 0与用户GUI分离、Local API ACL以及默认 Connector-only/EXECUTE policy 边界，不能把现有 user Controller简单用LocalSystem包装成service。Distribution Studio signed-output/cache仍后置到真实签名acceptance。
 
 ### Change log
 
-- **2026-09-04** — V7a Linux `systemd --user` implementation baseline IN PROGRESS：新增显式 `clew service` user-scope lifecycle、独立 linger动作、Clew-owned unit防覆盖/更新rollback、Controller `systemd_user` lifecycle telemetry与Local API shutdown-denied语义；为避免再次触发Windows大Clap树stack overflow，service使用argv[1]独立小parser，systemd lifecycle内部标记也改为固定环境变量而不进入root Clap。root/controller/service help与未知lifecycle marker均有integration regression；workspace **257/0/6**、check 0 warning。下一步固定commit后在wmn02做真实 install→enable→start→status→shutdown-denied→stop→disable→uninstall，且保持既有linger不变。
+- **2026-09-04** — V7a Linux `systemd --user` DONE：实现 commit `0106e88a578b...` 新增显式 user-scope service lifecycle、独立 linger、Clew-owned unit防覆盖/更新rollback、Controller `systemd_user` telemetry与Local API shutdown-denied；service采用argv[1]独立小parser，避免再次扩大Windows大Clap树stack。workspace **257/0/6**、check 0 warning。wmn02使用精确Rust/Cargo 1.96.0完成all-target check、service 3/3、controller CLI 9/9、shutdown-owner 1/1与binary build；真实 install 后 disabled/inactive，systemd-analyze verify PASS，enable不启动，start后owner=`systemd_user`；普通shutdown Denied且instance保持，foreground第二实例只attach；stop/start后同ControllerId、新instance/pid；最终stop/disable/uninstall清空unit，linger保持 **yes→yes**。V7a封板，下一块V7b Windows Service。
 
 - **2026-09-04** — V6b-3a secret-free signing + independent verification baseline DONE：`0a257fd`新增clean schema-2→private staging→Windows Authenticode/macOS Developer ID+notary→schema-3的显式签名管线；`0d17e42`再补无私钥`verify-package`与frozen exact-file/mode gate，拒绝异常但自洽payload。Windows真实SignTool无证书与macOS真实codesign无Developer ID均fail closed且不改unsigned/build-tree bytes、不产出partial signed artifact；Windows/macOS clean schema-2均由独立verifier真机通过，unsigned路径保持schema2且重复ZIP deterministic。workspace **251/0/6**。V6b-3b只剩正式证书/Developer ID外部acceptance；并行进入V7a systemd user runtime。
 
