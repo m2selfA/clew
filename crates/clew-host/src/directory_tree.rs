@@ -7,7 +7,8 @@ use std::{
 
 use clew_core::{ControlModelError, ControllerId, DeviceId, ReadPolicy, SiteId, TransferId};
 use clew_transport::{
-    DirectoryConflictPolicy, DirectoryTreeEntry, DirectoryTreeError, DirectoryTreeManifest,
+    DirectoryConflictPolicy, DirectoryTreeEntry, DirectoryTreeEntryKind, DirectoryTreeError,
+    DirectoryTreeErrorCode, DirectoryTreeManifest, DirectoryTreeReply, DirectoryTreeRequest,
     FileTransferDirection, MAX_DIRECTORY_DEPTH, MAX_DIRECTORY_FILE_BYTES,
     MAX_DIRECTORY_TOTAL_BYTES, MAX_DIRECTORY_TREE_ENTRIES,
 };
@@ -201,6 +202,429 @@ fn entry_is_link_or_reparse(metadata: &Metadata) -> bool {
     false
 }
 
+#[derive(Clone, Debug)]
+pub struct HostDirectoryTreeService {
+    policy: ReadPolicy,
+    controller_id: ControllerId,
+    site_id: SiteId,
+    device_id: DeviceId,
+    can_put: bool,
+}
+
+impl HostDirectoryTreeService {
+    pub fn new(
+        policy: ReadPolicy,
+        controller_id: ControllerId,
+        site_id: SiteId,
+        device_id: DeviceId,
+        can_put: bool,
+    ) -> Result<Self, DirectoryTreeScanError> {
+        policy.validate()?;
+        Ok(Self {
+            policy,
+            controller_id,
+            site_id,
+            device_id,
+            can_put,
+        })
+    }
+
+    pub async fn execute(
+        &self,
+        request: DirectoryTreeRequest,
+        allow_write: bool,
+    ) -> DirectoryTreeReply {
+        if request.validate().is_err() {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::InvalidRequest,
+                "invalid bounded directory tree request",
+            );
+        }
+        if !self.can_put || !allow_write || self.policy.roots.is_empty() {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "directory Put is not permitted by this device grant",
+            );
+        }
+        let service = self.clone();
+        match tokio::task::spawn_blocking(move || service.execute_blocking(request)).await {
+            Ok(reply) => reply,
+            Err(_) => DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Io,
+                "directory tree worker failed",
+            ),
+        }
+    }
+
+    fn execute_blocking(&self, request: DirectoryTreeRequest) -> DirectoryTreeReply {
+        let manifest = match &request {
+            DirectoryTreeRequest::PreparePut { manifest }
+            | DirectoryTreeRequest::FinalizePut { manifest }
+            | DirectoryTreeRequest::CancelPut { manifest } => manifest,
+        };
+        if manifest.controller_id != self.controller_id
+            || manifest.site_id != self.site_id
+            || manifest.device_id != self.device_id
+        {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "directory tree manifest scope does not match this Host",
+            );
+        }
+        match request {
+            DirectoryTreeRequest::PreparePut { manifest } => self.prepare_put(&manifest),
+            DirectoryTreeRequest::FinalizePut { manifest } => self.finalize_put(&manifest),
+            DirectoryTreeRequest::CancelPut { manifest } => self.cancel_put(&manifest),
+        }
+    }
+
+    fn prepare_put(&self, manifest: &DirectoryTreeManifest) -> DirectoryTreeReply {
+        let (final_root, staging_root) = match self.put_paths(manifest) {
+            Ok(paths) => paths,
+            Err(reply) => return reply,
+        };
+        match fs::symlink_metadata(&final_root) {
+            Ok(_) => {
+                return DirectoryTreeReply::error(
+                    DirectoryTreeErrorCode::Conflict,
+                    "directory destination already exists",
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return DirectoryTreeReply::error(
+                    DirectoryTreeErrorCode::Io,
+                    "directory destination metadata failed",
+                );
+            }
+        }
+        if let Err(reply) = ensure_staging_root(&staging_root) {
+            return reply;
+        }
+        for entry in &manifest.entries {
+            if entry.kind != DirectoryTreeEntryKind::Directory {
+                continue;
+            }
+            let path = join_relative(&staging_root, &entry.relative_path);
+            if let Err(reply) = ensure_manifest_directory(&path) {
+                return reply;
+            }
+        }
+        if let Err(reply) = sync_parent_directory(&staging_root) {
+            return reply;
+        }
+        let Some(staging_device_root) = staging_root.to_str().map(str::to_owned) else {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Io,
+                "directory staging path is not valid UTF-8",
+            );
+        };
+        DirectoryTreeReply::Prepared {
+            transfer_id: manifest.transfer_id,
+            staging_device_root,
+        }
+    }
+
+    fn finalize_put(&self, manifest: &DirectoryTreeManifest) -> DirectoryTreeReply {
+        let (final_root, staging_root) = match self.put_paths(manifest) {
+            Ok(paths) => paths,
+            Err(reply) => return reply,
+        };
+        let staging_metadata = fs::symlink_metadata(&staging_root);
+        let final_metadata = fs::symlink_metadata(&final_root);
+        let staging_exists = staging_metadata.is_ok();
+        let final_exists = final_metadata.is_ok();
+        if staging_metadata
+            .as_ref()
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+            || final_metadata
+                .as_ref()
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+        {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Io,
+                "directory finalize metadata failed",
+            );
+        }
+        if !staging_exists && final_exists {
+            return match verify_tree_matches(&final_root, manifest) {
+                Ok(()) => DirectoryTreeReply::Completed {
+                    transfer_id: manifest.transfer_id,
+                    final_device_root: manifest.device_root.clone(),
+                },
+                Err(reply) => reply,
+            };
+        }
+        if !staging_exists {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::NotFound,
+                "directory staging tree was not found",
+            );
+        }
+        if final_exists {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Conflict,
+                "directory destination appeared before finalize",
+            );
+        }
+        if let Err(reply) = verify_tree_matches(&staging_root, manifest) {
+            return reply;
+        }
+        if fs::rename(&staging_root, &final_root).is_err() {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Io,
+                "atomic directory finalize failed",
+            );
+        }
+        if let Err(reply) = sync_parent_directory(&final_root) {
+            return reply;
+        }
+        DirectoryTreeReply::Completed {
+            transfer_id: manifest.transfer_id,
+            final_device_root: manifest.device_root.clone(),
+        }
+    }
+
+    fn cancel_put(&self, manifest: &DirectoryTreeManifest) -> DirectoryTreeReply {
+        let (final_root, staging_root) = match self.put_paths(manifest) {
+            Ok(paths) => paths,
+            Err(reply) => return reply,
+        };
+        if fs::symlink_metadata(&final_root).is_ok() && fs::symlink_metadata(&staging_root).is_err()
+        {
+            return DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Conflict,
+                "directory transfer is already finalized",
+            );
+        }
+        match fs::symlink_metadata(&staging_root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return DirectoryTreeReply::error(
+                    DirectoryTreeErrorCode::Io,
+                    "directory staging metadata failed",
+                );
+            }
+            Ok(metadata) => {
+                if entry_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                    return DirectoryTreeReply::error(
+                        DirectoryTreeErrorCode::Denied,
+                        "directory staging root is not a safe regular directory",
+                    );
+                }
+                if validate_safe_tree_for_removal(&staging_root).is_err()
+                    || fs::remove_dir_all(&staging_root).is_err()
+                {
+                    return DirectoryTreeReply::error(
+                        DirectoryTreeErrorCode::Io,
+                        "directory staging cleanup failed",
+                    );
+                }
+                if let Err(reply) = sync_parent_directory(&staging_root) {
+                    return reply;
+                }
+            }
+        }
+        DirectoryTreeReply::Cancelled {
+            transfer_id: manifest.transfer_id,
+        }
+    }
+
+    fn put_paths(
+        &self,
+        manifest: &DirectoryTreeManifest,
+    ) -> Result<(PathBuf, PathBuf), DirectoryTreeReply> {
+        if manifest.validate().is_err()
+            || manifest.direction != FileTransferDirection::ControllerToDevice
+            || manifest.device_conflict_policy != Some(DirectoryConflictPolicy::FailIfExists)
+        {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::InvalidRequest,
+                "invalid directory Put manifest",
+            ));
+        }
+        let requested = PathBuf::from(&manifest.device_root);
+        if !requested.is_absolute() {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "directory destination must be absolute",
+            ));
+        }
+        let Some(std::path::Component::Normal(_)) = requested.components().next_back() else {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::InvalidRequest,
+                "directory destination must end in a normal name",
+            ));
+        };
+        let Some(parent) = requested.parent() else {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::InvalidRequest,
+                "directory destination parent is invalid",
+            ));
+        };
+        let parent = fs::canonicalize(parent).map_err(|_| {
+            DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::NotFound,
+                "directory destination parent was not found",
+            )
+        })?;
+        if !self.policy.roots.iter().any(|root| {
+            fs::canonicalize(root)
+                .map(|root| parent.starts_with(root))
+                .unwrap_or(false)
+        }) {
+            return Err(DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "directory destination is outside signed roots",
+            ));
+        }
+        let final_name = requested.file_name().ok_or_else(|| {
+            DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::InvalidRequest,
+                "invalid directory destination",
+            )
+        })?;
+        let final_root = parent.join(final_name);
+        let staging_root = parent.join(format!(".clew-dir-{}.part", manifest.transfer_id));
+        Ok((final_root, staging_root))
+    }
+}
+
+fn ensure_staging_root(path: &Path) -> Result<(), DirectoryTreeReply> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !entry_is_link_or_reparse(&metadata) && metadata.is_dir() => Ok(()),
+        Ok(_) => Err(DirectoryTreeReply::error(
+            DirectoryTreeErrorCode::Denied,
+            "directory staging path is not a safe directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|_| {
+                DirectoryTreeReply::error(
+                    DirectoryTreeErrorCode::Io,
+                    "directory staging root could not be created",
+                )
+            })
+        }
+        Err(_) => Err(DirectoryTreeReply::error(
+            DirectoryTreeErrorCode::Io,
+            "directory staging metadata failed",
+        )),
+    }
+}
+
+fn ensure_manifest_directory(path: &Path) -> Result<(), DirectoryTreeReply> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !entry_is_link_or_reparse(&metadata) && metadata.is_dir() => Ok(()),
+        Ok(_) => Err(DirectoryTreeReply::error(
+            DirectoryTreeErrorCode::Denied,
+            "directory staging entry conflicts with a non-directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|_| {
+                DirectoryTreeReply::error(
+                    DirectoryTreeErrorCode::Io,
+                    "directory staging entry could not be created",
+                )
+            })
+        }
+        Err(_) => Err(DirectoryTreeReply::error(
+            DirectoryTreeErrorCode::Io,
+            "directory staging entry metadata failed",
+        )),
+    }
+}
+
+fn join_relative(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(root.to_path_buf(), |path, segment| path.join(segment))
+}
+
+fn verify_tree_matches(
+    root: &Path,
+    manifest: &DirectoryTreeManifest,
+) -> Result<(), DirectoryTreeReply> {
+    let scan = scan_directory_tree(root).map_err(directory_scan_reply)?;
+    if scan.entries != manifest.entries || scan.total_file_bytes != manifest.total_file_bytes {
+        return Err(DirectoryTreeReply::error(
+            DirectoryTreeErrorCode::HashMismatch,
+            "directory staging tree does not match the signed manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_safe_tree_for_removal(root: &Path) -> Result<(), DirectoryTreeScanError> {
+    let canonical_root = fs::canonicalize(root)?;
+    let mut queue = VecDeque::from([(canonical_root.clone(), 0_usize)]);
+    let mut visited = BTreeSet::from([canonical_root.clone()]);
+    let mut entries = 0_usize;
+    while let Some((directory, depth)) = queue.pop_front() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries = entries.saturating_add(1);
+            if entries > MAX_DIRECTORY_TREE_ENTRIES {
+                return Err(DirectoryTreeScanError::TooManyEntries(entries));
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if entry_is_link_or_reparse(&metadata) {
+                return Err(DirectoryTreeScanError::UnsupportedEntry(
+                    entry.file_name().to_string_lossy().into_owned(),
+                ));
+            }
+            if metadata.is_dir() {
+                let next_depth = depth.saturating_add(1);
+                if next_depth > MAX_DIRECTORY_DEPTH {
+                    return Err(DirectoryTreeScanError::DepthExceeded(next_depth));
+                }
+                let canonical = fs::canonicalize(entry.path())?;
+                if !canonical.starts_with(&canonical_root) || !visited.insert(canonical.clone()) {
+                    return Err(DirectoryTreeScanError::DirectoryEscapeOrCycle(
+                        entry.file_name().to_string_lossy().into_owned(),
+                    ));
+                }
+                queue.push_back((canonical, next_depth));
+            } else if !metadata.is_file() {
+                return Err(DirectoryTreeScanError::UnsupportedEntry(
+                    entry.file_name().to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn directory_scan_reply(error: DirectoryTreeScanError) -> DirectoryTreeReply {
+    let message = error.to_string();
+    match error {
+        DirectoryTreeScanError::OutsideAllowedRoots => {
+            DirectoryTreeReply::error(DirectoryTreeErrorCode::Denied, message)
+        }
+        DirectoryTreeScanError::Io(_) => {
+            DirectoryTreeReply::error(DirectoryTreeErrorCode::Io, message)
+        }
+        _ => DirectoryTreeReply::error(DirectoryTreeErrorCode::InvalidRequest, message),
+    }
+}
+
+fn sync_parent_directory(_path: &Path) -> Result<(), DirectoryTreeReply> {
+    #[cfg(unix)]
+    {
+        let parent = _path.parent().ok_or_else(|| {
+            DirectoryTreeReply::error(DirectoryTreeErrorCode::Io, "directory parent is invalid")
+        })?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| {
+                DirectoryTreeReply::error(
+                    DirectoryTreeErrorCode::Io,
+                    "directory parent sync failed",
+                )
+            })?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum DirectoryTreeScanError {
     #[error(
@@ -234,7 +658,7 @@ pub enum DirectoryTreeScanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clew_transport::DirectoryTreeEntryKind;
+    use clew_transport::{DirectoryTreeEntryKind, file_sha256_hex};
     use tempfile::tempdir;
 
     #[test]
@@ -296,6 +720,206 @@ mod tests {
         assert!(matches!(
             scan_authorized_directory_tree(&policy, &allowed),
             Err(DirectoryTreeScanError::TooManyEntries(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn host_directory_put_prepares_verifies_finalizes_replays_and_cancels() {
+        let temp = tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        fs::create_dir_all(&allowed).unwrap();
+        let controller_id = ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let policy =
+            ReadPolicy::new(vec![allowed.to_string_lossy().into_owned()], 49_152, 5_000).unwrap();
+        let service =
+            HostDirectoryTreeService::new(policy.clone(), controller_id, site_id, device_id, true)
+                .unwrap();
+        let transfer_id = TransferId::new();
+        let final_root = allowed.join("project");
+        let manifest = DirectoryTreeManifest::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            final_root.to_string_lossy(),
+            vec![
+                DirectoryTreeEntry::file("a.txt", 1, file_sha256_hex(b"a")).unwrap(),
+                DirectoryTreeEntry::directory("src").unwrap(),
+                DirectoryTreeEntry::file("src/b.txt", 3, file_sha256_hex(b"bbb")).unwrap(),
+                DirectoryTreeEntry::directory("z-empty").unwrap(),
+            ],
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+
+        let prepared = service
+            .execute(
+                DirectoryTreeRequest::PreparePut {
+                    manifest: manifest.clone(),
+                },
+                true,
+            )
+            .await;
+        let DirectoryTreeReply::Prepared {
+            staging_device_root,
+            ..
+        } = prepared
+        else {
+            panic!("expected directory staging preparation");
+        };
+        let staging = PathBuf::from(&staging_device_root);
+        assert!(!final_root.exists());
+        assert!(staging.join("src").is_dir());
+        assert!(staging.join("z-empty").is_dir());
+        fs::write(staging.join("a.txt"), b"a").unwrap();
+        fs::write(staging.join("src/b.txt"), b"bbb").unwrap();
+
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::FinalizePut {
+                        manifest: manifest.clone(),
+                    },
+                    true,
+                )
+                .await,
+            DirectoryTreeReply::Completed { transfer_id: actual, .. } if actual == transfer_id
+        ));
+        assert!(final_root.join("a.txt").is_file());
+        assert!(final_root.join("src/b.txt").is_file());
+        assert!(final_root.join("z-empty").is_dir());
+        assert!(!staging.exists());
+
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::FinalizePut {
+                        manifest: manifest.clone(),
+                    },
+                    true,
+                )
+                .await,
+            DirectoryTreeReply::Completed { transfer_id: actual, .. } if actual == transfer_id
+        ));
+
+        let cancel_id = TransferId::new();
+        let cancel_root = allowed.join("cancelled");
+        let cancel_manifest = DirectoryTreeManifest::new(
+            cancel_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            cancel_root.to_string_lossy(),
+            vec![DirectoryTreeEntry::directory("empty").unwrap()],
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+        let DirectoryTreeReply::Prepared {
+            staging_device_root,
+            ..
+        } = service
+            .execute(
+                DirectoryTreeRequest::PreparePut {
+                    manifest: cancel_manifest.clone(),
+                },
+                true,
+            )
+            .await
+        else {
+            panic!("expected cancellable directory staging");
+        };
+        let cancel_staging = PathBuf::from(staging_device_root);
+        assert!(cancel_staging.is_dir());
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::CancelPut {
+                        manifest: cancel_manifest,
+                    },
+                    true,
+                )
+                .await,
+            DirectoryTreeReply::Cancelled { transfer_id: actual } if actual == cancel_id
+        ));
+        assert!(!cancel_staging.exists());
+        assert!(!cancel_root.exists());
+    }
+
+    #[tokio::test]
+    async fn host_directory_put_fails_closed_on_grant_scope_or_tree_tamper() {
+        let temp = tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        fs::create_dir_all(&allowed).unwrap();
+        let controller_id = ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let policy =
+            ReadPolicy::new(vec![allowed.to_string_lossy().into_owned()], 49_152, 5_000).unwrap();
+        let service =
+            HostDirectoryTreeService::new(policy.clone(), controller_id, site_id, device_id, true)
+                .unwrap();
+        let manifest = DirectoryTreeManifest::new(
+            TransferId::new(),
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            allowed.join("tampered").to_string_lossy(),
+            vec![DirectoryTreeEntry::file("a.txt", 1, file_sha256_hex(b"a")).unwrap()],
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            service
+                .execute(
+                    DirectoryTreeRequest::PreparePut {
+                        manifest: manifest.clone(),
+                    },
+                    false,
+                )
+                .await,
+            DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::Denied
+        ));
+        let readonly =
+            HostDirectoryTreeService::new(policy, controller_id, site_id, device_id, false)
+                .unwrap();
+        assert!(matches!(
+            readonly
+                .execute(
+                    DirectoryTreeRequest::PreparePut {
+                        manifest: manifest.clone(),
+                    },
+                    true,
+                )
+                .await,
+            DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::Denied
+        ));
+
+        let DirectoryTreeReply::Prepared {
+            staging_device_root,
+            ..
+        } = service
+            .execute(
+                DirectoryTreeRequest::PreparePut {
+                    manifest: manifest.clone(),
+                },
+                true,
+            )
+            .await
+        else {
+            panic!("expected staging before tamper");
+        };
+        fs::write(PathBuf::from(staging_device_root).join("a.txt"), b"b").unwrap();
+        assert!(matches!(
+            service
+                .execute(DirectoryTreeRequest::FinalizePut { manifest }, true)
+                .await,
+            DirectoryTreeReply::Error(error) if error.code == DirectoryTreeErrorCode::HashMismatch
         ));
     }
 

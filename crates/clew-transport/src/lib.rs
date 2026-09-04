@@ -25,9 +25,11 @@ pub use connector::{
 };
 pub use directory_tree::{
     DIRECTORY_TREE_MANIFEST_VERSION, DirectoryConflictPolicy, DirectoryTreeEntry,
-    DirectoryTreeEntryKind, DirectoryTreeError, DirectoryTreeManifest, MAX_DIRECTORY_DEPTH,
+    DirectoryTreeEntryKind, DirectoryTreeError, DirectoryTreeErrorBody, DirectoryTreeErrorCode,
+    DirectoryTreeManifest, DirectoryTreeReply, DirectoryTreeRequest, MAX_DIRECTORY_DEPTH,
     MAX_DIRECTORY_FILE_BYTES, MAX_DIRECTORY_RELATIVE_PATH_BYTES, MAX_DIRECTORY_TOTAL_BYTES,
-    MAX_DIRECTORY_TREE_ENTRIES, MAX_DIRECTORY_TREE_MANIFEST_BYTES, validate_relative_path,
+    MAX_DIRECTORY_TREE_ENTRIES, MAX_DIRECTORY_TREE_MANIFEST_BYTES,
+    MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES, validate_relative_path,
 };
 pub use discovery::{
     ConnectorCandidate, ConnectorDiscoveryAdvertisement, ConnectorDiscoveryError,

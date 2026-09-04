@@ -24,10 +24,10 @@ use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, FileConflictPolicy, ForwardAddRequest,
     FsWritePrecondition, HttpConnectAddRequest, InviteIssueRequest, LocalApiClient,
     OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest,
-    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
-    restore_controller_backup, start_controller,
+    OutfitSetFieldRequest, RemoteDirectoryPutRequest, RemoteEditRequest, RemoteFileGetRequest,
+    RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
+    RemoteReadRequest, RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
+    Socks5AddRequest, restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -412,16 +412,19 @@ impl From<FileConflictArg> for FileConflictPolicy {
 
 #[derive(Debug, Subcommand)]
 enum FileCommand {
-    /// Start one Controller-to-device single-file upload. The optional device uses shared selector semantics.
+    /// Start one Controller-to-device upload. Use --directory for a bounded serial directory Put.
     Put {
         #[arg(value_name = "DEVICE")]
         device: Option<String>,
-        #[arg(long, value_name = "LOCAL_FILE")]
+        #[arg(long, value_name = "LOCAL_PATH")]
         source: PathBuf,
         #[arg(long, value_name = "DEVICE_PATH")]
         dest: String,
         #[arg(long, default_value_t = 32_768)]
         chunk_size: u32,
+        /// Treat SOURCE/DEST as a directory tree. Directory Put currently supports fail-if-exists only.
+        #[arg(long)]
+        directory: bool,
         #[arg(long, value_enum, default_value = "fail")]
         conflict: FileConflictArg,
         #[arg(long, value_name = "DIR")]
@@ -442,15 +445,19 @@ enum FileCommand {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
-    /// Show Controller-owned progress for one transfer.
+    /// Show Controller-owned progress for one transfer. Use --directory for a directory Put.
     Status {
         transfer_id: TransferId,
+        #[arg(long)]
+        directory: bool,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
-    /// Request bounded cancellation for one transfer.
+    /// Request bounded cancellation for one transfer. Use --directory for a directory Put.
     Cancel {
         transfer_id: TransferId,
+        #[arg(long)]
+        directory: bool,
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
     },
@@ -961,6 +968,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 source,
                 dest,
                 chunk_size,
+                directory,
                 conflict,
                 state_dir,
             } => {
@@ -972,16 +980,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let client = LocalApiClient::new(controller_config(state_dir)?);
                 let devices = client.device_list().await?;
                 let device_id = select_executable_device(&devices.devices, device.as_deref())?;
-                let info = client
-                    .file_put(RemoteFilePutRequest {
-                        device_id,
-                        source_path,
-                        device_path: dest,
-                        chunk_size,
-                        conflict_policy: conflict.into(),
-                    })
-                    .await?;
-                println!("{}", serde_json::to_string_pretty(&info)?);
+                if directory {
+                    if !source.is_dir() {
+                        return Err("Controller directory source must be a directory".into());
+                    }
+                    if !matches!(conflict, FileConflictArg::Fail) {
+                        return Err("directory Put currently supports --conflict fail only".into());
+                    }
+                    let info = client
+                        .directory_put(RemoteDirectoryPutRequest {
+                            device_id,
+                            source_path,
+                            device_root: dest,
+                            chunk_size,
+                        })
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                } else {
+                    let info = client
+                        .file_put(RemoteFilePutRequest {
+                            device_id,
+                            source_path,
+                            device_path: dest,
+                            chunk_size,
+                            conflict_policy: conflict.into(),
+                        })
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
             }
             FileCommand::Get {
                 device,
@@ -1016,21 +1042,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             FileCommand::Status {
                 transfer_id,
+                directory,
                 state_dir,
             } => {
-                let info = LocalApiClient::new(controller_config(state_dir)?)
-                    .file_status(transfer_id)
-                    .await?;
-                println!("{}", serde_json::to_string_pretty(&info)?);
+                let client = LocalApiClient::new(controller_config(state_dir)?);
+                if directory {
+                    let info = client.directory_status(transfer_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                } else {
+                    let info = client.file_status(transfer_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
             }
             FileCommand::Cancel {
                 transfer_id,
+                directory,
                 state_dir,
             } => {
-                let info = LocalApiClient::new(controller_config(state_dir)?)
-                    .file_cancel(transfer_id)
-                    .await?;
-                println!("{}", serde_json::to_string_pretty(&info)?);
+                let client = LocalApiClient::new(controller_config(state_dir)?);
+                if directory {
+                    let info = client.directory_cancel(transfer_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                } else {
+                    let info = client.file_cancel(transfer_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                }
             }
         },
         Command::Mcp { command } => match command {

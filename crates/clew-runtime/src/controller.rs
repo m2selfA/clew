@@ -177,6 +177,11 @@ pub async fn start_controller(
         controller_id,
         layout.clone(),
     )?;
+    let directory_transfers = crate::ControllerDirectoryTransferManager::new(
+        remote_hub.clone(),
+        file_transfers.clone(),
+        controller_id,
+    );
 
     let secret = LocalApiSecret::rotate(&layout)?;
     let listener = LocalListener::bind(&config.local_endpoint())?;
@@ -208,6 +213,7 @@ pub async fn start_controller(
         socks5,
         http_connect,
         file_transfers,
+        directory_transfers,
         shutdown_tx,
     });
 

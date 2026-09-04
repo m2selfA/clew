@@ -4,6 +4,7 @@ mod backup;
 mod config;
 mod control;
 mod controller;
+mod directory_transfer;
 mod forward;
 mod http_connect;
 mod local_api;
@@ -22,6 +23,10 @@ pub use clew_transport::{
 pub use config::{ControllerConfig, ControllerConfigError, LocalEndpoint, default_state_root};
 pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerControlStore};
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
+pub use directory_transfer::{
+    ControllerDirectoryTransferError, ControllerDirectoryTransferManager,
+    ControllerDirectoryTransferPhase, DirectoryPutInfo, HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS,
+};
 pub use forward::{
     ForwardInfo, HARD_MAX_FORWARD_LISTENERS, TcpForwardManager, TcpForwardManagerError,
 };
@@ -36,10 +41,11 @@ pub use local_api::{
     MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteFileGetRequest,
-    RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
-    RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest,
-    RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest, Socks5List,
+    OutfitUpdateRequest, RecoveryStatus, RemoteDirectoryPutRequest, RemoteEditRequest,
+    RemoteFileGetRequest, RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest,
+    RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
+    Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,

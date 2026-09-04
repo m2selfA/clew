@@ -10,13 +10,13 @@ use clew_identity::{EnrollmentError, StoredControllerIdentity};
 use clew_transport::{
     BootstrapErrorBody, BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest,
     BootstrapResponse, ConnectorControlError, ConnectorLeaseError, ConnectorTunnelPurpose,
-    ControllerSessionAuthority, FileTransferReply, FileTransferRequest, FsMutationReply,
-    FsMutationRequest, FsQueryReply, FsQueryRequest, HARD_MAX_SHELL_TASKS_PER_SESSION,
-    InnerMessage, InnerSession, IrohProtocol, IrohStream, ReadReply, ReadRequest,
-    SHELL_RECONNECT_GRACE_MS, SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession,
-    ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag,
-    TcpForwardReply, TcpForwardRequest, is_rpc_progress, read_bootstrap, read_connector_open,
-    unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
+    ControllerSessionAuthority, DirectoryTreeReply, DirectoryTreeRequest, FileTransferReply,
+    FileTransferRequest, FsMutationReply, FsMutationRequest, FsQueryReply, FsQueryRequest,
+    HARD_MAX_SHELL_TASKS_PER_SESSION, InnerMessage, InnerSession, IrohProtocol, IrohStream,
+    ReadReply, ReadRequest, SHELL_RECONNECT_GRACE_MS, SealedBootstrapContext, SealedBootstrapError,
+    SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest,
+    SignedConnectorLease, SiteDiscoveryTag, TcpForwardReply, TcpForwardRequest, is_rpc_progress,
+    read_bootstrap, read_connector_open, unwrap_rpc_reply, wrap_rpc_request, write_bootstrap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -184,6 +184,11 @@ enum RemoteCommand {
         request_id: RequestId,
         request: FileTransferRequest,
         reply: oneshot::Sender<Result<FileTransferReply, RemoteHubError>>,
+    },
+    DirectoryTree {
+        request_id: RequestId,
+        request: DirectoryTreeRequest,
+        reply: oneshot::Sender<Result<DirectoryTreeReply, RemoteHubError>>,
     },
     TcpForward {
         request_id: RequestId,
@@ -379,6 +384,38 @@ impl RemoteHub {
                 {
                     previous_generation = None;
                 }
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(_)) | Err(_) => previous_generation = Some(generation),
+            }
+        }
+    }
+
+    pub async fn directory_tree(
+        &self,
+        device_id: DeviceId,
+        request: DirectoryTreeRequest,
+    ) -> Result<DirectoryTreeReply, RemoteHubError> {
+        request.validate()?;
+        let request_id = RequestId::new();
+        let mut previous_generation = None;
+        loop {
+            let (generation, tx) = self
+                .replay_session_after(device_id, previous_generation)
+                .await?;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx
+                .send(RemoteCommand::DirectoryTree {
+                    request_id,
+                    request: request.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                previous_generation = Some(generation);
+                continue;
+            }
+            match reply_rx.await {
                 Ok(Ok(reply)) => return Ok(reply),
                 Ok(Err(_)) | Err(_) => previous_generation = Some(generation),
             }
@@ -1667,6 +1704,39 @@ async fn handle_member(
                     break;
                 }
             }
+            RemoteCommand::DirectoryTree {
+                request_id,
+                request,
+                reply,
+            } => {
+                let result = tokio::select! {
+                    _ = &mut connection_closed => Err(RemoteHubError::Offline(device_id)),
+                    result = async {
+                        let message = wrap_rpc_request(request_id, request.into_message()?)?;
+                        send_rpc_request_with_timeout(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            message,
+                            &continuity,
+                        )
+                        .await?;
+                        let message = recv_rpc_reply_with_progress(
+                            &mut inner,
+                            stream,
+                            request_id,
+                            &mut continuity,
+                        )
+                        .await?;
+                        Ok(DirectoryTreeReply::from_message(&message)?)
+                    } => result,
+                };
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
             RemoteCommand::TcpForward {
                 request_id,
                 request,
@@ -1883,6 +1953,8 @@ pub enum RemoteHubError {
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
+    #[error(transparent)]
+    DirectoryTree(#[from] clew_transport::DirectoryTreeError),
     #[error(transparent)]
     FileTransfer(#[from] clew_transport::FileTransferError),
     #[error(transparent)]
@@ -2593,6 +2665,91 @@ mod tests {
         assert_eq!(disconnected.generation, generation_two);
         assert_eq!(disconnected.state, RemoteSessionState::Disconnected);
         assert_eq!(disconnected.last_transition_unix_ms, 2_300);
+    }
+
+    #[tokio::test]
+    async fn directory_tree_control_replays_same_request_id_on_new_generation() {
+        let hub = RemoteHub::default();
+        let device_id = DeviceId::new();
+        let transfer_id = clew_core::TransferId::new();
+        let controller_id = clew_core::ControllerId::new();
+        let site_id = SiteId::new();
+        let manifest = clew_transport::DirectoryTreeManifest::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            clew_transport::FileTransferDirection::ControllerToDevice,
+            "/replay/directory",
+            vec![
+                clew_transport::DirectoryTreeEntry::file(
+                    "a.txt",
+                    1,
+                    clew_transport::file_sha256_hex(b"a"),
+                )
+                .unwrap(),
+            ],
+            Some(clew_transport::DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+        let request = DirectoryTreeRequest::PreparePut {
+            manifest: manifest.clone(),
+        };
+        let call_hub = hub.clone();
+        let request_for_call = request.clone();
+        let call =
+            tokio::spawn(async move { call_hub.directory_tree(device_id, request_for_call).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!call.is_finished());
+
+        let (generation_one, mut commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_000,
+            )
+            .unwrap();
+        let RemoteCommand::DirectoryTree {
+            request_id: first_id,
+            request: first_request,
+            reply: first_reply,
+        } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected directory Prepare on first generation");
+        };
+        assert_eq!(first_request, request);
+        drop(first_reply);
+        hub.unregister(device_id, generation_one, Some(1_100));
+
+        let (_generation_two, mut commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                1_200,
+            )
+            .unwrap();
+        let RemoteCommand::DirectoryTree {
+            request_id: second_id,
+            request: second_request,
+            reply: second_reply,
+        } = commands_two.recv().await.unwrap()
+        else {
+            panic!("expected directory Prepare on replacement generation");
+        };
+        assert_eq!(second_id, first_id);
+        assert_eq!(second_request, request);
+        second_reply
+            .send(Ok(DirectoryTreeReply::Prepared {
+                transfer_id,
+                staging_device_root: "/replay/.clew-dir.part".into(),
+            }))
+            .unwrap();
+        assert!(matches!(
+            call.await.unwrap().unwrap(),
+            DirectoryTreeReply::Prepared { transfer_id: actual, .. } if actual == transfer_id
+        ));
     }
 
     #[tokio::test]

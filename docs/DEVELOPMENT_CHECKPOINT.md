@@ -1266,7 +1266,19 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - 本块只冻结tree/traversal contract，不实现directory data plane/并发scheduler；后续data plane复用已验收的single-file Put/Get/FileResume primitive，先串行有界，再单独引入bounded concurrency；
 - commit：`b53fd01 feat: define bounded directory tree contract`；focused directory contract **3/3 PASS**；`cargo test --workspace --all-targets` **218 passed / 0 failed / 6 ignored**。
 
-下一块 V5b-1a：Controller→Device directory Put。Controller先bounded traversal+hash整树，Host按manifest preflight目录冲突/创建目录，再按manifest稳定顺序复用single-file Put；默认串行，不引入无界并发。
+### V5b-1a — Bounded serial Controller→Device directory Put
+
+**Status：DONE（2026-09-04）**
+
+- `directory_tree`控制面新增`PreparePut / FinalizePut / CancelPut`，继续走authenticated InnerSession RPC；Controller在本地先bounded scan/hash整树，再把V5b-0 canonical manifest送Host。Controller-local source path仍只存在本机task state，peer只看到Device-side root + relative entries；
+- Host只在当前membership具有signed write grant时创建`HostDirectoryTreeService`；Prepare再次绑定Controller/Site/Device/direction/FailIfExists scope，destination parent必须canonical位于signed roots，拒绝symlink/reparse/special indirection。staging固定为同父目录、由outer directory `TransferId`决定的private `.part` root，因此Host进程重启/回复丢失后同TransferId可重新发现同一staging；manifest中的空目录在Prepare阶段创建；
+- Controller-owned directory manager hard cap **8**。Prepare成功后按manifest稳定顺序一次只启动**一个**既有durable single-file Put，上一文件Completed才允许下一文件；目录progress聚合child confirmed offset与completed file count，不引入新的无界scheduler；child失败/Cancel会先cancel当前single-file task，再bounded best-effort清Host staging；Preparing阶段断线等待可被Cancel打断；进入Finalizing后视为atomic commit point，不再虚假标记可撤销；
+- Finalize在Host重新scan/hash整个staging tree并要求entries/size/hash与原manifest完全一致，只有完整验证后才同目录atomic rename到final root；rename后reply丢失或Host process restart时，若staging已消失但final root重新scan与manifest精确一致，则同TransferId幂等返回Completed。目标已存在、tree tamper、scope/grant错误全部fail closed；
+- Local API新增directory Put/Status/Cancel；CLI不继续扩张clap子命令树，而复用`clew file put --directory`和`file status|cancel --directory`。最初额外增加3个File subcommand使Windows主线程在构建已有大型clap树时stack overflow，已改为flags收敛，`clew --help`与既有controller CLI全部恢复；directory conflict本块仍只允许`fail`；
+- focused：transport directory RPC/contract **4/4 PASS**，Host preflight/finalize/replay/tamper **2/2 PASS**，既有Controller CLI **7/7 PASS**；`cargo check --workspace --all-targets` PASS，`cargo test --workspace --all-targets` **222 passed / 0 failed / 6 ignored**；
+- 本块**不宣称directory-level Controller process-restart journal**：Controller重启时outer directory task暂不自动恢复；已经启动的single-file child仍保持V5a既有durability。directory Get、directory task journal与bounded multi-file concurrency继续分块处理，不把它们偷塞进V5b-1a。
+
+下一块 V5b-1b：Device→Controller bounded serial directory Get。先复用同一canonical tree contract和durable single-file Get，保持串行、Controller-local destination/conflict policy不进peer；directory-level Controller process-restart durability与多文件bounded concurrency随后单独收口。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1345,13 +1357,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 directory contract DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 contract + V5b-1a serial directory Put DONE）**
 
-**Next block：V5b-1a — bounded serial directory Put data plane**
+**Next block：V5b-1b — bounded serial directory Get data plane**
 
-V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume已全部闭合；V5b-0又冻结了256-entry/64-depth/1TiB-per-file/4TiB-total的canonical directory tree contract、symlink exclusion与FailIfExists-only目录冲突边界。下一步只做Controller→Device directory Put，并串行复用single-file primitive；directory Get与bounded multi-file concurrency继续分块，不一次塞进巨大scheduler。
+V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume已全部闭合；V5b-0冻结canonical directory tree contract，V5b-1a现在又把Controller→Device目录Put接到真实InnerSession/Host staging/既有durable single-file primitive，严格串行并在整树复验后atomic finalize。下一步对称实现Device→Controller serial directory Get；directory-level Controller process-restart journal与bounded multi-file concurrency继续后置为独立块，不一次塞进巨大scheduler。
 
 ### Change log
+
+- **2026-09-04** — V5b-1a bounded serial directory Put DONE：新增`directory_tree` Prepare/Finalize/Cancel RPC、Host deterministic TransferId staging + whole-tree verify/atomic rename/replay、Controller hard-cap-8 directory task并按manifest一次只复用一个durable single-file Put；Local API支持Put/Status/Cancel，CLI收敛为`file put/status/cancel --directory`，修复扩张clap tree引发的Windows main-stack overflow。Preparing cancel可打断reconnect wait，Finalizing明确不可撤销；transport **4/4**、Host **2/2**、Controller CLI **7/7**，workspace **222/0/6**。directory-level Controller process-restart journal未在本块伪称完成。下一块V5b-1b serial directory Get。
 
 - **2026-09-04** — V5b-0 bounded directory tree contract DONE：新增`DirectoryTreeManifest v1`，Device-side root + canonical relative entries，Controller-local path不进peer；拒绝absolute/`..`/backslash/colon/NUL，depth64、entries256、单文件1TiB、总4TiB、manifest48KiB，symlink不建模；hierarchy/parent/sort/hash/total/conflict scope全fail closed。commit `b53fd01`；focused **3/3**，workspace **218/0/6**。下一块V5b-1a serial directory Put。
 

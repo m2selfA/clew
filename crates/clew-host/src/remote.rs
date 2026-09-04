@@ -10,23 +10,25 @@ use clew_transport::{
     BootstrapErrorCode, BootstrapMemberMode, BootstrapRequest, BootstrapResponse,
     ConnectorControlError, ConnectorDiscoveryError, ConnectorDiscoveryEvent, ConnectorLeaseError,
     ConnectorOpenRequest, ConnectorReady, ConnectorTunnelPurpose, DeviceSessionIdentity,
-    FileTransferErrorCode, FileTransferReply, FileTransferRequest, FsMutationErrorCode,
-    FsMutationReply, FsMutationRequest, FsQueryErrorCode, FsQueryReply, FsQueryRequest,
-    InnerMessage, InnerSession, IrohOuter, IrohProtocol, MdnsConnectorDiscovery,
-    NearbyConnectorFile, RPC_PROGRESS_INTERVAL_MS, ReadErrorCode, ReadReply, ReadRequest,
-    SealedBootstrapContext, SealedBootstrapError, SealedBootstrapSession, ShellTaskErrorCode,
-    ShellTaskReply, ShellTaskRequest, SignedConnectorLease, SiteDiscoveryTag, TcpForwardErrorCode,
-    TcpForwardReply, TcpForwardRequest, forward_opaque_bidirectional, read_bootstrap,
-    read_connector_open, read_connector_ready, unwrap_rpc_request, wrap_rpc_progress,
-    wrap_rpc_reply, write_bootstrap, write_connector_open, write_connector_ready,
+    DirectoryTreeErrorCode, DirectoryTreeReply, DirectoryTreeRequest, FileTransferErrorCode,
+    FileTransferReply, FileTransferRequest, FsMutationErrorCode, FsMutationReply,
+    FsMutationRequest, FsQueryErrorCode, FsQueryReply, FsQueryRequest, InnerMessage, InnerSession,
+    IrohOuter, IrohProtocol, MdnsConnectorDiscovery, NearbyConnectorFile, RPC_PROGRESS_INTERVAL_MS,
+    ReadErrorCode, ReadReply, ReadRequest, SealedBootstrapContext, SealedBootstrapError,
+    SealedBootstrapSession, ShellTaskErrorCode, ShellTaskReply, ShellTaskRequest,
+    SignedConnectorLease, SiteDiscoveryTag, TcpForwardErrorCode, TcpForwardReply,
+    TcpForwardRequest, forward_opaque_bidirectional, read_bootstrap, read_connector_open,
+    read_connector_ready, unwrap_rpc_request, wrap_rpc_progress, wrap_rpc_reply, write_bootstrap,
+    write_connector_open, write_connector_ready,
 };
 use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{
-    HostFileTransferService, HostLaunchState, HostMembership, HostMembershipStore, HostReadService,
-    HostShellService, HostTcpForwardService, NearbyConnectorStore,
+    HostDirectoryTreeService, HostFileTransferService, HostLaunchState, HostMembership,
+    HostMembershipStore, HostReadService, HostShellService, HostTcpForwardService,
+    NearbyConnectorStore,
 };
 
 const MAX_CONNECTOR_TUNNELS: usize = 64;
@@ -958,6 +960,22 @@ async fn serve_networked_membership_with_outer_timing(
         .as_ref()
         .is_some_and(|grant| grant.tcp_egress);
     let tcp_forward_service = tcp_egress_allowed.then(HostTcpForwardService::new);
+    let directory_tree_service = if write_allowed {
+        service
+            .as_ref()
+            .map(|read_service| {
+                HostDirectoryTreeService::new(
+                    read_service.policy().clone(),
+                    membership.marker.controller.controller_id,
+                    membership.marker.site_id,
+                    membership.marker.device_id,
+                    true,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
     loop {
         tokio::select! {
             message = inner.recv(&mut stream) => {
@@ -1027,6 +1045,24 @@ async fn serve_networked_membership_with_outer_timing(
                                 (_, Err(_)) => FileTransferReply::error(
                                     FileTransferErrorCode::InvalidRequest,
                                     "malformed bounded file transfer request",
+                                ),
+                            };
+                            reply.into_message()?
+                        }
+                        "directory_tree" => {
+                            let reply = match (
+                                directory_tree_service.as_ref(),
+                                write_allowed,
+                                DirectoryTreeRequest::from_message(&message),
+                            ) {
+                                (Some(service), true, Ok(request)) => service.execute(request, true).await,
+                                (_, false, Ok(_)) | (None, true, Ok(_)) => DirectoryTreeReply::error(
+                                    DirectoryTreeErrorCode::Denied,
+                                    "directory Put is not permitted by this device grant",
+                                ),
+                                (_, _, Err(_)) => DirectoryTreeReply::error(
+                                    DirectoryTreeErrorCode::InvalidRequest,
+                                    "malformed bounded directory tree request",
                                 ),
                             };
                             reply.into_message()?
@@ -1288,6 +1324,10 @@ pub enum HostRemoteError {
     Inner(#[from] clew_transport::InnerSessionError),
     #[error(transparent)]
     Rpc(#[from] clew_transport::RpcProtocolError),
+    #[error(transparent)]
+    DirectoryTreeScan(#[from] crate::DirectoryTreeScanError),
+    #[error(transparent)]
+    DirectoryTreeProtocol(#[from] clew_transport::DirectoryTreeError),
     #[error(transparent)]
     FsQuery(#[from] clew_transport::FsQueryProtocolError),
     #[error(transparent)]

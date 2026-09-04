@@ -13,6 +13,8 @@ pub const MAX_DIRECTORY_RELATIVE_PATH_BYTES: usize = 1024;
 pub const MAX_DIRECTORY_DEPTH: usize = 64;
 pub const MAX_DIRECTORY_FILE_BYTES: u64 = 1_u64 << 40;
 pub const MAX_DIRECTORY_TOTAL_BYTES: u64 = 4_u64 << 40;
+pub const MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES: usize = 52 * 1024;
+const MAX_DIRECTORY_TREE_ERROR_MESSAGE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -279,6 +281,145 @@ fn validate_sha256(value: &str) -> Result<(), DirectoryTreeError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum DirectoryTreeRequest {
+    PreparePut { manifest: DirectoryTreeManifest },
+    FinalizePut { manifest: DirectoryTreeManifest },
+    CancelPut { manifest: DirectoryTreeManifest },
+}
+
+impl DirectoryTreeRequest {
+    pub fn validate(&self) -> Result<(), DirectoryTreeError> {
+        let manifest = match self {
+            Self::PreparePut { manifest }
+            | Self::FinalizePut { manifest }
+            | Self::CancelPut { manifest } => manifest,
+        };
+        manifest.validate()?;
+        if manifest.direction != FileTransferDirection::ControllerToDevice
+            || manifest.device_conflict_policy != Some(DirectoryConflictPolicy::FailIfExists)
+        {
+            return Err(DirectoryTreeError::InvalidPutRequest);
+        }
+        Ok(())
+    }
+
+    pub fn into_message(self) -> Result<crate::InnerMessage, DirectoryTreeError> {
+        self.validate()?;
+        let payload = serde_json::to_vec(&self)?;
+        if payload.len() > MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES {
+            return Err(DirectoryTreeError::RpcPayloadTooLarge(payload.len()));
+        }
+        Ok(crate::InnerMessage::new("directory_tree", payload)?)
+    }
+
+    pub fn from_message(message: &crate::InnerMessage) -> Result<Self, DirectoryTreeError> {
+        if message.kind != "directory_tree" {
+            return Err(DirectoryTreeError::UnexpectedMessageKind(
+                message.kind.clone(),
+            ));
+        }
+        if message.payload.len() > MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES {
+            return Err(DirectoryTreeError::RpcPayloadTooLarge(
+                message.payload.len(),
+            ));
+        }
+        let request: Self = serde_json::from_slice(&message.payload)?;
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryTreeErrorCode {
+    InvalidRequest,
+    Denied,
+    Conflict,
+    NotFound,
+    HashMismatch,
+    Io,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryTreeErrorBody {
+    pub code: DirectoryTreeErrorCode,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum DirectoryTreeReply {
+    Prepared {
+        transfer_id: TransferId,
+        staging_device_root: String,
+    },
+    Completed {
+        transfer_id: TransferId,
+        final_device_root: String,
+    },
+    Cancelled {
+        transfer_id: TransferId,
+    },
+    Error(DirectoryTreeErrorBody),
+}
+
+impl DirectoryTreeReply {
+    #[must_use]
+    pub fn error(code: DirectoryTreeErrorCode, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        if message.len() > MAX_DIRECTORY_TREE_ERROR_MESSAGE_BYTES {
+            message.truncate(MAX_DIRECTORY_TREE_ERROR_MESSAGE_BYTES);
+        }
+        Self::Error(DirectoryTreeErrorBody { code, message })
+    }
+
+    pub fn into_message(self) -> Result<crate::InnerMessage, DirectoryTreeError> {
+        validate_directory_reply(&self)?;
+        let payload = serde_json::to_vec(&self)?;
+        if payload.len() > MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES {
+            return Err(DirectoryTreeError::RpcPayloadTooLarge(payload.len()));
+        }
+        Ok(crate::InnerMessage::new("directory_tree_result", payload)?)
+    }
+
+    pub fn from_message(message: &crate::InnerMessage) -> Result<Self, DirectoryTreeError> {
+        if message.kind != "directory_tree_result" {
+            return Err(DirectoryTreeError::UnexpectedMessageKind(
+                message.kind.clone(),
+            ));
+        }
+        if message.payload.len() > MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES {
+            return Err(DirectoryTreeError::RpcPayloadTooLarge(
+                message.payload.len(),
+            ));
+        }
+        let reply: Self = serde_json::from_slice(&message.payload)?;
+        validate_directory_reply(&reply)?;
+        Ok(reply)
+    }
+}
+
+fn validate_directory_reply(reply: &DirectoryTreeReply) -> Result<(), DirectoryTreeError> {
+    match reply {
+        DirectoryTreeReply::Prepared {
+            staging_device_root,
+            ..
+        } => validate_device_root(staging_device_root),
+        DirectoryTreeReply::Completed {
+            final_device_root, ..
+        } => validate_device_root(final_device_root),
+        DirectoryTreeReply::Cancelled { .. } => Ok(()),
+        DirectoryTreeReply::Error(error) => {
+            if error.message.len() > MAX_DIRECTORY_TREE_ERROR_MESSAGE_BYTES {
+                return Err(DirectoryTreeError::ErrorMessageTooLarge);
+            }
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DirectoryTreeError {
     #[error("unsupported directory tree manifest version {0}")]
@@ -319,8 +460,20 @@ pub enum DirectoryTreeError {
     MissingDeviceConflictPolicy,
     #[error("Device-to-controller directory manifest leaked Controller-private conflict policy")]
     ControllerPrivateConflictPolicyLeaked,
+    #[error(
+        "directory tree Put control request must be Controller-to-device with fail-if-exists policy"
+    )]
+    InvalidPutRequest,
+    #[error("directory tree RPC payload exceeds {MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES} bytes: {0}")]
+    RpcPayloadTooLarge(usize),
+    #[error("unexpected directory tree message kind: {0}")]
+    UnexpectedMessageKind(String),
+    #[error("directory tree error message exceeds its hard bound")]
+    ErrorMessageTooLarge,
     #[error("directory tree manifest exceeds {MAX_DIRECTORY_TREE_MANIFEST_BYTES} bytes: {0}")]
     ManifestTooLarge(usize),
+    #[error(transparent)]
+    Inner(#[from] crate::InnerSessionError),
     #[error("directory tree JSON failed: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -369,6 +522,57 @@ mod tests {
         let encoded = manifest.encode().unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains("controller-private"));
         assert_eq!(DirectoryTreeManifest::decode(&encoded).unwrap(), manifest);
+    }
+
+    #[test]
+    fn directory_tree_control_rpc_roundtrips_and_rejects_wrong_scope_or_oversize() {
+        let (transfer_id, controller_id, site_id, device_id) = ids();
+        let manifest = DirectoryTreeManifest::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            "D:/device/project",
+            vec![DirectoryTreeEntry::file("a.txt", 1, "11".repeat(32)).unwrap()],
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+        let request = DirectoryTreeRequest::PreparePut {
+            manifest: manifest.clone(),
+        };
+        let encoded = request.clone().into_message().unwrap();
+        assert_eq!(
+            DirectoryTreeRequest::from_message(&encoded).unwrap(),
+            request
+        );
+
+        let reply = DirectoryTreeReply::Prepared {
+            transfer_id,
+            staging_device_root: "D:/device/.clew-dir-staging".into(),
+        };
+        assert_eq!(
+            DirectoryTreeReply::from_message(&reply.clone().into_message().unwrap()).unwrap(),
+            reply
+        );
+
+        let mut wrong = manifest.clone();
+        wrong.direction = FileTransferDirection::DeviceToController;
+        wrong.device_conflict_policy = None;
+        assert!(matches!(
+            DirectoryTreeRequest::PreparePut { manifest: wrong }.validate(),
+            Err(DirectoryTreeError::InvalidPutRequest)
+        ));
+
+        let oversized = crate::InnerMessage::new(
+            "directory_tree",
+            vec![b' '; MAX_DIRECTORY_TREE_RPC_PAYLOAD_BYTES + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            DirectoryTreeRequest::from_message(&oversized),
+            Err(DirectoryTreeError::RpcPayloadTooLarge(_))
+        ));
     }
 
     #[test]
