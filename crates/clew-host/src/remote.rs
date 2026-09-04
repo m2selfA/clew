@@ -415,14 +415,17 @@ fn member_remote_config(
             .is_some_and(|grant| grant.shell)
             .then(|| HostShellService::new(policy.clone()))
             .transpose()?;
-        let file_transfer_service = grant
-            .is_some_and(|grant| grant.write)
+        let can_get = grant.is_some_and(|grant| grant.read);
+        let can_put = grant.is_some_and(|grant| grant.write);
+        let file_transfer_service = (can_get || can_put)
             .then(|| {
                 HostFileTransferService::new(
                     policy.clone(),
                     membership.marker.controller.controller_id,
                     membership.marker.site_id,
                     membership.marker.device_id,
+                    can_get,
+                    can_put,
                 )
             })
             .transpose()?;
@@ -576,15 +579,22 @@ async fn connect_bootstrap_channel(
     controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     path_window: Duration,
 ) -> Result<HostBootstrapChannel, HostRemoteError> {
-    let direct = outer.connect_bootstrap(controller_endpoint);
-    tokio::pin!(direct);
+    let mut direct_tasks = JoinSet::new();
+    let direct_outer = outer.clone();
+    direct_tasks.spawn(async move {
+        direct_outer
+            .connect_bootstrap(controller_endpoint)
+            .await
+            .map_err(HostRemoteError::from)
+    });
 
     let Some(bootstrap_key) = controller_bootstrap_noise_public_key else {
-        return tokio::time::timeout(path_window, &mut direct)
-            .await
-            .map_err(|_| HostRemoteError::BootstrapPathUnavailable)?
-            .map(HostBootstrapChannel::Direct)
-            .map_err(HostRemoteError::from);
+        return match tokio::time::timeout(path_window, direct_tasks.join_next()).await {
+            Ok(Some(Ok(Ok(stream)))) => Ok(HostBootstrapChannel::Direct(stream)),
+            Ok(Some(Ok(Err(error)))) => Err(error),
+            Ok(Some(Err(error))) => Err(HostRemoteError::ConnectorTask(error.to_string())),
+            Ok(None) | Err(_) => Err(HostRemoteError::BootstrapPathUnavailable),
+        };
     };
 
     let discovery =
@@ -614,10 +624,13 @@ async fn connect_bootstrap_channel(
 
     loop {
         tokio::select! {
-            result = &mut direct, if !direct_done => {
-                match result {
-                    Ok(stream) => return Ok(HostBootstrapChannel::Direct(stream)),
-                    Err(_) => direct_done = true,
+            joined = direct_tasks.join_next(), if !direct_done => {
+                match joined {
+                    Some(Ok(Ok(stream))) => return Ok(HostBootstrapChannel::Direct(stream)),
+                    Some(Ok(Err(_))) | None => direct_done = true,
+                    Some(Err(error)) => {
+                        return Err(HostRemoteError::ConnectorTask(error.to_string()));
+                    }
                 }
             }
             joined = candidate_tasks.join_next(), if !candidate_tasks.is_empty() => {
@@ -702,8 +715,14 @@ async fn connect_member_stream(
     controller: ControllerPublicIdentity,
     site_id: SiteId,
 ) -> Result<(clew_transport::IrohStream, MemberOuterPath), HostRemoteError> {
-    let direct = outer.connect(controller_endpoint);
-    tokio::pin!(direct);
+    let mut direct_tasks = JoinSet::new();
+    let direct_outer = outer.clone();
+    direct_tasks.spawn(async move {
+        direct_outer
+            .connect(controller_endpoint)
+            .await
+            .map_err(HostRemoteError::from)
+    });
     let discovery =
         MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
     let mut events = discovery.subscribe().await;
@@ -733,10 +752,13 @@ async fn connect_member_stream(
 
     loop {
         tokio::select! {
-            result = &mut direct, if !direct_done => {
-                match result {
-                    Ok(stream) => return Ok((stream, MemberOuterPath::Direct)),
-                    Err(_) => direct_done = true,
+            joined = direct_tasks.join_next(), if !direct_done => {
+                match joined {
+                    Some(Ok(Ok(stream))) => return Ok((stream, MemberOuterPath::Direct)),
+                    Some(Ok(Err(_))) | None => direct_done = true,
+                    Some(Err(error)) => {
+                        return Err(HostRemoteError::ConnectorTask(error.to_string()));
+                    }
                 }
             }
             joined = candidate_tasks.join_next(), if !candidate_tasks.is_empty() => {
@@ -981,17 +1003,16 @@ async fn serve_networked_membership_with_outer_timing(
                         "file_transfer" => {
                             let reply = match (
                                 file_transfer_service.as_ref(),
-                                write_allowed,
                                 FileTransferRequest::from_message(&message),
                             ) {
-                                (Some(service), true, Ok(request)) => {
-                                    service.execute(request, true).await
+                                (Some(service), Ok(request)) => {
+                                    service.execute(request, read_allowed, write_allowed).await
                                 }
-                                (_, false, Ok(_)) | (None, true, Ok(_)) => FileTransferReply::error(
+                                (None, Ok(_)) => FileTransferReply::error(
                                     FileTransferErrorCode::Denied,
-                                    "file put is not permitted by this device grant",
+                                    "file transfer is not permitted by this device grant",
                                 ),
-                                (_, _, Err(_)) => FileTransferReply::error(
+                                (_, Err(_)) => FileTransferReply::error(
                                     FileTransferErrorCode::InvalidRequest,
                                     "malformed bounded file transfer request",
                                 ),

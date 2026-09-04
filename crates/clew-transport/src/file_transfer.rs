@@ -271,11 +271,30 @@ fn validate_sha256(value: &str) -> Result<(), FileTransferError> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum FileTransferRequest {
-    PutBegin { manifest: FileTransferManifest },
-    PutChunk { chunk: FileTransferChunk },
-    Status { transfer_id: TransferId },
-    Finalize { transfer_id: TransferId },
-    Cancel { transfer_id: TransferId },
+    PutBegin {
+        manifest: FileTransferManifest,
+    },
+    PutChunk {
+        chunk: FileTransferChunk,
+    },
+    GetBegin {
+        transfer_id: TransferId,
+        device_path: String,
+        chunk_size: u32,
+    },
+    GetChunk {
+        transfer_id: TransferId,
+        offset: u64,
+    },
+    Status {
+        transfer_id: TransferId,
+    },
+    Finalize {
+        transfer_id: TransferId,
+    },
+    Cancel {
+        transfer_id: TransferId,
+    },
 }
 
 impl FileTransferRequest {
@@ -288,7 +307,28 @@ impl FileTransferRequest {
                 }
             }
             Self::PutChunk { chunk } => chunk.validate()?,
-            Self::Status { .. } | Self::Finalize { .. } | Self::Cancel { .. } => {}
+            Self::GetBegin {
+                device_path,
+                chunk_size,
+                ..
+            } => {
+                if device_path.trim().is_empty()
+                    || device_path.len() > MAX_FILE_RESUME_PATH_BYTES
+                    || device_path.contains('\0')
+                {
+                    return Err(FileTransferError::InvalidDevicePath);
+                }
+                if *chunk_size < MIN_FILE_CHUNK_BYTES
+                    || *chunk_size > MAX_FILE_CHUNK_BYTES
+                    || !chunk_size.is_power_of_two()
+                {
+                    return Err(FileTransferError::InvalidChunkSize(*chunk_size));
+                }
+            }
+            Self::GetChunk { .. }
+            | Self::Status { .. }
+            | Self::Finalize { .. }
+            | Self::Cancel { .. } => {}
         }
         Ok(())
     }
@@ -386,6 +426,8 @@ pub struct FileTransferErrorBody {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum FileTransferReply {
     Status(FileTransferStatus),
+    Manifest(FileTransferManifest),
+    Chunk(FileTransferChunk),
     Cancelled { transfer_id: TransferId },
     Error(FileTransferErrorBody),
 }
@@ -403,6 +445,14 @@ impl FileTransferReply {
     pub fn validate(&self) -> Result<(), FileTransferError> {
         match self {
             Self::Status(status) => status.validate(),
+            Self::Manifest(manifest) => {
+                manifest.validate()?;
+                if manifest.direction != FileTransferDirection::DeviceToController {
+                    return Err(FileTransferError::WrongDirection);
+                }
+                Ok(())
+            }
+            Self::Chunk(chunk) => chunk.validate(),
             Self::Cancelled { .. } => Ok(()),
             Self::Error(error) => {
                 if error.message.len() > MAX_FILE_TRANSFER_ERROR_MESSAGE_BYTES {
@@ -616,6 +666,73 @@ mod tests {
         assert!(matches!(
             oversized_encoding.validate(),
             Err(FileTransferError::ChunkEncodingTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn get_rpc_returns_device_source_manifest_and_bounded_chunks() {
+        let transfer_id = TransferId::new();
+        let begin = FileTransferRequest::GetBegin {
+            transfer_id,
+            device_path: "/device/source.bin".into(),
+            chunk_size: 4096,
+        };
+        assert_eq!(
+            FileTransferRequest::from_message(&begin.clone().into_message().unwrap()).unwrap(),
+            begin
+        );
+        let get_chunk = FileTransferRequest::GetChunk {
+            transfer_id,
+            offset: 4096,
+        };
+        assert_eq!(
+            FileTransferRequest::from_message(&get_chunk.clone().into_message().unwrap()).unwrap(),
+            get_chunk
+        );
+
+        let manifest = FileTransferManifest::new(
+            transfer_id,
+            ControllerId::new(),
+            SiteId::new(),
+            DeviceId::new(),
+            FileTransferDirection::DeviceToController,
+            "/device/source.bin",
+            5_000,
+            4096,
+            "11".repeat(32),
+            None,
+        )
+        .unwrap();
+        let manifest_reply = FileTransferReply::Manifest(manifest.clone());
+        assert_eq!(
+            FileTransferReply::from_message(&manifest_reply.clone().into_message().unwrap())
+                .unwrap(),
+            manifest_reply
+        );
+        let chunk = FileTransferChunk::from_bytes(transfer_id, 4096, &[0x44; 904]).unwrap();
+        let chunk_reply = FileTransferReply::Chunk(chunk.clone());
+        assert_eq!(
+            FileTransferReply::from_message(&chunk_reply.clone().into_message().unwrap()).unwrap(),
+            chunk_reply
+        );
+        assert!(matches!(
+            FileTransferReply::Manifest(
+                FileTransferManifest::new(
+                    transfer_id,
+                    ControllerId::new(),
+                    SiteId::new(),
+                    DeviceId::new(),
+                    FileTransferDirection::ControllerToDevice,
+                    "/device/source.bin",
+                    1,
+                    4096,
+                    "11".repeat(32),
+                    Some(FileConflictPolicy::FailIfExists),
+                )
+                .unwrap()
+            )
+            .validate(),
+            Err(FileTransferError::WrongDirection)
         ));
     }
 

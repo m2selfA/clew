@@ -24,10 +24,10 @@ use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, FileConflictPolicy, ForwardAddRequest,
     FsWritePrecondition, HttpConnectAddRequest, InviteIssueRequest, LocalApiClient,
     OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteEditRequest, RemoteFilePutRequest, RemoteGlobRequest,
-    RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest, RemoteShellAttachRequest,
-    RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest, restore_controller_backup,
-    start_controller,
+    OutfitSetFieldRequest, RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest,
+    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
+    restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -420,6 +420,21 @@ enum FileCommand {
         source: PathBuf,
         #[arg(long, value_name = "DEVICE_PATH")]
         dest: String,
+        #[arg(long, default_value_t = 32_768)]
+        chunk_size: u32,
+        #[arg(long, value_enum, default_value = "fail")]
+        conflict: FileConflictArg,
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Start one device-to-Controller single-file download. The optional device uses shared selector semantics.
+    Get {
+        #[arg(value_name = "DEVICE")]
+        device: Option<String>,
+        #[arg(long, value_name = "DEVICE_PATH")]
+        source: String,
+        #[arg(long, value_name = "LOCAL_FILE")]
+        dest: PathBuf,
         #[arg(long, default_value_t = 32_768)]
         chunk_size: u32,
         #[arg(long, value_enum, default_value = "fail")]
@@ -962,6 +977,37 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         device_id,
                         source_path,
                         device_path: dest,
+                        chunk_size,
+                        conflict_policy: conflict.into(),
+                    })
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            }
+            FileCommand::Get {
+                device,
+                source,
+                dest,
+                chunk_size,
+                conflict,
+                state_dir,
+            } => {
+                let destination = if dest.is_absolute() {
+                    dest
+                } else {
+                    std::env::current_dir()?.join(dest)
+                };
+                let destination_path = destination
+                    .to_str()
+                    .ok_or("Controller destination path must be valid UTF-8")?
+                    .to_owned();
+                let client = LocalApiClient::new(controller_config(state_dir)?);
+                let devices = client.device_list().await?;
+                let device_id = select_executable_device(&devices.devices, device.as_deref())?;
+                let info = client
+                    .file_get(RemoteFileGetRequest {
+                        device_id,
+                        device_path: source,
+                        destination_path,
                         chunk_size,
                         conflict_policy: conflict.into(),
                     })

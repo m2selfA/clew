@@ -1139,7 +1139,7 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 
 ## 12. V5 — File Plane
 
-**Status：IN PROGRESS（V5a-0 + V5a-1a/1b DONE；single-file put + cross-generation resume DONE）**
+**Status：IN PROGRESS（V5a-0 + V5a-1a/1b + V5a-2 DONE；single-file put/get + cross-generation resume DONE）**
 
 ### V5a-0 — Single-file manifest / deterministic chunk contract
 
@@ -1185,7 +1185,22 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 - 默认未签write的final-binary readonly DeviceId `a70d8243-5056-4816-9d68-50dafb412669` 对file put精确Controller-side `Denied: file put is not permitted for this device`，目标不存在。Host file-transfer focused **2/2 PASS**；Controller reconnect synthetic **1/1 PASS**；final `cargo fmt -- --check` PASS、`cargo check --workspace --all-targets` PASS / 0 warnings、`cargo test --workspace --all-targets` **205 passed / 0 failed / 6 ignored**；
 - 当前resume能力明确只跨**同Host进程的InnerSession generation**。Controller manager和Host transfer store仍是process-memory state，Controller/Host进程重启后不保证恢复。因此`Feature::FileResume`继续保持reserved/not-implemented，不能把本块宣传为durable restart resume。
 
-V5 Controller→Device single-file put至此封板。下一块 V5a-2：Device→Controller single-file get，必须保持Controller destination/conflict policy私有、只要求signed read grant，并复用同一chunk/final-hash/TransferId语义。之后再收Controller/Host process-restart durable transfer store，最后才做directory tree与bounded multi-transfer concurrency。
+### V5a-2 — Device→Controller single-file get + cross-generation resume
+
+**Status：DONE（2026-09-04）**
+
+- `FileTransferRequest/Reply` 在同一 `file_transfer` RPC 增加 `GetBegin/GetChunk` 与 `Manifest/Chunk`；Device→Controller manifest 继续只携带 device-side source path / size / chunk size / final SHA，Controller 本机 destination/conflict policy 永不进入 peer manifest；
+- Host `HostFileTransferService` 将权限明确拆为 `can_get/can_put`，共享同一个 bounded 16-transfer namespace但绝不交叉授权。read-only membership 创建 service 时 `can_get=true / can_put=false`；Get 仍要求 persisted `effective_grant.read=true` + signed roots，Put 仍独立要求 write；readonly focused 证明 Get 正向而 Put 精确 Denied；
+- GetBegin 对 source 做 symlink/regular-file/canonical-root检查，使用同一个打开的 File handle 流式计算 full SHA，再 seek 回 0 并保留 source handle。相同 TransferId + 相同 source/chunk size 重放返回同一 manifest；同 ID 换 source 为 Conflict。GetChunk 只允许 deterministic aligned offset，逐块 SHA；source size 漂移 fail closed，若内容原位改变但 size不变，Controller最终 full SHA仍拒绝混合文件；
+- Controller manager 升级为统一 tagged `FileTransferInfo::{Put,Get}`，Put/Get 共用 stable TransferId namespace和全局 hard cap 16；Get start/status/cancel由长期 Controller 持有。Controller-private destination 先在目标同目录建立 secure temp，并维护自己的 `FileResumeDescriptor` / prefix SHA / confirmed_offset；chunk durable write+sync 成功后才推进本地 checkpoint；
+- 跨 InnerSession generation 的 Get resume 不借 Host Status 伪造 Controller checkpoint：session失效后使用同一 TransferId在新 generation **重新 GetBegin 并要求完整 source manifest 与首次完全相同**，然后只从 Controller 本地 confirmed_offset继续 GetChunk。final SHA与prefix SHA均匹配后才按 Controller-private Fail/Replace/Rename policy atomic persist并sync；最后发 bounded Host Cancel释放 source handle；
+- Local API/CLI 新增 DeviceId-only `file.get` 与 `clew file get [DEVICE] --source <DEVICE_PATH> --dest <LOCAL_FILE>`；Get只检查 active/executable + registry `effective_grant.read=true` + signed roots，完全不依赖 write。CLI relative `--dest`只在短命令进程cwd中绝对化；Activity只记录 `file_get_start + device source path`，不记录 Controller destination；status/cancel 对两方向统一返回 tagged FileTransferInfo；
+- 实现过程中真实 Windows fresh enrollment 暴露 main-thread stack overflow：定位到 `connect_bootstrap_channel` 第一次 inline poll `IrohOuter::connect_bootstrap()`；mDNS/Nearby/address fan-out均已排除，单一 direct IP仍复现。最终没有增大线程栈，而是把 bootstrap 与 active member 的 direct Controller dial 都改为 Tokio `JoinSet` worker task，与既有 Helper candidate dial一致；未完成 direct task在 JoinSet drop时自动abort。修复后 fresh cap00 与 Gamma read-only enrollment均从 waiting 正常进入 ready；
+- exact final Windows binary SHA-256 `3fc383f26733958d58e726db3b37d4c2de33280b1e4f4bf71f014cfdf2996582`（98,659,328 bytes），cap00/Gamma完全一致。真实 default read-only Gamma DeviceId `eda96692-52f1-4feb-a534-bdb6b9999d25`：102,523-byte Get自动选择唯一 executable device并 Completed，Controller独立 SHA=`a443a57526957e2f38930bd8c9004c50b151e81ff748137093ecb3da545c8683` 与 Gamma source一致；同一 Device Put精确 Controller-side Denied，Gamma目标不存在；
+- 真实 8MiB/4KiB reconnect gate：transfer `35bb9c77-4548-4671-95df-f431572dcbdf` 在 generation **1** confirmed_offset **2,375,680** 时启用仅 Gamma `clew.exe` 的 program-scoped outbound block，随后观测同一 Device generation **2**；同一 TransferId confirmed_offset 继续增长到 **8,351,744**（未回0），最终 **8,388,608/8,388,608 Completed**，Controller final SHA=`a5e85ff850b4329a754123d2093d7212620299565775fbd23c49f3b9a1dcb3ad` 与 Gamma source精确一致。此次查询未捕到瞬时 WaitingForReconnect，因此不冒充该瞬时状态证据；generation变化+offset单调续传+最终SHA是正式resume证据；
+- focused：transport file-transfer **6/6 PASS**；Host put/get **3/3 PASS**；Controller Get manifest re-proof/reconnect **1/1 PASS**。final `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS / 0 warnings；`cargo test --workspace --all-targets` **208 passed / 0 failed / 6 ignored**；测试清单总数 214；所有 Gamma/local fixture、program-scoped firewall rule与test jobs均已清理。
+
+V5 single-file双向 data plane至此封板。当前 resume仍只保证同进程的 InnerSession generation变化；Controller/Host进程重启后的 task/part/source state尚未durable恢复，因此 `Feature::FileResume` 继续保持reserved/not-implemented。下一块 V5a-3：process-restart durable single-file transfer state；通过后再评估是否开启 FileResume feature，最后才进入 directory tree 与 bounded multi-transfer concurrency。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1264,13 +1279,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；single-file put + generation resume DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；single-file put/get + generation resume DONE）**
 
-**Next block：V5a-2 — Device→Controller single-file get**
+**Next block：V5a-3 — process-restart durable single-file transfer state**
 
-V4已在`dfa373d`完整封板。V5a现在已经从V3d的TransferId/resume descriptor一路闭合到真实Controller→Device put：Controller持有后台task与私有source path，Host持有同进程part/checkpoint，session loss后以同TransferId先Status再从confirmed_offset续传；真实Gamma program-scoped断线已证明generation 3→4自动resume并final SHA一致。当前不再缺用户可用put；下一步补反向get，且继续明确process restart durability、directory tree和multi-transfer调度尚未完成，FileResume feature因此仍不协商。
+V4已在`dfa373d`完整封板。V5a现在已经闭合双向single-file data plane：put由Controller持有私有source、Host持有part/checkpoint；get由Host持有source handle/manifest、Controller持有私有destination/temp/checkpoint；两方向都已在真实Gamma上证明session generation变化后同TransferId继续并final SHA一致，default read-only Get正向且Put Denied。V5当前唯一single-file resume缺口收窄为Controller/Host **process restart durability**；在该gate闭合前FileResume feature继续reserved，不提前进入directory或多transfer调度。
 
 ### Change log
+
+- **2026-09-04** — V5a-2 Device→Controller single-file get + cross-generation resume DONE：同一file_transfer RPC新增GetBegin/GetChunk，Host readonly can_get/can_put分权，Controller私有destination/temp/checkpoint与manifest re-proof resume；default read-only Gamma 102,523-byte Get SHA一致且同设备Put Denied。8MiB/4KiB真实gate从generation1/offset2,375,680经program-scoped断线到generation2，原TransferId offset继续到8,351,744并Completed 8,388,608，Controller final SHA=`a5e85ff8...b3ad`。真实fresh enrollment同时暴露Windows inline iroh direct dial main-stack overflow，改为JoinSet worker后cap00/Gamma均恢复，不增大线程栈。workspace **208/0/6**。下一块V5a-3 process-restart durable state；FileResume仍reserved。
 
 - **2026-09-04** — V5a-1b Controller-owned single-file put + cross-generation resume DONE：Local API/CLI新增file put/status/cancel，Controller后台manager hard cap16并私有持有source；unknown chunk/finalize结果不blind replay，新generation先Status对齐confirmed_offset。independent review修复Preparing cancel永久Cancelling风险。exact final binary `e2f0d955...b4cb` cap00/Gamma一致；真实8MiB transfer在generation3/offset4,177,920断线后generation4续到Completed，Gamma final SHA一致；Preparing与Running cancel均Cancelled且part residual=0；default Site Denied。workspace **205/0/6**。下一块V5a-2 Device→Controller get；process-restart durable resume仍未完成，FileResume feature继续reserved。
 

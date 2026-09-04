@@ -33,10 +33,11 @@ use tokio::{
 
 use crate::{
     ControllerConfig, ControllerControlStore, ControllerFileTransferError,
-    ControllerFileTransferManager, FilePutInfo, ForwardInfo, HttpConnectInfo,
-    HttpConnectProxyManager, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore, OutfitEditPatch,
-    OutfitLibrary, OutfitLibraryEntry, RemoteHub, RemoteSessionInfo, RemoteSessionState,
-    Socks5Info, Socks5ProxyManager, TcpForwardManager, export_controller_backup, transport,
+    ControllerFileTransferManager, FileGetInfo, FilePutInfo, FileTransferInfo, ForwardInfo,
+    HttpConnectInfo, HttpConnectProxyManager, LocalEndpoint, OutfitAssetInfo, OutfitAssetStore,
+    OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, RemoteHub, RemoteSessionInfo,
+    RemoteSessionState, Socks5Info, Socks5ProxyManager, TcpForwardManager,
+    export_controller_backup, transport,
 };
 
 pub const LOCAL_API_VERSION: u32 = 1;
@@ -218,6 +219,15 @@ pub struct RemoteFilePutRequest {
     pub device_id: DeviceId,
     pub source_path: String,
     pub device_path: String,
+    pub chunk_size: u32,
+    pub conflict_policy: FileConflictPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteFileGetRequest {
+    pub device_id: DeviceId,
+    pub device_path: String,
+    pub destination_path: String,
     pub chunk_size: u32,
     pub conflict_policy: FileConflictPolicy,
 }
@@ -479,6 +489,7 @@ enum LocalMethod {
         proxy_id: ProxyId,
     },
     FilePut(RemoteFilePutRequest),
+    FileGet(RemoteFileGetRequest),
     FileStatus {
         transfer_id: TransferId,
     },
@@ -540,6 +551,8 @@ enum LocalResponse {
     HttpConnectInfo(HttpConnectInfo),
     HttpConnectList(HttpConnectList),
     FilePutInfo(FilePutInfo),
+    FileGetInfo(FileGetInfo),
+    FileTransferInfo(FileTransferInfo),
     ActivityList(ActivityList),
     OutfitList(OutfitList),
     OutfitProfile(OutfitProfile),
@@ -715,6 +728,7 @@ async fn dispatch(
             (http_connect_remove_response(state, proxy_id).await, false)
         }
         LocalMethod::FilePut(request) => (file_put_response(state, request), false),
+        LocalMethod::FileGet(request) => (file_get_response(state, request), false),
         LocalMethod::FileStatus { transfer_id } => {
             (file_status_response(state, transfer_id), false)
         }
@@ -1576,16 +1590,46 @@ fn file_put_response(state: &LocalApiState, request: RemoteFilePutRequest) -> Lo
     }
 }
 
+fn file_get_response(state: &LocalApiState, request: RemoteFileGetRequest) -> LocalResponse {
+    let site_id = match authorize_file_get_device(state, request.device_id) {
+        Ok(site_id) => site_id,
+        Err(response) => return response,
+    };
+    match state.file_transfers.start_get(
+        request.device_id,
+        site_id,
+        request.device_path.clone(),
+        request.destination_path,
+        request.chunk_size,
+        request.conflict_policy,
+    ) {
+        Ok(info) => {
+            record_shell_activity(
+                state,
+                site_id,
+                request.device_id,
+                "file_get_start",
+                Some(request.device_path),
+                ActivityResult::Succeeded,
+                0,
+                0,
+            );
+            LocalResponse::FileGetInfo(info)
+        }
+        Err(error) => file_transfer_manager_error(error),
+    }
+}
+
 fn file_status_response(state: &LocalApiState, transfer_id: TransferId) -> LocalResponse {
     match state.file_transfers.status(transfer_id) {
-        Ok(info) => LocalResponse::FilePutInfo(info),
+        Ok(info) => LocalResponse::FileTransferInfo(info),
         Err(error) => file_transfer_manager_error(error),
     }
 }
 
 fn file_cancel_response(state: &LocalApiState, transfer_id: TransferId) -> LocalResponse {
     match state.file_transfers.cancel(transfer_id) {
-        Ok(info) => LocalResponse::FilePutInfo(info),
+        Ok(info) => LocalResponse::FileTransferInfo(info),
         Err(error) => file_transfer_manager_error(error),
     }
 }
@@ -1594,6 +1638,8 @@ fn file_transfer_manager_error(error: ControllerFileTransferError) -> LocalRespo
     let code = match error {
         ControllerFileTransferError::InvalidSourcePath
         | ControllerFileTransferError::InvalidDevicePath
+        | ControllerFileTransferError::InvalidDestinationPath
+        | ControllerFileTransferError::DestinationConflict
         | ControllerFileTransferError::InvalidChunkSize(_)
         | ControllerFileTransferError::InvalidSource
         | ControllerFileTransferError::NotFound(_) => LocalApiErrorCode::InvalidRequest,
@@ -1645,6 +1691,49 @@ fn authorize_file_put_device(
     }
     Ok(site.site_id)
 }
+fn authorize_file_get_device(
+    state: &LocalApiState,
+    device_id: DeviceId,
+) -> Result<SiteId, LocalResponse> {
+    let store = state.control.lock().map_err(|_| {
+        local_error(
+            LocalApiErrorCode::Internal,
+            "controller state is unavailable",
+        )
+    })?;
+    let Some(device) = store.snapshot().catalog.device(device_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    let Some(site) = store.snapshot().catalog.site(device.device.site_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    let Some(enrollment) = store.snapshot().registry.device(device_id) else {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "device is not available",
+        ));
+    };
+    if device.revoked
+        || site.revoked
+        || !device.device.capabilities.execute
+        || !enrollment.effective_grant.read
+        || !site.read_policy.allows_read()
+        || !store.snapshot().registry.is_device_active(device_id)
+    {
+        return Err(local_error(
+            LocalApiErrorCode::Denied,
+            "file get is not permitted for this device",
+        ));
+    }
+    Ok(site.site_id)
+}
+
 fn authorize_tcp_egress_device(
     state: &LocalApiState,
     device_id: DeviceId,
@@ -2605,15 +2694,26 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn file_get(
+        &self,
+        request: RemoteFileGetRequest,
+    ) -> Result<FileGetInfo, LocalApiClientError> {
+        match self.request(LocalMethod::FileGet(request)).await? {
+            LocalResponse::FileGetInfo(info) => Ok(info),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn file_status(
         &self,
         transfer_id: TransferId,
-    ) -> Result<FilePutInfo, LocalApiClientError> {
+    ) -> Result<FileTransferInfo, LocalApiClientError> {
         match self
             .request(LocalMethod::FileStatus { transfer_id })
             .await?
         {
-            LocalResponse::FilePutInfo(info) => Ok(info),
+            LocalResponse::FileTransferInfo(info) => Ok(info),
             LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
@@ -2622,12 +2722,12 @@ impl LocalApiClient {
     pub async fn file_cancel(
         &self,
         transfer_id: TransferId,
-    ) -> Result<FilePutInfo, LocalApiClientError> {
+    ) -> Result<FileTransferInfo, LocalApiClientError> {
         match self
             .request(LocalMethod::FileCancel { transfer_id })
             .await?
         {
-            LocalResponse::FilePutInfo(info) => Ok(info),
+            LocalResponse::FileTransferInfo(info) => Ok(info),
             LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }

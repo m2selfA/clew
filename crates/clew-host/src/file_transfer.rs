@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{Seek as _, SeekFrom, Write as _},
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -24,13 +24,16 @@ pub struct HostFileTransferService {
     controller_id: ControllerId,
     site_id: SiteId,
     device_id: DeviceId,
+    can_get: bool,
+    can_put: bool,
     inner: Arc<Mutex<HostFileTransferStore>>,
 }
 
 #[derive(Debug, Default)]
 struct HostFileTransferStore {
     next_sequence: u64,
-    entries: BTreeMap<TransferId, HostPutEntry>,
+    puts: BTreeMap<TransferId, HostPutEntry>,
+    gets: BTreeMap<TransferId, HostGetEntry>,
 }
 
 #[derive(Debug)]
@@ -53,6 +56,14 @@ struct LastChunk {
     sha256: String,
 }
 
+#[derive(Debug)]
+struct HostGetEntry {
+    requested_device_path: String,
+    chunk_size: u32,
+    manifest: FileTransferManifest,
+    file: File,
+}
+
 impl HostPutEntry {
     fn status(&self) -> FileTransferReply {
         FileTransferReply::Status(FileTransferStatus {
@@ -69,6 +80,8 @@ impl HostFileTransferService {
         controller_id: ControllerId,
         site_id: SiteId,
         device_id: DeviceId,
+        can_get: bool,
+        can_put: bool,
     ) -> Result<Self, clew_core::ControlModelError> {
         policy.validate()?;
         Ok(Self {
@@ -76,6 +89,8 @@ impl HostFileTransferService {
             controller_id,
             site_id,
             device_id,
+            can_get,
+            can_put,
             inner: Arc::new(Mutex::new(HostFileTransferStore::default())),
         })
     }
@@ -83,6 +98,7 @@ impl HostFileTransferService {
     pub async fn execute(
         &self,
         request: FileTransferRequest,
+        allow_read: bool,
         allow_write: bool,
     ) -> FileTransferReply {
         if request.validate().is_err() {
@@ -91,10 +107,21 @@ impl HostFileTransferService {
                 "invalid bounded file transfer request",
             );
         }
-        if !allow_write || self.policy.roots.is_empty() {
+        let permitted = match &request {
+            FileTransferRequest::PutBegin { .. }
+            | FileTransferRequest::PutChunk { .. }
+            | FileTransferRequest::Finalize { .. } => self.can_put && allow_write,
+            FileTransferRequest::GetBegin { .. } | FileTransferRequest::GetChunk { .. } => {
+                self.can_get && allow_read
+            }
+            FileTransferRequest::Status { .. } | FileTransferRequest::Cancel { .. } => {
+                (self.can_get && allow_read) || (self.can_put && allow_write)
+            }
+        };
+        if !permitted || self.policy.roots.is_empty() {
             return FileTransferReply::error(
                 FileTransferErrorCode::Denied,
-                "file put is outside the allowed device grant",
+                "file transfer is outside the allowed device grant",
             );
         }
         let service = self.clone();
@@ -110,6 +137,15 @@ impl HostFileTransferService {
         match request {
             FileTransferRequest::PutBegin { manifest } => self.put_begin(manifest),
             FileTransferRequest::PutChunk { chunk } => self.put_chunk(chunk),
+            FileTransferRequest::GetBegin {
+                transfer_id,
+                device_path,
+                chunk_size,
+            } => self.get_begin(transfer_id, device_path, chunk_size),
+            FileTransferRequest::GetChunk {
+                transfer_id,
+                offset,
+            } => self.get_chunk(transfer_id, offset),
             FileTransferRequest::Status { transfer_id } => self.status(transfer_id),
             FileTransferRequest::Finalize { transfer_id } => self.finalize(transfer_id),
             FileTransferRequest::Cancel { transfer_id } => self.cancel(transfer_id),
@@ -131,7 +167,7 @@ impl HostFileTransferService {
                 Ok(store) => store,
                 Err(_) => return transfer_io("Host transfer store is unavailable"),
             };
-            if let Some(existing) = store.entries.get(&manifest.transfer_id) {
+            if let Some(existing) = store.puts.get(&manifest.transfer_id) {
                 return if existing.manifest == manifest {
                     existing.status()
                 } else {
@@ -140,6 +176,12 @@ impl HostFileTransferService {
                         "TransferId is already bound to a different manifest",
                     )
                 };
+            }
+            if store.gets.contains_key(&manifest.transfer_id) {
+                return FileTransferReply::error(
+                    FileTransferErrorCode::Conflict,
+                    "TransferId is already bound to a device-to-controller transfer",
+                );
             }
         }
 
@@ -177,7 +219,7 @@ impl HostFileTransferService {
             Err(_) => return transfer_io("Host transfer store is unavailable"),
         };
         prune_completed(&mut store);
-        if let Some(existing) = store.entries.get(&transfer_id) {
+        if let Some(existing) = store.puts.get(&transfer_id) {
             return if existing.manifest == manifest {
                 existing.status()
             } else {
@@ -187,7 +229,13 @@ impl HostFileTransferService {
                 )
             };
         }
-        if store.entries.len() >= HARD_MAX_HOST_FILE_TRANSFERS {
+        if store.gets.contains_key(&transfer_id) {
+            return FileTransferReply::error(
+                FileTransferErrorCode::Conflict,
+                "TransferId is already bound to a device-to-controller transfer",
+            );
+        }
+        if store.puts.len().saturating_add(store.gets.len()) >= HARD_MAX_HOST_FILE_TRANSFERS {
             return FileTransferReply::error(
                 FileTransferErrorCode::Capacity,
                 "Host file transfer capacity is exhausted",
@@ -195,7 +243,7 @@ impl HostFileTransferService {
         }
         store.next_sequence = store.next_sequence.saturating_add(1);
         let sequence = store.next_sequence;
-        store.entries.insert(
+        store.puts.insert(
             transfer_id,
             HostPutEntry {
                 sequence,
@@ -210,7 +258,7 @@ impl HostFileTransferService {
             },
         );
         store
-            .entries
+            .puts
             .get(&transfer_id)
             .map(HostPutEntry::status)
             .unwrap_or_else(|| transfer_io("Host transfer state failed"))
@@ -221,7 +269,7 @@ impl HostFileTransferService {
             Ok(store) => store,
             Err(_) => return transfer_io("Host transfer store is unavailable"),
         };
-        let Some(entry) = store.entries.get_mut(&chunk.transfer_id) else {
+        let Some(entry) = store.puts.get_mut(&chunk.transfer_id) else {
             return transfer_not_found();
         };
         let bytes = match chunk.decode_bytes() {
@@ -310,15 +358,163 @@ impl HostFileTransferService {
         entry.status()
     }
 
+    fn get_begin(
+        &self,
+        transfer_id: TransferId,
+        requested_device_path: String,
+        chunk_size: u32,
+    ) -> FileTransferReply {
+        {
+            let store = match self.inner.lock() {
+                Ok(store) => store,
+                Err(_) => return transfer_io("Host transfer store is unavailable"),
+            };
+            if store.puts.contains_key(&transfer_id) {
+                return FileTransferReply::error(
+                    FileTransferErrorCode::Conflict,
+                    "TransferId is already bound to a controller-to-device transfer",
+                );
+            }
+            if let Some(existing) = store.gets.get(&transfer_id) {
+                return if existing.requested_device_path == requested_device_path
+                    && existing.chunk_size == chunk_size
+                {
+                    FileTransferReply::Manifest(existing.manifest.clone())
+                } else {
+                    FileTransferReply::error(
+                        FileTransferErrorCode::Conflict,
+                        "TransferId is already bound to a different device source",
+                    )
+                };
+            }
+        }
+
+        let (canonical_path, mut file, total_size, final_sha256) =
+            match prepare_get_source(&self.policy, &requested_device_path) {
+                Ok(source) => source,
+                Err(reply) => return reply,
+            };
+        let manifest = match FileTransferManifest::new(
+            transfer_id,
+            self.controller_id,
+            self.site_id,
+            self.device_id,
+            FileTransferDirection::DeviceToController,
+            canonical_path,
+            total_size,
+            chunk_size,
+            final_sha256,
+            None,
+        ) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                return FileTransferReply::error(
+                    FileTransferErrorCode::InvalidRequest,
+                    "Host generated an invalid device source manifest",
+                );
+            }
+        };
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return transfer_io("device source seek failed");
+        }
+        let mut store = match self.inner.lock() {
+            Ok(store) => store,
+            Err(_) => return transfer_io("Host transfer store is unavailable"),
+        };
+        prune_completed(&mut store);
+        if store.puts.contains_key(&transfer_id) {
+            return FileTransferReply::error(
+                FileTransferErrorCode::Conflict,
+                "TransferId is already bound to a controller-to-device transfer",
+            );
+        }
+        if let Some(existing) = store.gets.get(&transfer_id) {
+            return if existing.requested_device_path == requested_device_path
+                && existing.chunk_size == chunk_size
+            {
+                FileTransferReply::Manifest(existing.manifest.clone())
+            } else {
+                FileTransferReply::error(
+                    FileTransferErrorCode::Conflict,
+                    "TransferId is already bound to a different device source",
+                )
+            };
+        }
+        if store.puts.len().saturating_add(store.gets.len()) >= HARD_MAX_HOST_FILE_TRANSFERS {
+            return FileTransferReply::error(
+                FileTransferErrorCode::Capacity,
+                "Host file transfer capacity is exhausted",
+            );
+        }
+        store.gets.insert(
+            transfer_id,
+            HostGetEntry {
+                requested_device_path,
+                chunk_size,
+                manifest: manifest.clone(),
+                file,
+            },
+        );
+        FileTransferReply::Manifest(manifest)
+    }
+
+    fn get_chunk(&self, transfer_id: TransferId, offset: u64) -> FileTransferReply {
+        let mut store = match self.inner.lock() {
+            Ok(store) => store,
+            Err(_) => return transfer_io("Host transfer store is unavailable"),
+        };
+        let Some(entry) = store.gets.get_mut(&transfer_id) else {
+            return transfer_not_found();
+        };
+        if entry.manifest.total_size == 0 || offset >= entry.manifest.total_size {
+            return FileTransferReply::error(
+                FileTransferErrorCode::OutOfOrder,
+                "get chunk offset is outside the device source",
+            );
+        }
+        if offset % u64::from(entry.manifest.chunk_size) != 0 {
+            return FileTransferReply::error(
+                FileTransferErrorCode::OutOfOrder,
+                "get chunk offset is not on a deterministic chunk boundary",
+            );
+        }
+        match entry.file.metadata() {
+            Ok(metadata) if metadata.len() == entry.manifest.total_size => {}
+            _ => {
+                return FileTransferReply::error(
+                    FileTransferErrorCode::Conflict,
+                    "device source size changed during transfer",
+                );
+            }
+        }
+        let expected_len = u64::from(entry.manifest.chunk_size)
+            .min(entry.manifest.total_size.saturating_sub(offset))
+            as usize;
+        if entry.file.seek(SeekFrom::Start(offset)).is_err() {
+            return transfer_io("device source seek failed");
+        }
+        let mut bytes = vec![0_u8; expected_len];
+        if entry.file.read_exact(&mut bytes).is_err() {
+            return transfer_io("device source read failed");
+        }
+        match FileTransferChunk::from_bytes(transfer_id, offset, &bytes) {
+            Ok(chunk) => FileTransferReply::Chunk(chunk),
+            Err(_) => transfer_io("device source chunk encoding failed"),
+        }
+    }
+
     fn status(&self, transfer_id: TransferId) -> FileTransferReply {
         let store = match self.inner.lock() {
             Ok(store) => store,
             Err(_) => return transfer_io("Host transfer store is unavailable"),
         };
+        if let Some(entry) = store.puts.get(&transfer_id) {
+            return entry.status();
+        }
         store
-            .entries
+            .gets
             .get(&transfer_id)
-            .map(HostPutEntry::status)
+            .map(|entry| FileTransferReply::Manifest(entry.manifest.clone()))
             .unwrap_or_else(transfer_not_found)
     }
 
@@ -327,8 +523,15 @@ impl HostFileTransferService {
             Ok(store) => store,
             Err(_) => return transfer_io("Host transfer store is unavailable"),
         };
-        let Some(entry) = store.entries.get_mut(&transfer_id) else {
-            return transfer_not_found();
+        let Some(entry) = store.puts.get_mut(&transfer_id) else {
+            return if store.gets.contains_key(&transfer_id) {
+                FileTransferReply::error(
+                    FileTransferErrorCode::OutOfOrder,
+                    "device-to-controller transfer does not use Host finalize",
+                )
+            } else {
+                transfer_not_found()
+            };
         };
         if entry.phase == FileTransferPhase::Completed {
             return entry.status();
@@ -378,24 +581,27 @@ impl HostFileTransferService {
             Ok(store) => store,
             Err(_) => return transfer_io("Host transfer store is unavailable"),
         };
-        let Some(entry) = store.entries.get(&transfer_id) else {
-            return transfer_not_found();
-        };
-        if entry.phase == FileTransferPhase::Completed {
-            return FileTransferReply::error(
-                FileTransferErrorCode::Conflict,
-                "completed file transfer cannot be cancelled",
-            );
+        if let Some(entry) = store.puts.get(&transfer_id) {
+            if entry.phase == FileTransferPhase::Completed {
+                return FileTransferReply::error(
+                    FileTransferErrorCode::Conflict,
+                    "completed file transfer cannot be cancelled",
+                );
+            }
+            store.puts.remove(&transfer_id);
+            return FileTransferReply::Cancelled { transfer_id };
         }
-        store.entries.remove(&transfer_id);
-        FileTransferReply::Cancelled { transfer_id }
+        if store.gets.remove(&transfer_id).is_some() {
+            return FileTransferReply::Cancelled { transfer_id };
+        }
+        transfer_not_found()
     }
 }
 
 fn prune_completed(store: &mut HostFileTransferStore) {
-    while store.entries.len() >= HARD_MAX_HOST_FILE_TRANSFERS {
+    while store.puts.len().saturating_add(store.gets.len()) >= HARD_MAX_HOST_FILE_TRANSFERS {
         let candidate = store
-            .entries
+            .puts
             .iter()
             .filter_map(|(transfer_id, entry)| {
                 (entry.phase == FileTransferPhase::Completed)
@@ -406,8 +612,73 @@ fn prune_completed(store: &mut HostFileTransferStore) {
         let Some(transfer_id) = candidate else {
             break;
         };
-        store.entries.remove(&transfer_id);
+        store.puts.remove(&transfer_id);
     }
+}
+
+fn prepare_get_source(
+    policy: &ReadPolicy,
+    requested_device_path: &str,
+) -> Result<(String, File, u64, String), FileTransferReply> {
+    let requested = PathBuf::from(requested_device_path);
+    if !requested.is_absolute() {
+        return Err(transfer_denied("device source must be absolute"));
+    }
+    let metadata = fs::symlink_metadata(&requested).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FileTransferReply::error(
+                FileTransferErrorCode::NotFound,
+                "device source was not found",
+            )
+        } else {
+            transfer_io("device source metadata failed")
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(transfer_denied("device source cannot be a symlink"));
+    }
+    if !metadata.is_file() {
+        return Err(FileTransferReply::error(
+            FileTransferErrorCode::Conflict,
+            "device source is not a regular file",
+        ));
+    }
+    let canonical = fs::canonicalize(&requested)
+        .map_err(|_| transfer_io("device source canonicalization failed"))?;
+    ensure_allowed_file(policy, &canonical)?;
+    let mut file = File::open(&canonical).map_err(|_| transfer_io("device source open failed"))?;
+    let mut hasher = Sha256::new();
+    let mut total_size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| transfer_io("device source hashing read failed"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total_size = total_size
+            .checked_add(read as u64)
+            .ok_or_else(|| transfer_io("device source size overflow"))?;
+    }
+    let path = canonical
+        .to_str()
+        .ok_or_else(|| transfer_io("device source path is not valid UTF-8"))?
+        .to_owned();
+    Ok((path, file, total_size, digest_hex(hasher.finalize())))
+}
+
+fn ensure_allowed_file(policy: &ReadPolicy, path: &Path) -> Result<(), FileTransferReply> {
+    for root in &policy.roots {
+        let Ok(root) = fs::canonicalize(root) else {
+            continue;
+        };
+        if path.starts_with(root) {
+            return Ok(());
+        }
+    }
+    Err(transfer_denied("device source is outside signed roots"))
 }
 
 fn prepare_put_target(
@@ -685,6 +956,8 @@ mod tests {
             controller_id,
             site_id,
             device_id,
+            true,
+            true,
         )
         .unwrap();
         let bytes = vec![0x5a; 5_000];
@@ -704,6 +977,7 @@ mod tests {
                     manifest: put_manifest.clone(),
                 },
                 true,
+                true,
             )
             .await
         else {
@@ -720,6 +994,7 @@ mod tests {
                     chunk: first.clone(),
                 },
                 true,
+                true,
             )
             .await
         else {
@@ -728,18 +1003,18 @@ mod tests {
         assert_eq!(after_first.descriptor.confirmed_offset, 4096);
         assert_eq!(after_first.phase, FileTransferPhase::Receiving);
         let replay = service
-            .execute(FileTransferRequest::PutChunk { chunk: first }, true)
+            .execute(FileTransferRequest::PutChunk { chunk: first }, true, true)
             .await;
         assert_eq!(replay, FileTransferReply::Status(after_first.clone()));
 
         let status = service
-            .execute(FileTransferRequest::Status { transfer_id }, true)
+            .execute(FileTransferRequest::Status { transfer_id }, true, true)
             .await;
         assert_eq!(status, FileTransferReply::Status(after_first));
 
         let last = FileTransferChunk::from_bytes(transfer_id, 4096, &bytes[4096..]).unwrap();
         let FileTransferReply::Status(ready) = service
-            .execute(FileTransferRequest::PutChunk { chunk: last }, true)
+            .execute(FileTransferRequest::PutChunk { chunk: last }, true, true)
             .await
         else {
             panic!("expected ready-to-finalize status");
@@ -753,7 +1028,7 @@ mod tests {
         assert!(!root.join("target.bin").exists());
 
         let FileTransferReply::Status(completed) = service
-            .execute(FileTransferRequest::Finalize { transfer_id }, true)
+            .execute(FileTransferRequest::Finalize { transfer_id }, true, true)
             .await
         else {
             panic!("expected completed transfer status");
@@ -762,7 +1037,7 @@ mod tests {
         assert_eq!(fs::read(root.join("target.bin")).unwrap(), bytes);
         assert_eq!(
             service
-                .execute(FileTransferRequest::Finalize { transfer_id }, true)
+                .execute(FileTransferRequest::Finalize { transfer_id }, true, true)
                 .await,
             FileTransferReply::Status(completed)
         );
@@ -783,6 +1058,7 @@ mod tests {
                     manifest: cancel_manifest,
                 },
                 true,
+                true,
             )
             .await;
         assert_eq!(
@@ -791,6 +1067,7 @@ mod tests {
                     FileTransferRequest::Cancel {
                         transfer_id: cancel_id,
                     },
+                    true,
                     true,
                 )
                 .await,
@@ -805,6 +1082,151 @@ mod tests {
                         transfer_id: cancel_id,
                     },
                     true,
+                    true,
+                )
+                .await,
+            FileTransferReply::Error(error) if error.code == FileTransferErrorCode::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn readonly_get_is_root_bounded_replayable_and_never_grants_put() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("shared");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let bytes = vec![0x7b; 5_000];
+        fs::write(&source, &bytes).unwrap();
+        let outside = temp.path().join("outside.bin");
+        fs::write(&outside, b"private").unwrap();
+        let controller_id = ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let service = HostFileTransferService::new(
+            ReadPolicy::new(vec![root.to_string_lossy().into_owned()], 4096, 5_000).unwrap(),
+            controller_id,
+            site_id,
+            device_id,
+            true,
+            false,
+        )
+        .unwrap();
+        let transfer_id = TransferId::new();
+        let begin_request = FileTransferRequest::GetBegin {
+            transfer_id,
+            device_path: source.to_string_lossy().into_owned(),
+            chunk_size: 4096,
+        };
+        let FileTransferReply::Manifest(source_manifest) =
+            service.execute(begin_request.clone(), true, false).await
+        else {
+            panic!("expected device source manifest");
+        };
+        assert_eq!(source_manifest.transfer_id, transfer_id);
+        assert_eq!(
+            source_manifest.direction,
+            FileTransferDirection::DeviceToController
+        );
+        assert_eq!(source_manifest.total_size, bytes.len() as u64);
+        assert_eq!(source_manifest.chunk_size, 4096);
+        assert_eq!(source_manifest.final_sha256, file_sha256_hex(&bytes));
+        assert_eq!(source_manifest.device_conflict_policy, None);
+        assert!(Path::new(&source_manifest.device_path).is_absolute());
+        assert_eq!(
+            service.execute(begin_request, true, false).await,
+            FileTransferReply::Manifest(source_manifest.clone())
+        );
+
+        let first_request = FileTransferRequest::GetChunk {
+            transfer_id,
+            offset: 0,
+        };
+        let FileTransferReply::Chunk(first) =
+            service.execute(first_request.clone(), true, false).await
+        else {
+            panic!("expected first device source chunk");
+        };
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.decode_bytes().unwrap(), bytes[..4096]);
+        assert_eq!(
+            service.execute(first_request, true, false).await,
+            FileTransferReply::Chunk(first)
+        );
+        let FileTransferReply::Chunk(last) = service
+            .execute(
+                FileTransferRequest::GetChunk {
+                    transfer_id,
+                    offset: 4096,
+                },
+                true,
+                false,
+            )
+            .await
+        else {
+            panic!("expected final device source chunk");
+        };
+        assert_eq!(last.decode_bytes().unwrap(), bytes[4096..]);
+
+        assert!(matches!(
+            service
+                .execute(
+                    FileTransferRequest::GetBegin {
+                        transfer_id: TransferId::new(),
+                        device_path: outside.to_string_lossy().into_owned(),
+                        chunk_size: 4096,
+                    },
+                    true,
+                    false,
+                )
+                .await,
+            FileTransferReply::Error(error) if error.code == FileTransferErrorCode::Denied
+        ));
+        assert!(matches!(
+            service
+                .execute(
+                    FileTransferRequest::GetBegin {
+                        transfer_id: TransferId::new(),
+                        device_path: source.to_string_lossy().into_owned(),
+                        chunk_size: 4096,
+                    },
+                    false,
+                    false,
+                )
+                .await,
+            FileTransferReply::Error(error) if error.code == FileTransferErrorCode::Denied
+        ));
+
+        let put = manifest(
+            &root,
+            controller_id,
+            site_id,
+            device_id,
+            TransferId::new(),
+            b"cannot write",
+            FileConflictPolicy::FailIfExists,
+        );
+        assert!(matches!(
+            service
+                .execute(FileTransferRequest::PutBegin { manifest: put }, true, false)
+                .await,
+            FileTransferReply::Error(error) if error.code == FileTransferErrorCode::Denied
+        ));
+
+        assert_eq!(
+            service
+                .execute(FileTransferRequest::Cancel { transfer_id }, true, false)
+                .await,
+            FileTransferReply::Cancelled { transfer_id }
+        );
+        assert!(matches!(
+            service
+                .execute(
+                    FileTransferRequest::GetChunk {
+                        transfer_id,
+                        offset: 0,
+                    },
+                    true,
+                    false,
                 )
                 .await,
             FileTransferReply::Error(error) if error.code == FileTransferErrorCode::NotFound
@@ -824,6 +1246,8 @@ mod tests {
             controller_id,
             site_id,
             device_id,
+            true,
+            true,
         )
         .unwrap();
         let transfer_id = TransferId::new();
@@ -842,6 +1266,7 @@ mod tests {
                     FileTransferRequest::PutBegin {
                         manifest: good.clone(),
                     },
+                    true,
                     false,
                 )
                 .await,
@@ -856,6 +1281,7 @@ mod tests {
                         manifest: wrong_scope,
                     },
                     true,
+                    true,
                 )
                 .await,
             FileTransferReply::Error(error) if error.code == FileTransferErrorCode::Denied
@@ -864,7 +1290,7 @@ mod tests {
         fs::write(root.join("target.bin"), b"existing").unwrap();
         assert!(matches!(
             service
-                .execute(FileTransferRequest::PutBegin { manifest: good }, true)
+                .execute(FileTransferRequest::PutBegin { manifest: good }, true, true)
                 .await,
             FileTransferReply::Error(error) if error.code == FileTransferErrorCode::Conflict
         ));

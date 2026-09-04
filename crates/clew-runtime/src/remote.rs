@@ -2048,10 +2048,11 @@ impl RemoteConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ControllerFileTransferManager, ControllerFileTransferPhase};
+    use crate::{ControllerFileTransferManager, ControllerFileTransferPhase, FileTransferInfo};
     use clew_transport::{
-        FileConflictPolicy, FileTransferPhase, FileTransferReply, FileTransferRequest,
-        FileTransferStatus, file_sha256_hex,
+        FileConflictPolicy, FileTransferChunk, FileTransferDirection, FileTransferManifest,
+        FileTransferPhase, FileTransferReply, FileTransferRequest, FileTransferStatus,
+        file_sha256_hex,
     };
 
     #[tokio::test]
@@ -2190,7 +2191,7 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let status = manager.status(info.transfer_id).unwrap();
-                if status.phase.terminal() {
+                if status.phase().terminal() {
                     break status;
                 }
                 tokio::task::yield_now().await;
@@ -2198,6 +2199,9 @@ mod tests {
         })
         .await
         .expect("Controller put task did not finish");
+        let FileTransferInfo::Put(status) = status else {
+            panic!("expected put projection");
+        };
         assert_eq!(status.phase, ControllerFileTransferPhase::Completed);
         assert_eq!(status.confirmed_offset, source.len() as u64);
         assert_eq!(
@@ -2205,6 +2209,187 @@ mod tests {
             Some("/device/target.bin")
         );
         assert!(status.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn controller_file_get_reproves_manifest_before_cross_generation_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("download.bin");
+        let source = vec![0x37_u8; 5_000];
+        let controller_id = clew_core::ControllerId::new();
+        let site_id = SiteId::new();
+        let device_id = DeviceId::new();
+        let hub = RemoteHub::default();
+        let (generation_one, mut commands_one) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Direct,
+                RemotePathState::Direct,
+                2_000,
+            )
+            .unwrap();
+        let manager = ControllerFileTransferManager::new(hub.clone(), controller_id);
+        let info = manager
+            .start_get(
+                device_id,
+                site_id,
+                "/device/source.bin".into(),
+                destination.to_string_lossy().into_owned(),
+                4096,
+                FileConflictPolicy::FailIfExists,
+            )
+            .unwrap();
+        let manifest = FileTransferManifest::new(
+            info.transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::DeviceToController,
+            "/device/source.bin",
+            source.len() as u64,
+            4096,
+            file_sha256_hex(&source),
+            None,
+        )
+        .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected GetBegin on generation one");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetBegin {
+                transfer_id: info.transfer_id,
+                device_path: "/device/source.bin".into(),
+                chunk_size: 4096,
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Manifest(manifest.clone())))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected first GetChunk");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetChunk {
+                transfer_id: info.transfer_id,
+                offset: 0,
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Chunk(
+                FileTransferChunk::from_bytes(info.transfer_id, 0, &source[..4096]).unwrap(),
+            )))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_one.recv().await.unwrap()
+        else {
+            panic!("expected second GetChunk on generation one");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetChunk {
+                transfer_id: info.transfer_id,
+                offset: 4096,
+            }
+        );
+        // The device could have read this chunk, but Controller never received it. Since GetChunk is
+        // read-only, reconnect must re-prove the source manifest and then request the same offset.
+        drop(reply);
+        hub.unregister(device_id, generation_one, Some(2_100));
+        let (_generation_two, mut commands_two) = hub
+            .register(
+                device_id,
+                RemoteSessionTopology::Connector,
+                RemotePathState::MixedOrUnknown,
+                2_200,
+            )
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } =
+            tokio::time::timeout(Duration::from_secs(2), commands_two.recv())
+                .await
+                .expect("Controller did not re-prove device source after reconnect")
+                .unwrap()
+        else {
+            panic!("expected GetBegin after reconnect");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetBegin {
+                transfer_id: info.transfer_id,
+                device_path: "/device/source.bin".into(),
+                chunk_size: 4096,
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Manifest(manifest.clone())))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_two.recv().await.unwrap()
+        else {
+            panic!("expected resumed second GetChunk");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::GetChunk {
+                transfer_id: info.transfer_id,
+                offset: 4096,
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Chunk(
+                FileTransferChunk::from_bytes(info.transfer_id, 4096, &source[4096..]).unwrap(),
+            )))
+            .unwrap();
+
+        let RemoteCommand::FileTransfer { request, reply, .. } = commands_two.recv().await.unwrap()
+        else {
+            panic!("expected source cleanup Cancel after local finalize");
+        };
+        assert_eq!(
+            request,
+            FileTransferRequest::Cancel {
+                transfer_id: info.transfer_id
+            }
+        );
+        reply
+            .send(Ok(FileTransferReply::Cancelled {
+                transfer_id: info.transfer_id,
+            }))
+            .unwrap();
+
+        let final_info = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = manager.status(info.transfer_id).unwrap();
+                if status.phase().terminal() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Controller get task did not finish");
+        let FileTransferInfo::Get(final_info) = final_info else {
+            panic!("expected get projection");
+        };
+        assert_eq!(final_info.phase, ControllerFileTransferPhase::Completed);
+        assert_eq!(final_info.confirmed_offset, source.len() as u64);
+        assert_eq!(
+            final_info.final_sha256.as_deref(),
+            Some(manifest.final_sha256.as_str())
+        );
+        let canonical_destination = std::fs::canonicalize(&destination).unwrap();
+        assert_eq!(
+            final_info.final_controller_path.as_deref(),
+            Some(canonical_destination.to_string_lossy().as_ref())
+        );
+        assert!(final_info.error.is_none());
+        assert_eq!(std::fs::read(&destination).unwrap(), source);
     }
 
     #[tokio::test]

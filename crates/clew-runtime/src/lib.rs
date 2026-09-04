@@ -36,10 +36,10 @@ pub use local_api::{
     MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
     OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
     OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteFilePutRequest,
-    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
-    RemoteWriteRequest, Socks5AddRequest, Socks5List,
+    OutfitUpdateRequest, RecoveryStatus, RemoteEditRequest, RemoteFileGetRequest,
+    RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
+    RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest,
+    RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest, Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
@@ -59,5 +59,6 @@ pub use socks5::{
 };
 pub use transfer::{
     ControllerFileTransferError, ControllerFileTransferManager, ControllerFileTransferPhase,
-    FilePutInfo, HARD_MAX_CONTROLLER_FILE_TRANSFERS, MAX_CONTROLLER_FILE_SOURCE_PATH_BYTES,
+    FileGetInfo, FilePutInfo, FileTransferInfo, HARD_MAX_CONTROLLER_FILE_TRANSFERS,
+    MAX_CONTROLLER_FILE_DESTINATION_PATH_BYTES, MAX_CONTROLLER_FILE_SOURCE_PATH_BYTES,
 };
