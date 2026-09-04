@@ -44,11 +44,30 @@ Clew deliberately has no `--pfx-password`, `--apple-password`, or equivalent opt
 - `product = "clew"` and `app_id = "io.clew.app"`;
 - `dirty = false`;
 - `unsigned = true` and no existing `signing` record;
-- platform-native V6b-2 layout;
+- the exact frozen V6b-2 platform layout: no extra payload files;
 - bounded, unique, safe relative payload paths;
+- executable entrypoints/CLI mode `0755` and all other payload files mode `0644`;
 - the ZIP filename, size, SHA-256, embedded manifest, and every payload SHA-256 match the sidecar.
 
 Windows artifacts must be signed on Windows; macOS artifacts must be signed on macOS. Linux release signing is not defined by V6b-3 and is rejected rather than silently inventing a policy.
+
+## 2.1 Independent verification
+
+Signing and verification are deliberately separate commands. A release reviewer does not need access to the signing private key:
+
+```text
+cargo xtask verify-package \
+  --manifest <artifact.release.json>
+```
+
+For unsigned schema-2 artifacts, `verify-package` re-checks the sidecar/archive relationship, exact frozen platform file set and modes, embedded manifest, every payload hash, and — when the artifact target is the current native target — executes the extracted CLI with `--version` and `--help`.
+
+For signed schema-3 artifacts, verification additionally requires the artifact's native operating-system family:
+
+- Windows: the same exact/hash checks plus `signtool verify /pa /all /v` on the executable extracted from the final signed ZIP. SignTool is discovered automatically or may be selected with `--signtool <path>`;
+- macOS: final ZIP extraction with `ditto`, exact post-signing file/hash checks, nested CLI and app `codesign --verify --strict`, `stapler validate`, and `spctl --assess`.
+
+`verify-package` accepts no certificate selector, Developer ID identity, Keychain profile, or signing secret. A schema-3 manifest claim is not sufficient by itself: native signature/ticket verification must also succeed.
 
 ## 3. Windows Authenticode
 

@@ -66,6 +66,15 @@ enum Task {
         #[command(subcommand)]
         signer: Signer,
     },
+    /// Independently verify an unsigned or signed Clew release artifact.
+    VerifyPackage {
+        /// Sidecar .release.json belonging to the artifact being verified.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Optional explicit signtool.exe path for signed Windows verification.
+        #[arg(long)]
+        signtool: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -207,6 +216,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             out_dir,
             signer,
         } => sign_package(&repo, &manifest, &out_dir, signer)?,
+        Task::VerifyPackage { manifest, signtool } => {
+            verify_package(&repo, &manifest, signtool.as_deref())?
+        }
     }
     Ok(())
 }
@@ -331,6 +343,86 @@ fn package(
     println!("sha256={archive_sha256}");
     println!("manifest={}", sidecar_path.display());
     println!("unsigned=true");
+    Ok(())
+}
+
+fn verify_package(
+    repo: &Path,
+    manifest: &Path,
+    signtool: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let manifest_path = if manifest.is_absolute() {
+        manifest.to_path_buf()
+    } else {
+        repo.join(manifest)
+    };
+    let artifact_manifest = read_artifact_manifest(&manifest_path)?;
+    validate_release_filename(&artifact_manifest.artifact.file)?;
+    let payload = &artifact_manifest.payload;
+    let signed = match (
+        payload.schema_version,
+        payload.unsigned,
+        payload.signing.is_some(),
+    ) {
+        (RELEASE_SCHEMA_VERSION, true, false) => false,
+        (SIGNED_RELEASE_SCHEMA_VERSION, false, true) => true,
+        _ => return Err("release sidecar has an unsupported signing/schema state".into()),
+    };
+    let platform = if signed {
+        validate_signed_artifact(&artifact_manifest)?
+    } else {
+        validate_unsigned_artifact(&artifact_manifest)?
+    };
+    let stem = if signed {
+        format!("clew-v{}-{}-signed", payload.version, payload.target)
+    } else {
+        format!("clew-v{}-{}", payload.version, payload.target)
+    };
+    let expected_archive = format!("{stem}.zip");
+    if artifact_manifest.artifact.file != expected_archive {
+        return Err("release archive filename does not match manifest state/version/target".into());
+    }
+    let archive_path = manifest_path
+        .parent()
+        .ok_or("release manifest has no parent directory")?
+        .join(&artifact_manifest.artifact.file);
+    if fs::metadata(&archive_path)?.len() != artifact_manifest.artifact.size
+        || sha256_file(&archive_path)? != artifact_manifest.artifact.sha256
+    {
+        return Err("release archive size/hash differs from release sidecar".into());
+    }
+    let host = rustc_info(repo)?.host;
+    if !signed {
+        if signtool.is_some() {
+            return Err("--signtool is only valid when verifying a signed Windows artifact".into());
+        }
+        smoke_archive(&archive_path, &stem, payload, payload.target == host)?;
+    } else {
+        if release_platform(&host)? != platform {
+            return Err("signed artifacts require native operating-system verification".into());
+        }
+        match platform {
+            ReleasePlatform::Windows => {
+                smoke_archive(&archive_path, &stem, payload, payload.target == host)?;
+                let tool = resolve_windows_signtool(signtool)?;
+                verify_windows_archive_signature(&tool, &archive_path, &stem, payload)?;
+            }
+            ReleasePlatform::Macos => {
+                if signtool.is_some() {
+                    return Err("--signtool is only valid for signed Windows verification".into());
+                }
+                smoke_macos_signed_archive(&archive_path, &stem, payload, payload.target == host)?;
+            }
+            ReleasePlatform::Linux => {
+                return Err("Linux signed release verification is not defined in V6b-3".into());
+            }
+        }
+    }
+    println!("verified=true");
+    println!("artifact={}", archive_path.display());
+    println!("sha256={}", artifact_manifest.artifact.sha256);
+    println!("schema_version={}", payload.schema_version);
+    println!("unsigned={}", payload.unsigned);
     Ok(())
 }
 
@@ -523,7 +615,9 @@ fn validate_release_filename(name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn validate_signable_artifact(manifest: &ArtifactManifest) -> Result<(), Box<dyn Error>> {
+fn validate_unsigned_artifact(
+    manifest: &ArtifactManifest,
+) -> Result<ReleasePlatform, Box<dyn Error>> {
     let payload = &manifest.payload;
     if payload.schema_version != RELEASE_SCHEMA_VERSION
         || payload.product != PRODUCT
@@ -534,9 +628,78 @@ fn validate_signable_artifact(manifest: &ArtifactManifest) -> Result<(), Box<dyn
     {
         return Err("release sidecar is not an unsigned Clew schema-2 artifact".into());
     }
-    if payload.dirty {
+    let platform = validate_payload_layout(payload)?;
+    validate_payload_shape(payload, platform, false)?;
+    Ok(platform)
+}
+
+fn validate_signable_artifact(manifest: &ArtifactManifest) -> Result<(), Box<dyn Error>> {
+    let platform = validate_unsigned_artifact(manifest)?;
+    if manifest.payload.dirty {
         return Err("dirty artifacts are never accepted by the release signing pipeline".into());
     }
+    if platform == ReleasePlatform::Linux {
+        return Err("Linux release signing is not defined in V6b-3".into());
+    }
+    Ok(())
+}
+
+fn validate_signed_artifact(
+    manifest: &ArtifactManifest,
+) -> Result<ReleasePlatform, Box<dyn Error>> {
+    let payload = &manifest.payload;
+    if payload.schema_version != SIGNED_RELEASE_SCHEMA_VERSION
+        || payload.product != PRODUCT
+        || payload.app_id != APP_ID
+        || payload.archive_format != "zip"
+        || payload.dirty
+        || payload.unsigned
+    {
+        return Err("release sidecar is not a clean signed Clew schema-3 artifact".into());
+    }
+    let signing = payload
+        .signing
+        .as_ref()
+        .ok_or("signed release sidecar omitted signing metadata")?;
+    let platform = validate_payload_layout(payload)?;
+    validate_payload_shape(payload, platform, true)?;
+    match platform {
+        ReleasePlatform::Windows => {
+            if signing.mechanism != "windows-authenticode"
+                || !signing.timestamped
+                || signing.notarized
+                || signing.stapled
+                || signing.notary_submission_id.is_some()
+                || normalize_certificate_sha1(&signing.identity)? != signing.identity
+            {
+                return Err("Windows signed release metadata is inconsistent".into());
+            }
+        }
+        ReleasePlatform::Macos => {
+            let submission_id = signing
+                .notary_submission_id
+                .as_deref()
+                .ok_or("notarized macOS release omitted submission id")?;
+            validate_signing_label(&signing.identity, "Developer ID identity")?;
+            validate_signing_label(submission_id, "notary submission id")?;
+            if signing.mechanism != "macos-developer-id-notarized"
+                || !signing.timestamped
+                || !signing.notarized
+                || !signing.stapled
+            {
+                return Err("macOS signed release metadata is inconsistent".into());
+            }
+        }
+        ReleasePlatform::Linux => {
+            return Err("Linux signed release verification is not defined in V6b-3".into());
+        }
+    }
+    Ok(platform)
+}
+
+fn validate_payload_layout(payload: &PayloadManifest) -> Result<ReleasePlatform, Box<dyn Error>> {
+    validate_target(&payload.target)?;
+    validate_profile(&payload.profile)?;
     let platform = release_platform(&payload.target)?;
     match platform {
         ReleasePlatform::Windows
@@ -547,12 +710,30 @@ fn validate_signable_artifact(manifest: &ArtifactManifest) -> Result<(), Box<dyn
             if payload.layout == "macos-app"
                 && payload.entrypoint == "Clew.app/Contents/MacOS/Clew"
                 && payload.cli_binary == "Clew.app/Contents/Resources/clew" => {}
-        ReleasePlatform::Linux => {
-            return Err("Linux release signing is not defined in V6b-3".into());
-        }
+        ReleasePlatform::Linux
+            if payload.layout == "linux-portable"
+                && payload.entrypoint == "bin/clew"
+                && payload.cli_binary == "bin/clew" => {}
         _ => return Err("release sidecar layout does not match its target platform".into()),
     }
-    if payload.files.is_empty() || payload.files.len() > MAX_SIGNED_PAYLOAD_FILES {
+    Ok(platform)
+}
+
+fn validate_payload_shape(
+    payload: &PayloadManifest,
+    platform: ReleasePlatform,
+    signed: bool,
+) -> Result<(), Box<dyn Error>> {
+    let expected_paths = expected_payload_paths(platform, signed)?;
+    let actual_paths = payload
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if actual_paths != expected_paths {
+        return Err("release payload file set does not match the frozen platform layout".into());
+    }
+    if payload.files.len() > MAX_SIGNED_PAYLOAD_FILES {
         return Err("release payload file count is outside signing bounds".into());
     }
     let mut total = 0_u64;
@@ -572,9 +753,54 @@ fn validate_signable_artifact(manifest: &ArtifactManifest) -> Result<(), Box<dyn
         if total > MAX_SIGNED_PAYLOAD_BYTES {
             return Err("release payload exceeds signing total size bound".into());
         }
-        let _ = u32::from_str_radix(&file.mode, 8)?;
+        let expected_mode = if file.path == payload.entrypoint || file.path == payload.cli_binary {
+            "0755"
+        } else {
+            "0644"
+        };
+        if file.mode != expected_mode {
+            return Err(format!(
+                "release payload mode differs for {}: {} != {expected_mode}",
+                file.path, file.mode
+            )
+            .into());
+        }
     }
     Ok(())
+}
+
+fn expected_payload_paths(
+    platform: ReleasePlatform,
+    signed: bool,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let paths: &[&str] = match (platform, signed) {
+        (ReleasePlatform::Windows, false | true) => &["README.md", "clew.exe"],
+        (ReleasePlatform::Macos, false) => &[
+            "Clew.app/Contents/Info.plist",
+            "Clew.app/Contents/MacOS/Clew",
+            "Clew.app/Contents/Resources/AppIcon.icns",
+            "Clew.app/Contents/Resources/clew",
+            "README.md",
+        ],
+        (ReleasePlatform::Macos, true) => &[
+            "Clew.app/Contents/Info.plist",
+            "Clew.app/Contents/MacOS/Clew",
+            "Clew.app/Contents/Resources/AppIcon.icns",
+            "Clew.app/Contents/Resources/clew",
+            MACOS_CODE_RESOURCES,
+            "README.md",
+        ],
+        (ReleasePlatform::Linux, false) => &[
+            "README.md",
+            "bin/clew",
+            "share/applications/io.clew.app.desktop",
+            "share/icons/hicolor/scalable/apps/clew.svg",
+        ],
+        (ReleasePlatform::Linux, true) => {
+            return Err("Linux signed release layout is not defined in V6b-3".into());
+        }
+    };
+    Ok(paths.iter().map(|path| (*path).to_owned()).collect())
 }
 
 fn materialize_payload(
@@ -1717,6 +1943,82 @@ mod tests {
 
         let linux = sample_artifact(sample_payload(ReleasePlatform::Linux));
         assert!(validate_signable_artifact(&linux).is_err());
+    }
+
+    #[test]
+    fn release_payload_shape_rejects_extra_files_and_wrong_modes() {
+        let windows = sample_artifact(sample_payload(ReleasePlatform::Windows));
+        assert!(validate_unsigned_artifact(&windows).is_ok());
+
+        let mut extra = windows.clone();
+        extra.payload.files.push(PayloadFile {
+            path: "evil.dll".into(),
+            size: 4,
+            sha256: sha256_bytes(b"evil"),
+            mode: "0644".into(),
+        });
+        assert!(validate_unsigned_artifact(&extra).is_err());
+
+        let mut wrong_mode = windows;
+        wrong_mode
+            .payload
+            .files
+            .iter_mut()
+            .find(|file| file.path == "clew.exe")
+            .unwrap()
+            .mode = "0644".into();
+        assert!(validate_unsigned_artifact(&wrong_mode).is_err());
+    }
+
+    #[test]
+    fn signed_release_metadata_and_macos_code_resources_are_strict() {
+        let mut windows = sample_artifact(sample_payload(ReleasePlatform::Windows));
+        windows.payload.schema_version = SIGNED_RELEASE_SCHEMA_VERSION;
+        windows.payload.unsigned = false;
+        windows.payload.signing = Some(SigningInfo {
+            mechanism: "windows-authenticode".into(),
+            identity: "A".repeat(40),
+            timestamped: true,
+            notarized: false,
+            stapled: false,
+            notary_submission_id: None,
+        });
+        assert_eq!(
+            validate_signed_artifact(&windows).unwrap(),
+            ReleasePlatform::Windows
+        );
+        windows.payload.signing.as_mut().unwrap().timestamped = false;
+        assert!(validate_signed_artifact(&windows).is_err());
+
+        let mut macos = sample_artifact(sample_payload(ReleasePlatform::Macos));
+        macos.payload.schema_version = SIGNED_RELEASE_SCHEMA_VERSION;
+        macos.payload.unsigned = false;
+        macos.payload.files.insert(
+            4,
+            PayloadFile {
+                path: MACOS_CODE_RESOURCES.into(),
+                size: 6,
+                sha256: sha256_bytes(b"sealed"),
+                mode: "0644".into(),
+            },
+        );
+        macos.payload.signing = Some(SigningInfo {
+            mechanism: "macos-developer-id-notarized".into(),
+            identity: "Developer ID Application: Example (TEAMID)".into(),
+            timestamped: true,
+            notarized: true,
+            stapled: true,
+            notary_submission_id: Some("00000000-0000-0000-0000-000000000000".into()),
+        });
+        assert_eq!(
+            validate_signed_artifact(&macos).unwrap(),
+            ReleasePlatform::Macos
+        );
+        macos
+            .payload
+            .files
+            .retain(|file| file.path != MACOS_CODE_RESOURCES);
+        assert!(validate_signed_artifact(&macos).is_err());
     }
 
     #[test]

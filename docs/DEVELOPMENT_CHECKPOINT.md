@@ -1364,18 +1364,30 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - 正式实现commit `c407c05e1fca35ba6f043d73475c2cbd16a28daf` 的三平台clean provenance已补齐：Windows fresh build后再`--no-build`重包，两次ZIP SHA-256均为 **`fa11c96d23fae701ae3d58726f063bc2b265ad57ad4b125faa92d832b692a6d9`**；macOS从clean checkout正常build/package连续两次均为 **`f0c1a5ee6fd4bbdfd27bd272b27fcea60a84057d8b792f21c399db6cd083bc88`**；Linux正常build与`--no-build`重包均为 **`41f70b830d11d6f98dfde2b97db67f4d0daeddefd439d9d779fdc0a436c61341`**。三份sidecar均精确为`dirty=false / unsigned=true / source_commit=c407c05e1fca...`；macOS先前复用dirty launcher的no-build ZIP不作为clean reproducibility证据；
 - final local gates：xtask **6/6 PASS**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets --locked` PASS / 0 warnings；`cargo test --workspace --all-targets --locked` **245 passed / 0 failed / 6 ignored**；`git diff --check` PASS。下一块只进入显式签名/notarization管线，不把当前unsigned artifact伪称为已签名。
 
-#### V6b-3 — Windows signing + macOS signing/notarization baseline
+#### V6b-3 — Windows signing + macOS signing/notarization
 
-**Status：IN PROGRESS — pipeline baseline implemented；real-credential acceptance pending**
+**Status：IN PROGRESS（V6b-3a baseline DONE；V6b-3b real-credential acceptance BLOCKED/NEXT）**
 
-- 新增显式第二阶段`cargo xtask sign-package`；默认`cargo xtask package`完全保留schema-2 unsigned语义且`signing=None`不序列化。signer只接受已经验证的`dirty=false / unsigned=true / schema=2` sidecar+ZIP，重新核对archive filename/size/SHA、embedded manifest、逐文件path/size/hash/mode后才解到private temp；只签temp副本，绝不改`target/<triple>/<profile>` build-tree binary或输入unsigned ZIP；失败前不会创建signed release文件；
-- signed release升级为schema **3**：`unsigned=false`并新增公开`signing { mechanism, identity, timestamped, notarized, stapled, notary_submission_id? }`；签名后重新枚举并hash最终payload，Windows不允许任何新增文件，当前macOS bundle只允许codesign新增`Clew.app/Contents/_CodeSignature/CodeResources`，其它普通文件、symlink、路径/数量/size越界全部fail closed。signed artifact因secure timestamp/notary ticket不再要求字节reproducible，改由最终archive SHA + post-signing逐文件hash + OS native verify共同证明；
-- Windows Authenticode不接受PFX/password参数，只接受OS certificate store中的公开40-hex SHA-1 thumbprint、RFC3161 URL、可选SignTool路径和显式machine-store选择；SignTool按显式路径→PATH→Windows Kits 10最新版架构目录发现，sign固定`/fd SHA256 /tr <url> /td SHA256`，随后`verify /pa /all /v`，最终ZIP再解包验签；
-- cap00 native无凭据gate：Windows Kits SignTool已被xtask自动发现；标准RFC3161地址被接受后，真实SignTool明确返回`No certificates were found that met all the given criteria.`。失败前后clean unsigned ZIP SHA仍=`fa11c96d...a6d9`，build-tree `clew.exe` SHA仍=`ced0ce2f...49487`，signed output files=`0`；当前`CurrentUser\\My`带private key的CodeSigningCert数量为0，因此不伪造成功签名；
-- macOS路径已实现inside-out Developer ID：先签/验`Contents/Resources/clew`，再以`--timestamp --options runtime`签/验`.app`，用`notarytool submit --keychain-profile ... --wait --output-format json`要求`Accepted`并记录submission id，随后`stapler staple/validate + spctl --assess`；最终用`ditto`封装stapled app并解包重复验签。CLI只接收公开Developer ID identity和Keychain profile名称，Apple credential/private key不进入参数/manifest/repo；`macos-3dv0`当前工具齐全但`security find-identity -p codesigning`为**0 valid identities**，native compile/no-identity fail-closed与真实Developer ID acceptance继续作为本块剩余gate；
-- 新增`docs/RELEASE_SIGNING.md`冻结操作/secret/CI边界；xtask focused从6增至**10/10 PASS**，覆盖schema2兼容、schema3 roundtrip、dirty/already-signed/Linux拒绝、签名输入bounds与macOS新增文件白名单。当前`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets --locked` PASS / 0 warnings；`cargo test --workspace --all-targets --locked` **249 passed / 0 failed / 6 ignored**。
+##### V6b-3a — Secret-free signing + independent verification baseline
 
-本块剩余 acceptance 只允许使用正式Windows code-signing certificate与正式Apple Developer ID/notary profile；无凭据环境继续稳定产出unsigned artifact，绝不以ad-hoc/self-signed结果冒充发布签名。ClientFlavor/Distribution Studio成品签名与cache仍后置。
+**Status：DONE（2026-09-04）**
+
+- 新增显式第二阶段`cargo xtask sign-package`；默认`cargo xtask package`完全保留schema-2 unsigned语义且`signing=None`不序列化。signer只接受`dirty=false / unsigned=true / schema=2` sidecar+ZIP，重新核对archive filename/size/SHA、embedded manifest与payload后才解到private temp；只签temp副本，绝不改build-tree binary或输入unsigned ZIP，失败前不会发布partial signed artifact；
+- signer/verifier共用**冻结layout exact-shape gate**，不再只验证“manifest自洽”：Windows unsigned/signed只能`README.md + clew.exe`；macOS unsigned只能V6b-2固定5文件，signed只额外允许`Clew.app/Contents/_CodeSignature/CodeResources`；Linux unsigned固定`README + bin + desktop + SVG`。任何额外/缺失文件、symlink、非canonical path、数量/size越界、binary非`0755`或resource非`0644`均fail closed，避免为异常但自洽的payload背书；
+- signed release升级schema **3**：`unsigned=false`并记录公开`signing { mechanism, identity, timestamped, notarized, stapled, notary_submission_id? }`；签名后重新枚举/hash最终payload。signed artifact因secure timestamp/notary ticket不要求字节reproducible，改由最终archive SHA + post-signing逐文件hash + native signature verification共同证明；
+- Windows Authenticode不接受PFX/password参数，只接受OS certificate store公开SHA-1 thumbprint、RFC3161 URL、可选SignTool路径和显式machine-store；SignTool发现顺序为显式路径→PATH→Windows Kits 10，sign固定`/fd SHA256 /tr <url> /td SHA256`，随后`verify /pa /all /v`并对final ZIP解包后再验签；
+- macOS实现inside-out Developer ID：先签/验`Contents/Resources/clew`，再以secure timestamp + Hardened Runtime签/验`.app`，`notarytool submit --keychain-profile ... --wait --output-format json`必须`Accepted`，随后`stapler staple/validate + spctl --assess`；最终用`ditto`封装stapled app并解包重复验签。CLI只接收公开Developer ID identity和Keychain profile名称，Apple credential/private key不进入参数/manifest/repo；
+- 新增完全独立、无签名身份参数的`cargo xtask verify-package --manifest ...`：schema-2重新做sidecar/archive/exact-shape/embedded manifest/逐文件hash与native CLI smoke；schema-3在同OS上进一步执行Windows SignTool verify或macOS codesign + stapler + spctl。cap00对真实clean unsigned artifact独立verify通过：schema=2、unsigned=true、ZIP SHA=`29697683...4268b`；
+- 默认unsigned non-regression：实现commit`0a257fd`上正常package仍为`schema=2 / unsigned=true / dirty=false`且JSON**完全无`signing`字段**，Windows clean ZIP SHA=`296976832ce2961c0a95548932d6a1a35526872409bf49688da5d41a9564268b`；同binary `--no-build`重包SHA完全一致；
+- cap00无凭据gate：Windows Kits SignTool被自动发现，标准RFC3161地址被接受后真实SignTool明确返回`No certificates were found that met all the given criteria.`；失败前后unsigned ZIP/build-tree exe hash不变且signed output files=0。收紧exact-shape后重复gate仍穿过preflight到达同一SignTool证书失败，证明合法artifact未被误挡；
+- `macos-3dv0`对exact commit `0a257fd` native `cargo check -p xtask --all-targets --locked` PASS、focused **10/10 PASS**；当前`security find-identity -p codesigning`为0 valid identities，`sign-package macos`对不存在Developer ID真实进入codesign并明确报`The specified item could not be found in the keychain.`，失败前后clean unsigned ZIP=`f0c1a5ee...3bc88`、release CLI=`74dc4b08...57101`均不变，signed output files=0；
+- 新增`docs/RELEASE_SIGNING.md`冻结secret/CI/签名/独立验签边界；最终本地focused **12/12 PASS**，`cargo fmt -- --check` PASS，`cargo check --workspace --all-targets --locked` PASS / 0 warnings，`cargo test --workspace --all-targets --locked` **251 passed / 0 failed / 6 ignored**。
+
+##### V6b-3b — Real credential acceptance
+
+**Status：BLOCKED / NEXT（外部凭据缺失，不是代码失败）**
+
+完成条件只能用正式凭据证明：Windows以正式code-signing certificate产出schema-3 signed ZIP并通过final-archive SignTool verify；macOS以正式Developer ID Application + notary profile完成secure timestamp、Apple notarization Accepted、staple与最终ZIP解包Gatekeeper验证。当前cap00无带private-key CodeSigningCert，macos-3dv0无Developer ID identity，因此明确不以ad-hoc/self-signed结果冒充发布签名。ClientFlavor/Distribution Studio成品签名与cache继续后置到这项真实acceptance之后。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1434,11 +1446,11 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V6b-3 — Release Signing（IN PROGRESS；pipeline baseline implemented，real-credential acceptance pending）**
+**Current block：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Next gate：macOS native compile/no-identity fail-closed → real Windows Authenticode + macOS Developer ID/notarization acceptance**
+**Next gate：正式Windows Authenticode artifact + 正式macOS Developer ID/notarized artifact**
 
-V6a/V6b-2的unsigned artifact继续作为可复现基线；V6b-3已把签名变成独立、显式、secret-free CLI surface，并建立signed schema 3与post-signing/native verification边界。cap00已证明无证书时SignTool fail closed且不污染任何unsigned/build-tree bytes；下一步先把同一实现commit投到macos-3dv0做native compile和0-identity对称gate，之后本块唯一不可伪造的完成条件就是正式Windows证书与正式Apple Developer ID/notary profile的真实acceptance。
+V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed与unsigned non-regression均已收口；现在没有未解决的签名代码/测试 blocker。V6b-3b唯一剩余条件是当前环境不存在的正式Windows private-key certificate与Apple Developer ID/notary profile。没有这些凭据时继续改签名逻辑只会制造无法验证的复杂度，因此不伪造acceptance；Distribution Studio signed-output/cache保持后置。
 
 ### Change log
 
