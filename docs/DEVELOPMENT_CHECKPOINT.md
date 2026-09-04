@@ -2,7 +2,7 @@
 
 状态：**正式开发 / V2 Agent Minimum IN PROGRESS**
 架构基线：**Architecture v1.5**
-更新时间：**2026-09-03**
+更新时间：**2026-09-04**
 
 本文是 Clew 开始实现后的**唯一开发进度台账**。`00`–`06` 文档定义产品、架构和已经裁定的边界；本文负责回答四个问题：**现在做到哪一块、这一块怎样算完成、验证过什么、下一块是什么。**
 
@@ -61,7 +61,7 @@
 | V3 | Reliability | DONE | reconnect/replay/Shell reattach/sleep-resume/compatibility 已闭合 |
 | V4 | Dynamic networking | DONE | Controller-owned TCP forward / SOCKS5 CONNECT / HTTP CONNECT + non-migration |
 | V5 | File plane | IN PROGRESS | single-file put + cross-generation resume DONE；继续 get / durable restart / directory |
-| V6 | Release packaging | TODO | Windows signing、macOS signing/notarization、Linux artifact、ClientFlavor pipeline |
+| V6 | Release packaging | IN PROGRESS | reproducible unsigned baseline DONE；继续 native metadata/branding、signing/notarization、ClientFlavor pipeline |
 | V7 | Advanced Service Runtime | TODO | systemd --user → Windows Service/Linux system service，显式 opt-in |
 | V8+ | Deferred expansion | TODO | 仅按真实需求评估 Directory、dedicated relay、第二 transport 等 |
 
@@ -1320,18 +1320,28 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ## 13. V6 — Release Packaging
 
-**Status：TODO**
+**Status：IN PROGRESS**
 
-- Windows signed portable artifact；
-- macOS signing/notarization；
-- Linux artifact；
-- Client Generator / Distribution Studio release pipeline；
-- Windows icon/VERSIONINFO branding；
-- macOS bundle naming/icon/localization；
-- ClientFlavor signing/notarization/cache；
-- cross-platform packaging smoke。
+### V6a — Reproducible unsigned cross-platform artifact baseline
 
-Packaging smoke 应在早期按需进行；V6 是发布级收口，不是第一次碰 signing。
+**Status：DONE（2026-09-04）**
+
+- 新增 workspace `xtask` 与 `cargo xtask package`；所有 package 内部 build 使用 `--locked`，repository alias 自身也固定 `cargo run --locked --package xtask --`。新增 `rust-toolchain.toml` 固定 Rust **1.96.0**，CI 同样显式安装 1.96.0，而不是随时间漂移的 `stable`；
+- unsigned package 固定为 `clew-v<version>-<target>.zip`，payload 只含 native `clew[.exe]`、README 与 embedded `release-manifest.json`。ZIP entry time/permissions固定，release build设置 commit-derived `SOURCE_DATE_EPOCH` 与 `CARGO_INCREMENTAL=0`；manifest记录source commit/date、target/profile、dirty/unsigned、每个payload size/SHA/mode、rustc release+commit+host+LLVM以及`Cargo.lock` SHA-256；
+- package smoke 不再只执行 build-tree binary：native target会重新打开刚生成的ZIP，要求entry集合精确匹配，bounded读取embedded manifest并与内存payload逐字段比较，复核archived binary SHA，解到private temp后实际执行`clew --version`与`clew --help`；
+- 外部`.release.json`同时记录ZIP size/SHA；`SHA256SUMS`覆盖ZIP与`.release.json`两类发布物。dirty tracked/untracked worktree默认拒绝package，只有显式`--allow-dirty`才允许，并在manifest写`dirty=true`；
+- GitHub CI建立Windows 2022 / macOS 14 / Ubuntu 22.04三平台矩阵：fmt、`check/test --workspace --all-targets --locked`、native unsigned package、artifact upload。平台签名证书/notarization账号不在本块伪造；CI真机结果要在远端workflow运行后继续补证据；
+- V6 gate顺带暴露V5b cancel regression的测试harness时序毛刺：旧测试错误假定4个并发child `PutBegin`连续到达，并在Cancel后停止泵remote command。已改为允许合法PutBegin/PutChunk/Cancel交错且最终严格要求4个child全Cancelled + 4个remote Cancel + Host directory cleanup；focused连续**20/20 PASS**，修复提交`9237323 test: harden concurrent directory cancel regression`；
+- 本地最终 gates：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets --locked` PASS / 0 warnings；`cargo test --workspace --all-targets --locked` **243 passed / 0 failed / 6 ignored**；xtask focused **4/4 PASS**；`git diff --check` PASS；
+- clean Windows native package从commit `7a090744295e5fa5002f048f75eef353e4794aa3`连续构建两次，ZIP SHA-256均为 **`6587bb279ec6f48a90d9ae884e957b88b36ce95f537670daf228a8f5b535689c`**；manifest为`dirty=false / unsigned=true / target=x86_64-pc-windows-msvc`，rustc=`1.96.0`、commit=`ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96`，`Cargo.lock` SHA-256=`bdb17e0e57bdd9bc8708d55f57f989b7ec9ad02dd8c5bc0f97ff26feb45ca48e`；两次package都通过archive-extracted binary smoke。
+
+### V6b — Native release metadata + branding + portable layout
+
+**Status：NEXT**
+
+在不依赖外部证书/账号的范围内先收口：Windows PE VERSIONINFO/icon/application metadata、macOS `.app` bundle naming/icon/Info.plist/localization、Linux portable artifact layout/desktop-facing metadata，以及三平台package manifest对这些资源的可验证描述。完成后再进入Windows signing与macOS signing/notarization；ClientFlavor/Distribution Studio成品签名与cache继续留在后续V6子块。
+
+Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
 ## 14. V7 — Advanced Service Runtime
 
@@ -1388,13 +1398,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（DONE；V5a single-file + process-restart FileResume + V5b bounded directory Put/Get/restart/concurrency）**
+**Current block：V6 — Release Packaging（IN PROGRESS；V6a reproducible unsigned artifact baseline DONE）**
 
-**Next block：V6 — Release Packaging（先收口 reproducible unsigned cross-platform artifact baseline，再进入平台签名/品牌化/Distribution Studio）**
+**Next block：V6b — Native release metadata + branding + portable layout**
 
-V4已在`dfa373d`完整封板，V5现在也完整封板。V5b-3在V5b-2 durable模型上冻结per-directory 4-child window + Controller-wide 8-child budget，journal可表达乱序completion但只推进contiguous prefix；multi-active restart/cancel与真实48MiB Put/Get Controller hard-kill均通过。下一阶段进入V6；第一步不碰需要外部证书/账号的签名门禁，先盘点现有CI/build/package面并建立Windows/macOS/Linux可复现unsigned artifact、版本/资源元数据、最小install/run smoke与release manifest/checksum基线，之后再分平台处理signing/notarization/branding。
+V5已完整封板。V6a现在也完成：pinned Rust 1.96、locked xtask、deterministic ZIP、embedded/external manifest、Cargo.lock/toolchain provenance、archive-extracted native smoke、checksum与Windows clean双构建可复现证据均已建立；CI矩阵已覆盖Windows/macOS/Linux但远端平台运行结果仍需实际workflow补证。下一步先做不依赖证书的Windows/macOS/Linux native metadata与portable layout，再进入真实signing/notarization和Distribution Studio成品管线。
 
 ### Change log
+
+- **2026-09-04** — V6a reproducible unsigned artifact baseline DONE：新增pinned Rust 1.96 + locked `cargo xtask package`，deterministic ZIP、embedded/external release manifest、rustc/Cargo.lock/source provenance、ZIP内binary hash复核与解包后`--version/--help` smoke、ZIP+sidecar `SHA256SUMS`，以及Windows/macOS/Linux CI package矩阵。clean Windows commit `7a090744...`双构建ZIP SHA均`6587bb27...5689c`，manifest `dirty=false/unsigned=true`；workspace **243/0/6**。release gate还顺带修复V5b concurrent cancel test harness对PutBegin顺序的错误假设（`9237323`，压力20/20）。下一块V6b native metadata/branding/portable layout。
 
 - **2026-09-04** — V5b-3 bounded multi-file concurrency DONE / **V5 FILE PLANE DONE**：directory scheduler冻结per-outer **4** + Controller-wide incomplete child **8**，新增bounded `active_children` journal，允许乱序completion但只推进contiguous prefix；旧single-child journal可迁移，>4/重复ID/断裂index/progress越界fail closed；restart保留多child原IDs/flags，Cancel覆盖全部active child。focused directory **15/15**，workspace **239/0/6**，check 0 warnings。真实Windows 12×4MiB Put在2,023,424 bytes/0-of-12、4 active时hard-kill Controller，原outer/四child IDs续到48MiB/12-of-12并全hash一致；Get在4,943,872 bytes/0-of-12、4 active时hard-kill，四个local child parts保留并以原IDs续完48MiB/12-of-12，atomic destination/hash/staging cleanup均通过。V5封板，下一块V6 Release Packaging；directory Rename/Replace继续按既定scope deferred。
 
