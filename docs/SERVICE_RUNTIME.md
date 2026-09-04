@@ -1,6 +1,6 @@
 # Advanced Service Runtime
 
-Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 已完成；V7b 分成 Windows machine runtime 与 user-session control plane 两层，其中 V7b-1 machine Connector service 已完成，V7b-2 的 protected IPC / standard-user lifecycle backend / GUI+tray client 已实现并通过安全面验收，仍等待独立交互 Windows session 的可见窗口/tray acceptance；Linux system service 属于后续 V7c。
+Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 已完成；V7b Windows machine runtime与user-session control plane也已封板，包括protected IPC、standard-user lifecycle backend以及独立交互session中的GUI/tray生命周期验收；Linux system service 属于后续 V7c。
 
 ## V7a：Linux `systemd --user`
 
@@ -137,7 +137,7 @@ V7b-2 不把 ProgramData machine state 或 DeviceKey 暴露给普通用户，而
 - `clew service status --scope machine` 会把 SCM状态与 protected IPC telemetry合并；`clew service gui --scope machine` 是 user-session Eframe/tray client，后台线程只调用同一 service manager/status backend；
 - GUI关闭按钮默认 hide-to-tray，明确显示“关闭/退出窗口不会停止后台服务”；安装永远仍是显式 administrator CLI动作，GUI不会静默安装或扩大权限。
 
-安全验收使用 restricted token真实移除 Administrators membership后完成：同一 authorized user仍能查询 protected IPC并用生产 backend stop/start service，但 `CHANGE_CONFIG` / `DELETE` 均被SCM拒绝，读取ProgramData `service.json`也返回 Access Denied；重启后仍恢复 `serving_connector` 且不获得 EXECUTE。cap00 WebCodex agent本身位于 Windows Session 0，因此它只能验证GUI client进程与backend稳定共存，**不能**被计作可见桌面窗口/tray证据；V7b-2最终封板仍要求在独立 interactive Windows session完成该视觉/生命周期 acceptance。
+安全验收使用 restricted token真实移除 Administrators membership后完成：同一 authorized user仍能查询 protected IPC并用生产 backend stop/start service，但 `CHANGE_CONFIG` / `DELETE` 均被SCM拒绝，读取ProgramData `service.json`也返回 Access Denied；重启后仍恢复 `serving_connector` 且不获得 EXECUTE。最终 implementation commit `3ebc9fe` 的 binary又投到 mzd Active RDP Session 2：同session Win32 inspector通过 `EnumWindows`精确看到 visible `Clew Background Service` 顶层窗口；向该窗口发送 `WM_CLOSE` 后同一PID继续存活，窗口变为 invisible，证明默认close只hide-to-tray而不会退出client或停止machine service。临时scheduled tasks/binary/process均在验收后清理。V7b-2至此封板。
 
 ## 后续 V7
 
