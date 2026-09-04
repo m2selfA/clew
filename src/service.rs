@@ -27,6 +27,7 @@ pub enum ServiceScope {
 #[value(rename_all = "kebab-case")]
 pub enum ServiceAction {
     Status,
+    Gui,
     Install,
     Enable,
     Start,
@@ -52,6 +53,20 @@ pub struct ServiceReport {
     pub active_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linger_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_ipc_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_site_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_executable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_connector: Option<bool>,
 }
 
 pub fn manage(
@@ -110,6 +125,42 @@ pub fn manage(
                 Err("`clew service --scope machine` is currently available on Windows only".into())
             }
         }
+    }
+}
+
+pub async fn enrich_report(scope: ServiceScope, report: &mut ServiceReport) {
+    #[cfg(windows)]
+    if scope == ServiceScope::Machine {
+        windows::enrich_machine_report(report).await;
+    }
+    #[cfg(not(windows))]
+    let _ = (scope, report);
+}
+
+#[must_use]
+pub fn is_windows_service_cleanup_process() -> bool {
+    #[cfg(windows)]
+    {
+        let mut args = std::env::args_os();
+        let _ = args.next();
+        return args
+            .next()
+            .is_some_and(|arg| arg == windows::SERVICE_CLEANUP_ARGUMENT);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub fn run_windows_service_cleanup_process() -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    {
+        return windows::run_cleanup_process();
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Windows service cleanup process mode is unavailable on this platform".into())
     }
 }
 
@@ -200,6 +251,9 @@ fn manage_linux_user(
     let unit_path = user_unit_path()?;
     match action {
         ServiceAction::Status => {}
+        ServiceAction::Gui => {
+            return Err("service GUI is not a Linux user-service lifecycle action".into());
+        }
         ServiceAction::Install => install_user_unit(&unit_path, state_dir)?,
         ServiceAction::Enable => {
             require_managed_unit(&unit_path)?;
@@ -335,6 +389,13 @@ fn service_report(
         enable_state,
         active_state,
         linger_enabled: query_linger(),
+        process_id: None,
+        control_ipc_available: None,
+        runtime_state: None,
+        runtime_site_name: None,
+        runtime_device_id: None,
+        runtime_executable: None,
+        runtime_connector: None,
     })
 }
 
@@ -530,6 +591,7 @@ fn sync_parent(path: &Path) -> Result<(), Box<dyn Error>> {
 fn action_name(action: ServiceAction) -> &'static str {
     match action {
         ServiceAction::Status => "status",
+        ServiceAction::Gui => "gui",
         ServiceAction::Install => "install",
         ServiceAction::Enable => "enable",
         ServiceAction::Start => "start",

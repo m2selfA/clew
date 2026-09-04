@@ -2,7 +2,7 @@
 
 状态：**正式开发 / V2 Agent Minimum IN PROGRESS**
 架构基线：**Architecture v1.5**
-更新时间：**2026-09-04**
+更新时间：**2026-09-05**
 
 本文是 Clew 开始实现后的**唯一开发进度台账**。`00`–`06` 文档定义产品、架构和已经裁定的边界；本文负责回答四个问题：**现在做到哪一块、这一块怎样算完成、验证过什么、下一块是什么。**
 
@@ -1456,11 +1456,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel next implementation block：V7b-2 — Windows Service user-session control plane（protected machine IPC + tray/GUI/CLI client）**
+**Parallel current block：V7b-2 — Windows Service user-session control plane（implementation + security acceptance complete；interactive desktop gate pending）**
 
-V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；V6b-3b只剩外部正式签名凭据。V7a `systemd --user` 已封板；V7b-1 Windows machine Connector service 也已在 exact commit `f38af723...` 上完成 cap00 SCM/ACL/identity/crash/tamper native acceptance。当前继续 V7b-2：machine service仍在Session 0运行无UI，新增authorized-user SID绑定的protected local IPC，让用户session中的tray/GUI/CLI只作为client；不得复用Host wake pipe、不得向普通Users/Everyone开放machine DeviceKey或控制面。Distribution Studio signed-output/cache仍后置到真实签名acceptance。
+V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；V6b-3b只剩外部正式签名凭据。V7a `systemd --user` 与V7b-1 Windows machine Connector service均已封板。V7b-2现已实现authorized-user SID绑定的SCM DACL、protected machine status pipe、SCM-PID反证、bounded handler admission、standard-user production start/stop/status以及user-session Eframe/tray client；restricted-token native gate已证明去掉Administrators后仍可日常控制，但不能读ProgramData machine state、不能CHANGE_CONFIG/DELETE。cap00 agent自身位于Session 0，因此当前唯一未计正式PASS的是**独立 interactive Windows session中的可见窗口/tray生命周期**；正在转到mzd Active RDP Session 2做exact-commit acceptance。Distribution Studio signed-output/cache仍后置到真实签名acceptance。
 
 ### Change log
+
+- **2026-09-05** — V7b-2 user-session control plane implementation/security gate complete，interactive desktop acceptance pending：machine metadata schema 2固化installer user SID+service SID；SCM DACL仅给authorized user Query/Start/Stop/Interrogate/ReadControl，ProgramData仍只允许SYSTEM/Admin/service SID；独立`clew-machine-control-v1` pipe使用explicit SECURITY_ATTRIBUTES + remote-client reject + SCM PID反证，只投影bounded Connector-only runtime status。control server冻结16KiB/2s/7-active+1-listener admission。`clew service status --scope machine`合并SCM+runtime，新增`service gui` Eframe/tray client且关闭窗口不停止service。cap00 restricted-token真机测试移除Administrators后仍通过生产status→stop→start→serving_connector，同时CHANGE_CONFIG/DELETE与ProgramData `service.json`读取均拒绝；root package **33/0/2**，workspace **271/0**，workspace locked check 0 warnings。cap00 GUI进程因agent在Session 0不计可见窗口证据；下一步固定commit后投mzd Active RDP Session 2补可见GUI/tray acceptance，再决定V7b-2 DONE并进入V7c。
 
 - **2026-09-05** — V7b-1 Windows machine Connector service DONE：实现 commit `f38af72346db4fab78cbb7a2d53452c4779ee46e`；LocalService +独立service SID、ProgramData machine identity、Win32 protected 3-ACE DACL、Connector-only单调降权、SCM显式生命周期、2s/10s/60s failure restart、payload hash fail-closed且损坏后仍可stop/disable/uninstall。并修复Windows Local API对等价relative state-dir拼写生成不同pipe的问题。focused Windows service/ACL **4/4**、controller CLI **10/10**、workspace **263/0/6**、check 0 warning。cap00 exact-commit install为manual/stopped，独立ACL/SCM/hash反读全匹配；enable不启动；service设备`f3f44d9d-89ce-4163-ac1c-88befee361b1`始终`execute=false/connector=true`，stop/start保持同ID；强杀pid `105492`后SCM拉起`107124`且同ID恢复；篡改binary后start拒绝而uninstall仍成功，最终SCM/root/Controller清空。下一块V7b-2 protected cross-session machine IPC + user-session tray/GUI/CLI client。
 

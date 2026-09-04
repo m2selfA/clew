@@ -5,7 +5,7 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -37,14 +37,17 @@ use windows_service::{
 use super::{ServiceAction, ServiceReport};
 
 mod acl;
+mod control;
+mod security;
 
 pub const SERVICE_PROCESS_ARGUMENT: &str = "__clew-windows-service";
+pub const SERVICE_CLEANUP_ARGUMENT: &str = "__clew-windows-service-cleanup";
 const SERVICE_NAME: &str = "ClewConnector";
 const SERVICE_DISPLAY_NAME: &str = "Clew Connector";
 const SERVICE_DESCRIPTION: &str =
     "Clew long-lived connector helper. Runs with Connector-only authority under LocalService.";
 const SERVICE_ACCOUNT: &str = r"NT AUTHORITY\LocalService";
-const SERVICE_SCHEMA_VERSION: u32 = 1;
+const SERVICE_SCHEMA_VERSION: u32 = 2;
 const SERVICE_ROLE: &str = "connector_only";
 const SERVICE_DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVICE_TRANSITION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -84,6 +87,8 @@ struct MachineServiceConfig {
     service_name: String,
     role: String,
     installed_version: String,
+    control_user_sid: String,
+    service_sid: String,
     binary_sha256: String,
     site_sha256: String,
 }
@@ -94,6 +99,8 @@ impl MachineServiceConfig {
             || self.service_name != SERVICE_NAME
             || self.role != SERVICE_ROLE
             || self.installed_version.is_empty()
+            || security::validate_control_user_sid(&self.control_user_sid).is_err()
+            || !valid_service_sid(&self.service_sid)
             || !is_sha256(&self.binary_sha256)
             || !is_sha256(&self.site_sha256)
         {
@@ -139,23 +146,57 @@ fn run_service_main() -> Result<(), Box<dyn Error>> {
     if let Ok(mut guard) = status_slot.lock() {
         *guard = Some(status_handle);
     }
-    status_handle.set_service_status(service_status(ServiceState::StartPending))?;
+    status_handle.set_service_status(service_start_pending(1))?;
 
+    let (paths, config) = load_machine_runtime_payload()?;
+    status_handle.set_service_status(service_start_pending(2))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    status_handle.set_service_status(service_start_pending(3))?;
+    let runtime_status = Arc::new(tokio::sync::RwLock::new(
+        control::MachineRuntimeStatus::starting(),
+    ));
+    let control_server = runtime.block_on(async {
+        control::MachineControlServer::bind(&config.control_user_sid, &config.service_sid)
+    })?;
+    status_handle.set_service_status(service_start_pending(4))?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     status_handle.set_service_status(service_status(ServiceState::Running))?;
     let result = runtime.block_on(async move {
+        let stop_status = Arc::clone(&runtime_status);
+        let stop_shutdown = shutdown_tx.clone();
         let stop_bridge = tokio::spawn(async move {
             let _ = stop_rx.recv().await;
-            let _ = shutdown_tx.send(true);
+            stop_status.write().await.phase = control::MachineRuntimePhase::Stopping;
+            let _ = stop_shutdown.send(true);
         });
-        let result = run_machine_host(shutdown_rx).await;
+
+        let host_shutdown = shutdown_rx.clone();
+        let control_shutdown = shutdown_rx;
+        let host_status = Arc::clone(&runtime_status);
+        let control_status = Arc::clone(&runtime_status);
+        let mut host = Box::pin(run_machine_host(paths, host_shutdown, host_status));
+        let mut control = Box::pin(control_server.serve(control_status, control_shutdown));
+
+        let (host_result, control_result) = tokio::select! {
+            result = &mut host => {
+                let _ = shutdown_tx.send(true);
+                let control_result = control.await;
+                (result, control_result)
+            }
+            result = &mut control => {
+                let _ = shutdown_tx.send(true);
+                let host_result = host.await;
+                (host_result, result)
+            }
+        };
         stop_bridge.abort();
         let _ = stop_bridge.await;
-        result
+        host_result?;
+        control_result?;
+        Ok(())
     });
     let stopped_status = if result.is_ok() {
         service_status(ServiceState::Stopped)
@@ -193,22 +234,46 @@ fn service_status(state: ServiceState) -> ServiceStatus {
     }
 }
 
-async fn run_machine_host(mut shutdown: watch::Receiver<bool>) -> Result<(), Box<dyn Error>> {
+fn service_start_pending(checkpoint: u32) -> ServiceStatus {
+    let mut status = service_status(ServiceState::StartPending);
+    status.checkpoint = checkpoint;
+    status
+}
+
+fn load_machine_runtime_payload() -> Result<(MachinePaths, MachineServiceConfig), Box<dyn Error>> {
     let paths = MachinePaths::current()?;
     let config = load_machine_config(&paths)?;
     config.validate()?;
+    if !paths.binary.is_file() || !paths.site_file.is_file() || !paths.state_root.is_dir() {
+        return Err("Windows machine service installation is incomplete".into());
+    }
     if sha256_file(&paths.binary)? != config.binary_sha256
         || sha256_file(&paths.site_file)? != config.site_sha256
     {
         return Err("Windows machine service files no longer match installed metadata".into());
     }
+    verify_machine_acl_with_sid(&paths.root, &config.service_sid)?;
+    Ok((paths, config))
+}
 
+async fn run_machine_host(
+    paths: MachinePaths,
+    mut shutdown: watch::Receiver<bool>,
+    runtime_status: Arc<tokio::sync::RwLock<control::MachineRuntimeStatus>>,
+) -> Result<(), Box<dyn Error>> {
     let layout = StateLayout::new(paths.state_root.clone());
     let context = HostLaunchContext::current(Some(paths.site_file.clone()), layout.clone())?;
     let state = resolve_host_launch_with_mode(context, HostLaunchMode::ConnectorOnly)?;
     if !state.is_connector_only() {
         return Err("Windows machine service refused a non-Connector-only Host state".into());
     }
+    let phase = if matches!(state, HostLaunchState::AwaitingEnrollment { .. }) {
+        control::MachineRuntimePhase::AwaitingEnrollment
+    } else {
+        control::MachineRuntimePhase::Starting
+    };
+    *runtime_status.write().await = control::MachineRuntimeStatus::from_host_state(phase, &state);
+
     let Some(active) =
         wait_for_networked_activation_until(&layout, state, shutdown.clone()).await?
     else {
@@ -219,6 +284,10 @@ async fn run_machine_host(mut shutdown: watch::Receiver<bool>) -> Result<(), Box
             "Windows machine service enrollment unexpectedly gained EXECUTE authority".into(),
         );
     }
+    *runtime_status.write().await = control::MachineRuntimeStatus::from_host_state(
+        control::MachineRuntimePhase::ServingConnector,
+        &active,
+    );
     let HostLaunchState::Active { membership, .. } = active else {
         return Err("Windows machine service could not reach an active Host membership".into());
     };
@@ -245,6 +314,9 @@ pub fn manage_machine(
 ) -> Result<ServiceReport, Box<dyn Error>> {
     match action {
         ServiceAction::Status => machine_report(action),
+        ServiceAction::Gui => {
+            Err("service GUI is handled by the explicit user-session client entrypoint".into())
+        }
         ServiceAction::Install => {
             let site = site.ok_or("Windows machine service install requires --site FILE")?;
             install_machine(&site)?;
@@ -306,18 +378,23 @@ fn install_machine(site_path: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     let current_executable = fs::canonicalize(env::current_exe()?)?;
+    let control_user_sid = security::current_user_sid_string()?;
     let service_info = expected_service_info(&paths, ServiceStartType::OnDemand);
     let service_access = ServiceAccess::QUERY_CONFIG
         | ServiceAccess::CHANGE_CONFIG
         | ServiceAccess::QUERY_STATUS
         | ServiceAccess::START
         | ServiceAccess::STOP
-        | ServiceAccess::DELETE;
+        | ServiceAccess::DELETE
+        | ServiceAccess::READ_CONTROL
+        | ServiceAccess::WRITE_DAC;
     let service = manager.create_service(&service_info, service_access)?;
     let install_result = (|| -> Result<(), Box<dyn Error>> {
         service.set_config_service_sid_info(ServiceSidType::Unrestricted)?;
         service.set_description(SERVICE_DESCRIPTION)?;
         configure_failure_actions(&service)?;
+        security::apply_service_control_dacl(service.raw_handle(), &control_user_sid)?;
+        let installed_service_sid = service_sid()?;
         fs::create_dir_all(&paths.root)?;
         harden_machine_root(&paths.root)?;
         fs::create_dir_all(
@@ -335,11 +412,13 @@ fn install_machine(site_path: &Path) -> Result<(), Box<dyn Error>> {
             service_name: SERVICE_NAME.into(),
             role: SERVICE_ROLE.into(),
             installed_version: env!("CARGO_PKG_VERSION").into(),
+            control_user_sid,
+            service_sid: installed_service_sid,
             binary_sha256: sha256_file(&paths.binary)?,
             site_sha256: sha256_file(&paths.site_file)?,
         };
         write_machine_config(&paths, &config)?;
-        verify_machine_acl(&paths.root)?;
+        verify_machine_acl_with_sid(&paths.root, &config.service_sid)?;
         Ok(())
     })();
     if let Err(error) = install_result {
@@ -386,12 +465,8 @@ fn set_start_type(
 }
 
 fn start_machine() -> Result<(), Box<dyn Error>> {
-    require_machine_payload()?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::START,
-    )?;
+    let (_paths, service) =
+        open_scm_managed_service(ServiceAccess::QUERY_STATUS | ServiceAccess::START)?;
     let current = service.query_status()?;
     if current.current_state == ServiceState::Running {
         return Ok(());
@@ -404,12 +479,8 @@ fn start_machine() -> Result<(), Box<dyn Error>> {
 }
 
 fn stop_machine() -> Result<(), Box<dyn Error>> {
-    require_managed_installation()?;
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
-    )?;
+    let (_paths, service) =
+        open_scm_managed_service(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
     let current = service.query_status()?;
     if current.current_state == ServiceState::Stopped {
         return Ok(());
@@ -437,7 +508,126 @@ fn uninstall_machine() -> Result<(), Box<dyn Error>> {
     service.delete()?;
     drop(service);
     wait_service_deleted(&manager)?;
-    fs::remove_dir_all(&paths.root)?;
+    remove_machine_root_after_uninstall(&paths)?;
+    Ok(())
+}
+
+fn remove_machine_root_after_uninstall(paths: &MachinePaths) -> Result<(), Box<dyn Error>> {
+    let current_executable = fs::canonicalize(env::current_exe()?)?;
+    let installed_executable = fs::canonicalize(&paths.binary)?;
+    if current_executable != installed_executable {
+        fs::remove_dir_all(&paths.root)?;
+        return Ok(());
+    }
+
+    spawn_self_uninstall_cleanup(&current_executable)?;
+    Ok(())
+}
+
+fn spawn_self_uninstall_cleanup(current_executable: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let helper = env::temp_dir().join(format!(
+        "clew-service-uninstall-{}-{stamp}.exe",
+        std::process::id()
+    ));
+    fs::copy(current_executable, &helper)?;
+    let mut child = Command::new(&helper)
+        .arg(SERVICE_CLEANUP_ARGUMENT)
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    if let Some(status) = child.try_wait()? {
+        return Err(format!(
+            "Windows self-uninstall cleanup helper exited before the parent process: {status}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub fn run_cleanup_process() -> Result<(), Box<dyn Error>> {
+    let args = env::args_os().collect::<Vec<_>>();
+    if args.len() != 3 || args[1] != SERVICE_CLEANUP_ARGUMENT {
+        return Err("invalid Windows service cleanup invocation".into());
+    }
+    let parent_pid = args[2]
+        .to_str()
+        .ok_or("Windows service cleanup parent PID is not valid UTF-8")?
+        .parse::<u32>()?;
+    if parent_pid == 0 || parent_pid == std::process::id() {
+        return Err("invalid Windows service cleanup parent PID".into());
+    }
+    wait_for_parent_exit(parent_pid)?;
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    if service_exists(&manager)? {
+        return Err(
+            "refusing deferred Windows service cleanup while ClewConnector still exists".into(),
+        );
+    }
+    let paths = MachinePaths::current()?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match fs::remove_dir_all(&paths.root) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) if Instant::now() < deadline => {
+                thread::sleep(SERVICE_POLL_INTERVAL);
+                if Instant::now() >= deadline {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    schedule_delete_on_reboot(&env::current_exe()?)?;
+    Ok(())
+}
+
+fn wait_for_parent_exit(parent_pid: u32) -> Result<(), Box<dyn Error>> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(87) {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let result = unsafe { WaitForSingleObject(handle, 30_000) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if result == WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    if result == WAIT_FAILED {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Err("timed out waiting for the self-uninstall parent process to exit".into())
+}
+
+fn schedule_delete_on_reboot(path: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    if unsafe { MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
@@ -447,18 +637,7 @@ fn machine_report(action: ServiceAction) -> Result<ServiceReport, Box<dyn Error>
     {
         Ok(manager) => manager,
         Err(_) => {
-            return Ok(ServiceReport {
-                action: action_name(action).into(),
-                scope: "machine".into(),
-                unit_name: SERVICE_NAME.into(),
-                unit_path: paths.binary,
-                installed: false,
-                managed: false,
-                manager_available: false,
-                enable_state: None,
-                active_state: None,
-                linger_enabled: None,
-            });
+            return Ok(empty_machine_report(action, paths.binary, false));
         }
     };
     let service = match manager.open_service(
@@ -467,33 +646,13 @@ fn machine_report(action: ServiceAction) -> Result<ServiceReport, Box<dyn Error>
     ) {
         Ok(service) => service,
         Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
-            return Ok(ServiceReport {
-                action: action_name(action).into(),
-                scope: "machine".into(),
-                unit_name: SERVICE_NAME.into(),
-                unit_path: paths.binary,
-                installed: false,
-                managed: false,
-                manager_available: true,
-                enable_state: None,
-                active_state: None,
-                linger_enabled: None,
-            });
+            return Ok(empty_machine_report(action, paths.binary, true));
         }
         Err(error) => return Err(error.into()),
     };
     let status = service.query_status()?;
     let service_config = service.query_config()?;
-    let managed = machine_service_identity_matches(&service, &paths)
-        .and_then(|matches| {
-            if !matches {
-                return Ok(false);
-            }
-            let config = load_machine_config(&paths)?;
-            config.validate()?;
-            Ok(true)
-        })
-        .unwrap_or(false);
+    let managed = machine_service_identity_matches(&service, &paths).unwrap_or(false);
     Ok(ServiceReport {
         action: action_name(action).into(),
         scope: "machine".into(),
@@ -505,7 +664,64 @@ fn machine_report(action: ServiceAction) -> Result<ServiceReport, Box<dyn Error>
         enable_state: Some(start_type_name(service_config.start_type).into()),
         active_state: Some(service_state_name(status.current_state).into()),
         linger_enabled: None,
+        process_id: status.process_id,
+        control_ipc_available: None,
+        runtime_state: None,
+        runtime_site_name: None,
+        runtime_device_id: None,
+        runtime_executable: None,
+        runtime_connector: None,
     })
+}
+
+fn empty_machine_report(
+    action: ServiceAction,
+    unit_path: PathBuf,
+    manager_available: bool,
+) -> ServiceReport {
+    ServiceReport {
+        action: action_name(action).into(),
+        scope: "machine".into(),
+        unit_name: SERVICE_NAME.into(),
+        unit_path,
+        installed: false,
+        managed: false,
+        manager_available,
+        enable_state: None,
+        active_state: None,
+        linger_enabled: None,
+        process_id: None,
+        control_ipc_available: None,
+        runtime_state: None,
+        runtime_site_name: None,
+        runtime_device_id: None,
+        runtime_executable: None,
+        runtime_connector: None,
+    }
+}
+
+pub async fn enrich_machine_report(report: &mut ServiceReport) {
+    let Some(process_id) = report.process_id.filter(|process_id| *process_id != 0) else {
+        report.control_ipc_available = Some(false);
+        return;
+    };
+    if report.active_state.as_deref() != Some("running") {
+        report.control_ipc_available = Some(false);
+        return;
+    }
+    match control::query_status(process_id).await {
+        Ok(status) => {
+            report.control_ipc_available = Some(true);
+            report.runtime_state = Some(status.phase.as_str().into());
+            report.runtime_site_name = status.site_name;
+            report.runtime_device_id = status.device_id;
+            report.runtime_executable = Some(status.executable);
+            report.runtime_connector = Some(status.connector);
+        }
+        Err(_) => {
+            report.control_ipc_available = Some(false);
+        }
+    }
 }
 
 fn service_exists(manager: &ServiceManager) -> Result<bool, Box<dyn Error>> {
@@ -518,6 +734,23 @@ fn service_exists(manager: &ServiceManager) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+fn open_scm_managed_service(
+    access: ServiceAccess,
+) -> Result<(MachinePaths, windows_service::service::Service), Box<dyn Error>> {
+    let paths = MachinePaths::current()?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        access | ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
+    )?;
+    if !machine_service_identity_matches(&service, &paths)? {
+        return Err(
+            "refusing to manage a Windows service whose SCM identity does not match Clew".into(),
+        );
+    }
+    Ok((paths, service))
+}
+
 fn require_managed_installation() -> Result<MachinePaths, Box<dyn Error>> {
     let paths = MachinePaths::current()?;
     let config = load_machine_config(&paths)?;
@@ -525,13 +758,14 @@ fn require_managed_installation() -> Result<MachinePaths, Box<dyn Error>> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
         SERVICE_NAME,
-        ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS,
+        ServiceAccess::QUERY_CONFIG | ServiceAccess::QUERY_STATUS | ServiceAccess::READ_CONTROL,
     )?;
     if !machine_service_identity_matches(&service, &paths)? {
         return Err(
             "refusing to manage a Windows service whose SCM identity does not match Clew".into(),
         );
     }
+    security::verify_service_control_dacl(service.raw_handle(), &config.control_user_sid)?;
     Ok(paths)
 }
 
@@ -549,7 +783,7 @@ fn require_machine_payload() -> Result<MachinePaths, Box<dyn Error>> {
                 .into(),
         );
     }
-    verify_machine_acl(&paths.root)?;
+    verify_machine_acl_with_sid(&paths.root, &config.service_sid)?;
     Ok(paths)
 }
 
@@ -691,9 +925,11 @@ fn harden_machine_root(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn verify_machine_acl(root: &Path) -> Result<(), Box<dyn Error>> {
-    let service_sid = service_sid()?;
-    acl::verify_protected_directory_dacl(root, &service_sid)?;
+fn verify_machine_acl_with_sid(root: &Path, service_sid: &str) -> Result<(), Box<dyn Error>> {
+    if !valid_service_sid(service_sid) {
+        return Err("Windows machine service metadata contains an invalid service SID".into());
+    }
+    acl::verify_protected_directory_dacl(root, service_sid)?;
     Ok(())
 }
 
@@ -796,6 +1032,7 @@ fn is_sha256(value: &str) -> bool {
 fn action_name(action: ServiceAction) -> &'static str {
     match action {
         ServiceAction::Status => "status",
+        ServiceAction::Gui => "gui",
         ServiceAction::Install => "install",
         ServiceAction::Enable => "enable",
         ServiceAction::Start => "start",
@@ -852,6 +1089,8 @@ mod tests {
             service_name: SERVICE_NAME.into(),
             role: SERVICE_ROLE.into(),
             installed_version: "0.1.0".into(),
+            control_user_sid: security::current_user_sid_string().unwrap(),
+            service_sid: "S-1-5-80-1-2-3-4-5".into(),
             binary_sha256: "a".repeat(64),
             site_sha256: "b".repeat(64),
         };
@@ -859,9 +1098,85 @@ mod tests {
         let mut wrong = config.clone();
         wrong.role = "execute".into();
         assert!(wrong.validate().is_err());
+        let mut wrong_sid = config.clone();
+        wrong_sid.control_user_sid = "S-1-5-18".into();
+        assert!(wrong_sid.validate().is_err());
+        let mut wrong_service_sid = config.clone();
+        wrong_service_sid.service_sid = "S-1-5-18".into();
+        assert!(wrong_service_sid.validate().is_err());
         let mut wrong = config;
         wrong.binary_sha256 = "short".into();
         assert!(wrong.validate().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires an installed, running V7b Windows machine service"]
+    async fn live_restricted_user_can_query_pipe_and_control_only_lifecycle() {
+        let _impersonation = security::impersonate_restricted_current_user().unwrap();
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).unwrap();
+        let service = manager
+            .open_service(
+                SERVICE_NAME,
+                ServiceAccess::QUERY_CONFIG
+                    | ServiceAccess::QUERY_STATUS
+                    | ServiceAccess::START
+                    | ServiceAccess::STOP,
+            )
+            .unwrap();
+
+        assert!(
+            manager
+                .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+                .is_err()
+        );
+        assert!(
+            manager
+                .open_service(SERVICE_NAME, ServiceAccess::DELETE)
+                .is_err()
+        );
+
+        let paths = MachinePaths::current().unwrap();
+        let metadata_error = fs::read(&paths.config_file).unwrap_err();
+        assert_eq!(metadata_error.raw_os_error(), Some(5));
+
+        let status = service.query_status().unwrap();
+        assert_eq!(status.current_state, ServiceState::Running);
+
+        let mut report = machine_report(ServiceAction::Status).unwrap();
+        enrich_machine_report(&mut report).await;
+        assert!(report.managed);
+        assert_eq!(report.control_ipc_available, Some(true));
+        assert_eq!(report.runtime_executable, Some(false));
+        assert_eq!(report.runtime_connector, Some(true));
+
+        stop_machine().unwrap();
+        assert_eq!(
+            service.query_status().unwrap().current_state,
+            ServiceState::Stopped
+        );
+        start_machine().unwrap();
+        assert_eq!(
+            service.query_status().unwrap().current_state,
+            ServiceState::Running
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut report = machine_report(ServiceAction::Status).unwrap();
+            enrich_machine_report(&mut report).await;
+            if report.runtime_state.as_deref() == Some("serving_connector") {
+                assert_eq!(report.runtime_executable, Some(false));
+                assert_eq!(report.runtime_connector, Some(true));
+                assert!(report.runtime_device_id.is_some());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "restricted user service restart did not return to serving_connector"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     #[test]

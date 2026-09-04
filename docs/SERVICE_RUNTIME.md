@@ -1,6 +1,6 @@
 # Advanced Service Runtime
 
-Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 已完成；V7b 分成 Windows machine runtime 与 user-session control plane 两层，其中 V7b-1 machine Connector service 已完成，V7b-2 用户态 GUI/CLI 安全控制面仍在推进；Linux system service 属于后续 V7c。
+Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 已完成；V7b 分成 Windows machine runtime 与 user-session control plane 两层，其中 V7b-1 machine Connector service 已完成，V7b-2 的 protected IPC / standard-user lifecycle backend / GUI+tray client 已实现并通过安全面验收，仍等待独立交互 Windows session 的可见窗口/tray acceptance；Linux system service 属于后续 V7c。
 
 ## V7a：Linux `systemd --user`
 
@@ -123,17 +123,21 @@ NT SERVICE\ClewConnector 的 service SID
 
 V7b-1 不创建任何交互窗口，也没有跨 Session 0 的普通用户控制 pipe；当前 machine lifecycle 由提升权限的 CLI/SCM管理。
 
-## V7b-2：user-session control plane（NEXT）
+## V7b-2：user-session control plane
 
-下一层才把 tray/GUI/普通用户 CLI 变成 machine service 的 client：
+V7b-2 不把 ProgramData machine state 或 DeviceKey 暴露给普通用户，而是把“安装时的本机用户”固化成唯一日常控制主体：
 
-- 新建独立的 machine service status/control IPC，不复用 Host 单实例 `wake` pipe；
-- named pipe 必须显式绑定 authorized local user SID + service/system/admin ACL；
-- 用户 session只持有被授权的控制凭据/句柄，machine DeviceKey仍只留在 protected ProgramData state；
-- GUI明确区分“关闭窗口”和“停止后台服务”；
-- UI永远运行在交互用户 session，不进入 Session 0。
+- install 从当前 process token 读取 installer user SID，并把它写入 machine metadata；SYSTEM / Administrators / service SID 都不能冒充这个 user SID；
+- SCM service object 使用显式 DACL：SYSTEM 与 Administrators 保留 full control；authorized user只得到 `QUERY_CONFIG / QUERY_STATUS / START / STOP / INTERROGATE / READ_CONTROL`，没有 `CHANGE_CONFIG / DELETE / WRITE_DAC`；因此安装、重配、卸载仍要求管理员，而日常 start/stop/status 不需要再次提权；
+- `%ProgramData%\\Clew\\Service` DACL**没有**加入 authorized user，所以 GUI/CLI不能读取 `service.json`、Site Kit、DeviceKey 或其它 machine state；
+- Session 0 service另开 `\\.\\pipe\\clew-machine-control-v1`，不复用 Host wake pipe。pipe使用显式 `SECURITY_ATTRIBUTES`，只允许 SYSTEM / Administrators / service SID full access与 authorized user read/write，并继续 `reject_remote_clients(true)`；
+- control API v1当前只暴露 bounded `Status`，16 KiB frame、2s I/O、最多7个active handlers+1个listener；生命周期 start/stop仍走 Windows SCM，不在自定义 RPC里重新实现 privileged service manager；
+- user client在连接固定 pipe名后调用 `GetNamedPipeServerProcessId`，必须与 SCM当前 service PID一致，避免同名 pipe被普通进程抢占后冒充 service；
+- runtime telemetry只投影 `starting / awaiting_enrollment / serving_connector / stopping`、Site name / DeviceId以及固定 `executable=false / connector=true`，不返回任何 machine secret；
+- `clew service status --scope machine` 会把 SCM状态与 protected IPC telemetry合并；`clew service gui --scope machine` 是 user-session Eframe/tray client，后台线程只调用同一 service manager/status backend；
+- GUI关闭按钮默认 hide-to-tray，明确显示“关闭/退出窗口不会停止后台服务”；安装永远仍是显式 administrator CLI动作，GUI不会静默安装或扩大权限。
 
-完成这层以前，不宣称 Windows Service 的 user-session GUI/CLI control plane 已收口。
+安全验收使用 restricted token真实移除 Administrators membership后完成：同一 authorized user仍能查询 protected IPC并用生产 backend stop/start service，但 `CHANGE_CONFIG` / `DELETE` 均被SCM拒绝，读取ProgramData `service.json`也返回 Access Denied；重启后仍恢复 `serving_connector` 且不获得 EXECUTE。cap00 WebCodex agent本身位于 Windows Session 0，因此它只能验证GUI client进程与backend稳定共存，**不能**被计作可见桌面窗口/tray证据；V7b-2最终封板仍要求在独立 interactive Windows session完成该视觉/生命周期 acceptance。
 
 ## 后续 V7
 

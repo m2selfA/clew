@@ -476,6 +476,51 @@ fn top_level_help_surfaces_remain_bounded() {
 }
 
 #[test]
+fn service_gui_requires_machine_scope_and_rejects_install_flags() {
+    let user_scope = Command::new(env!("CARGO_BIN_EXE_clew"))
+        .args(["service", "gui", "--scope", "user"])
+        .output()
+        .unwrap();
+    assert!(!user_scope.status.success());
+    assert!(
+        String::from_utf8_lossy(&user_scope.stderr)
+            .contains("available for Windows machine scope only"),
+        "{}",
+        String::from_utf8_lossy(&user_scope.stderr)
+    );
+
+    let machine_with_site = Command::new(env!("CARGO_BIN_EXE_clew"))
+        .args([
+            "service",
+            "gui",
+            "--scope",
+            "machine",
+            "--site",
+            "site.clew",
+        ])
+        .output()
+        .unwrap();
+    assert!(!machine_with_site.status.success());
+    assert!(
+        String::from_utf8_lossy(&machine_with_site.stderr)
+            .contains("does not accept --state-dir or --site"),
+        "{}",
+        String::from_utf8_lossy(&machine_with_site.stderr)
+    );
+}
+
+#[test]
+fn service_help_lists_explicit_gui_client_action() {
+    let output = Command::new(env!("CARGO_BIN_EXE_clew"))
+        .args(["service", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("gui"), "{stdout}");
+}
+
+#[test]
 fn unknown_controller_lifecycle_marker_fails_closed() {
     let temp = tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_clew"))

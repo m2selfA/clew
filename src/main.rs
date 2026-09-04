@@ -7,6 +7,8 @@ mod host_gui;
 mod invite_io;
 mod mcp;
 mod service;
+#[cfg(windows)]
+mod service_gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
@@ -623,19 +625,39 @@ fn service_cli_from_process_args() -> Option<ServiceCli> {
     ))
 }
 
-fn run_service(cli: ServiceCli) -> Result<(), Box<dyn std::error::Error>> {
-    let report = service::manage(cli.action, cli.scope, cli.state_dir, cli.site)?;
+async fn run_service(cli: ServiceCli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.action == service::ServiceAction::Gui {
+        if cli.scope != service::ServiceScope::Machine {
+            return Err("`clew service gui` is available for Windows machine scope only".into());
+        }
+        if cli.state_dir.is_some() || cli.site.is_some() {
+            return Err("`clew service gui` does not accept --state-dir or --site".into());
+        }
+        #[cfg(windows)]
+        {
+            return service_gui::run();
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("`clew service gui --scope machine` is available on Windows only".into());
+        }
+    }
+
+    let mut report = service::manage(cli.action, cli.scope, cli.state_dir, cli.site)?;
+    service::enrich_report(cli.scope, &mut report).await;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let result = if service::is_windows_service_process() {
+    let result = if service::is_windows_service_cleanup_process() {
+        service::run_windows_service_cleanup_process()
+    } else if service::is_windows_service_process() {
         service::run_windows_service_process()
     } else {
         match service_cli_from_process_args() {
-            Some(cli) => run_service(cli),
+            Some(cli) => run_service(cli).await,
             None => run(Cli::parse()).await,
         }
     };
