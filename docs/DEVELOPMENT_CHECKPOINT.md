@@ -1380,8 +1380,8 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - 新增完全独立、无签名身份参数的`cargo xtask verify-package --manifest ...`：schema-2重新做sidecar/archive/exact-shape/embedded manifest/逐文件hash与native CLI smoke；schema-3在同OS上进一步执行Windows SignTool verify或macOS codesign + stapler + spctl。cap00对真实clean unsigned artifact独立verify通过：schema=2、unsigned=true、ZIP SHA=`29697683...4268b`；
 - 默认unsigned non-regression：实现commit`0a257fd`上正常package仍为`schema=2 / unsigned=true / dirty=false`且JSON**完全无`signing`字段**，Windows clean ZIP SHA=`296976832ce2961c0a95548932d6a1a35526872409bf49688da5d41a9564268b`；同binary `--no-build`重包SHA完全一致；
 - cap00无凭据gate：Windows Kits SignTool被自动发现，标准RFC3161地址被接受后真实SignTool明确返回`No certificates were found that met all the given criteria.`；失败前后unsigned ZIP/build-tree exe hash不变且signed output files=0。收紧exact-shape后重复gate仍穿过preflight到达同一SignTool证书失败，证明合法artifact未被误挡；
-- `macos-3dv0`对exact commit `0a257fd` native `cargo check -p xtask --all-targets --locked` PASS、focused **10/10 PASS**；当前`security find-identity -p codesigning`为0 valid identities，`sign-package macos`对不存在Developer ID真实进入codesign并明确报`The specified item could not be found in the keychain.`，失败前后clean unsigned ZIP=`f0c1a5ee...3bc88`、release CLI=`74dc4b08...57101`均不变，signed output files=0；
-- 新增`docs/RELEASE_SIGNING.md`冻结secret/CI/签名/独立验签边界；最终本地focused **12/12 PASS**，`cargo fmt -- --check` PASS，`cargo check --workspace --all-targets --locked` PASS / 0 warnings，`cargo test --workspace --all-targets --locked` **251 passed / 0 failed / 6 ignored**。
+- signing实现commit `0a257fd`先在`macos-3dv0`完成native compile/no-identity gate；随后独立verifier + frozen exact-shape commit `0d17e4225e8d653601700609f7d5a75071b1ec45`再次clean投到同机，`cargo check -p xtask --all-targets --locked` PASS、focused **12/12 PASS**。`verify-package`对真实clean macOS schema-2 artifact独立通过（ZIP=`f0c1a5ee...3bc88`）；收紧shape后`sign-package macos`仍穿过preflight并在真实codesign处明确报`The specified item could not be found in the keychain.`，失败前后clean ZIP=`f0c1a5ee...3bc88`、release CLI=`74dc4b08...57101`均不变，signed output files=0；
+- 新增`docs/RELEASE_SIGNING.md`冻结secret/CI/签名/独立验签边界；V6b-3a最终本地focused **12/12 PASS**，`cargo fmt -- --check` PASS，`cargo check --workspace --all-targets --locked` PASS / 0 warnings，`cargo test --workspace --all-targets --locked` **251 passed / 0 failed / 6 ignored**。实现由`0a257fd build: add explicit release signing pipeline` + `0d17e42 build: add independent release verification`组成。
 
 ##### V6b-3b — Real credential acceptance
 
@@ -1446,13 +1446,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
+**Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Next gate：正式Windows Authenticode artifact + 正式macOS Developer ID/notarized artifact**
+**Parallel next implementation block：V7a — Linux `systemd --user`（不依赖签名凭据）**
 
-V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed与unsigned non-regression均已收口；现在没有未解决的签名代码/测试 blocker。V6b-3b唯一剩余条件是当前环境不存在的正式Windows private-key certificate与Apple Developer ID/notary profile。没有这些凭据时继续改签名逻辑只会制造无法验证的复杂度，因此不伪造acceptance；Distribution Studio signed-output/cache保持后置。
+V6b-3a的secret-free sign/verify pipeline、schema-3、exact frozen-layout gate、Windows/macOS无凭据fail-closed、native independent verify与unsigned non-regression均已收口；签名侧没有未解决的代码/测试 blocker。V6b-3b唯一剩余条件是当前环境不存在的正式Windows private-key certificate与Apple Developer ID/notary profile，因此保留为release acceptance pending而不伪造完成。服务runtime与签名凭据无耦合，下面可继续按V7既定顺序推进Linux `systemd --user`；Distribution Studio signed-output/cache仍后置到真实签名acceptance。
 
 ### Change log
+
+- **2026-09-04** — V6b-3a secret-free signing + independent verification baseline DONE：`0a257fd`新增clean schema-2→private staging→Windows Authenticode/macOS Developer ID+notary→schema-3的显式签名管线；`0d17e42`再补无私钥`verify-package`与frozen exact-file/mode gate，拒绝异常但自洽payload。Windows真实SignTool无证书与macOS真实codesign无Developer ID均fail closed且不改unsigned/build-tree bytes、不产出partial signed artifact；Windows/macOS clean schema-2均由独立verifier真机通过，unsigned路径保持schema2且重复ZIP deterministic。workspace **251/0/6**。V6b-3b只剩正式证书/Developer ID外部acceptance；并行进入V7a systemd user runtime。
 
 - **2026-09-04** — V6b-2 macOS bundle + Linux portable layout DONE：release manifest升级schema 2并逐文件hashnative layout；macOS新增feature-gated `.app` launcher、Info.plist、deterministic 7-chunk ICNS及short Unix socket适配，macos-3dv0系统反读/plutil/iconutil/Mach-O/launcher smoke全过；Linux新增`bin+share/applications+share/icons` portable tree，desktop入口统一GUI且`desktop-file-validate`零输出，EL8 native ELF/CLI/SVG smoke全过。实现commit `c407c05`后三平台clean ZIP：Windows=`fa11c96d...a6d9`、macOS=`f0c1a5ee...3bc88`、Linux=`41f70b83...61341`，sidecar均`dirty=false/unsigned=true/source_commit=c407c05...`；workspace **245/0/6**。下一块V6b-3 signing/notarization baseline。
 
