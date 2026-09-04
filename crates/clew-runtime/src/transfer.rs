@@ -988,7 +988,7 @@ async fn run_put_task(
                 .await?;
                 generation = recovered.0;
                 let recovered_status = recovered.1;
-                validate_status(&manifest, Some(&previous_descriptor), &recovered_status)?;
+                validate_recovered_status(&manifest, &previous_descriptor, &recovered_status)?;
                 match recovered_status.descriptor.confirmed_offset {
                     confirmed if confirmed == offset => {
                         status = send_chunk_on_generation(
@@ -997,7 +997,7 @@ async fn run_put_task(
                             generation,
                             chunk,
                             &manifest,
-                            &previous_descriptor,
+                            &recovered_status.descriptor,
                         )
                         .await?;
                     }
@@ -1055,7 +1055,7 @@ async fn run_put_task(
                 )
                 .await?;
                 generation = next_generation;
-                validate_status(&manifest, Some(&previous_descriptor), &recovered)?;
+                validate_recovered_status(&manifest, &previous_descriptor, &recovered)?;
                 status = if recovered.phase == FileTransferPhase::Completed {
                     recovered
                 } else if recovered.phase == FileTransferPhase::ReadyToFinalize {
@@ -1934,6 +1934,31 @@ fn validate_status(
         && descriptor != previous
     {
         descriptor.validate_successor_of(previous)?;
+    }
+    Ok(())
+}
+
+fn validate_recovered_status(
+    manifest: &FileTransferManifest,
+    previous: &FileResumeDescriptor,
+    status: &FileTransferStatus,
+) -> Result<(), ControllerFileTransferError> {
+    // A Host process restart can reconstruct the same durable checkpoint with a fresh local
+    // revision sequence. Across session generations, scope/hash/offset monotonicity is the
+    // authoritative proof; checkpoint_revision remains strict only within one Host process.
+    validate_status(manifest, None, status)?;
+    let descriptor = &status.descriptor;
+    if descriptor.confirmed_offset < previous.confirmed_offset {
+        return Err(ControllerFileTransferError::InvalidHostStatus(
+            "recovered Host offset regressed across process restart".into(),
+        ));
+    }
+    if descriptor.confirmed_offset == previous.confirmed_offset
+        && descriptor.confirmed_prefix_sha256 != previous.confirmed_prefix_sha256
+    {
+        return Err(ControllerFileTransferError::InvalidHostStatus(
+            "recovered Host prefix hash changed at the same offset".into(),
+        ));
     }
     Ok(())
 }

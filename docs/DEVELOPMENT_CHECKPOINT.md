@@ -1225,7 +1225,21 @@ V5 single-file双向 data plane至此封板。当前 resume仍只保证同进程
 - 真实cap00 Controller + Gamma Host进程重启gate：exact binary两端SHA-256 `005bb19323db6f6e8be0457b539fdd1eaa8d6197451559d56c228e74e62aa455`。16MiB/4KiB Get `0916fed4-7c71-4705-9c5b-b604005ee7da` 在CLI可见offset **2,838,528**时强杀Controller；磁盘part已durable到 **5,505,024**，真实命中“part领先journal”窗口；同state重启Controller后ControllerId不变、instance变化，原TransferId直接继续到 **12,480,512**，最终 **16,777,216/16,777,216 Completed**；Controller destination SHA-256 `080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e` 与Gamma source精确一致，part消失；
 - `cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **211 passed / 0 failed / 6 ignored**。Gamma/local smoke进程与fixture已清理。
 
-下一块 V5a-3c：Host process-restart durable put/get state。Controller端Put/Get现已能跨自身进程重启；Host端仍需持久化Put part/checkpoint与Get source identity/manifest，Host重启后同TransferId必须由Controller现有worker自动重新对齐并续传。两端均通过后再评估开启`Feature::FileResume`。
+### V5a-3c — Host process-restart durable put/get state
+
+**Status：DONE（2026-09-04）**
+
+- Host per-membership file-transfer store升级为Controller/Site/Device-bound双槽generation journal `host/file-transfers/state.{a,b}.json`，最多 **16 transfers**，仍受全局state document hard bound；newest slot损坏可回退，equal generation / wrong scope / duplicate TransferId / invalid manifest/checkpoint/private path均fail closed；
+- Controller→Device Put：journal持久化manifest、descriptor、private requested target与part path。Host restart时不信journal confirmed offset，而以part实际length为真值，要求regular non-symlink、同destination目录、≤total且位于deterministic chunk boundary/EOF，流式重算prefix SHA并重建descriptor；part领先journal是真实允许窗口，journal绝不能领先part；
+- Device→Controller Get：Host journal持久化TransferId + requested source binding + first manifest；restart后重新canonicalize/open source并流式重算size/final SHA，只有重建manifest与持久manifest完全一致才恢复同TransferId source handle；source missing/changed不恢复该binding，Controller V5a-3b exact-manifest re-proof随后会fail closed，绝不混合新旧source；
+- Host runtime在有StateLayout的长期membership路径改用`HostFileTransferService::load_or_create`；无layout focused/once路径保留纯内存service。durable service正常Drop会`keep()` active Put tempfile，hard-kill天然保留part；Begin/Cancel/Finalize都会journal化，chunk不每4KiB重写journal，因为`sync_data` part才是durable checkpoint事实；
+- independent crash review收紧atomic finalize窗口：Put Finalize先选定并journal化private `finalizing_path`，再atomic persist，最后写Completed journal。若Host在rename commit后、Completed journal前崩溃，restart只接受**这一条已journal路径**且regular-file size+full SHA与manifest完全匹配时恢复Completed；不扫描目录猜同hash文件。RenameIfExists候选被并发抢占时恢复part、清旧marker、journal rollback后重选；finalizing path还必须是requested target或同目录bounded rename candidate；
+- 真机首轮Host Put restart暴露跨进程checkpoint revision语义bug：Host part正确恢复到 **5,746,688 bytes**，但旧Controller descriptor revision=1404，而新Host重建revision=2，旧严格`validate_successor_of`导致Failed。现冻结规则：**同一Host进程**仍严格revision递增；跨session generation/Host restart用scope/total/final SHA不变 + offset不回退 + same-offset prefix SHA一致作re-proof，若需重发当前chunk则以恢复descriptor作为新进程revision基线；
+- exact final Windows binary两端SHA-256 `41e5a8dc0c90087aee4cad889912bf49c5b8ae6354190709fa10e6b86fa0f3b9`（99,204,608 bytes）。真实Put transfer `071ce7a5-899a-4d37-8005-642c736c3a95`：Controller可见offset **2,998,272** 时强杀Gamma Host，Gamma durable part实际已 **6,496,256**、target不存在、journal双槽在；同Host state重启后原TransferId直接继续到 **10,477,568**，最终 **16,777,216 Completed**，Gamma target SHA=`ac3777a30e326071393c06666ab7c5152ef3402bf2c42cc7411d02e6ce421b98` 与Controller source一致，part=0；
+- 真实Get transfer `eb6c7f7d-a023-4fb5-b3fe-9ca9e6941040`：generation **2** 下Controller可见offset **4,395,008** 时强杀Gamma Host；Controller local durable part继续到 **12,083,200** 并进入WaitingForReconnect，Gamma最新journal明确持同TransferId/get-source binding；同Host state重启后generation **3**，不重发`file get`，原TransferId直接完成 **16,777,216**；Controller destination SHA=`c5adb75f6a9a5a991eda7dbf64ed635cc63e6fda44315299a2151a71eb2cc329` 与Gamma source一致，Controller part消失。成功后的Host journal generation **8** 已无Get binding；generation7仅作为双槽历史fallback；
+- focused Host durability **2/2 PASS**（normal Put/Get service restart + crash-after-atomic-commit-before-Completed-journal），完整Host file-transfer **5/5 PASS**；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS、0 warnings；`cargo test --workspace --all-targets` **213 passed / 0 failed / 6 ignored**。两端真实smoke进程/fixture已清理。
+
+V5a-3 process-restart durability至此双端封板：Controller与Host都能在单文件Put/Get中保住同一TransferId与durable checkpoint。`Feature::FileResume`此刻仍保持reserved；下一块 V5a-3d 只做feature advertisement/negotiation与compatibility gate，确认旧peer/未实现peer不会误协商后才正式开启，不直接进入directory transfer。
 
 - block/chunk manifest；
 - hash/final verification；
@@ -1304,13 +1318,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；single-file put/get + generation resume + Controller restart durability DONE）**
+**Current block：V5 — File Plane（IN PROGRESS；single-file process-restart durability DONE）**
 
-**Next block：V5a-3c — Host process-restart durable put/get state**
+**Next block：V5a-3d — enable FileResume feature negotiation / compatibility gate**
 
-V4已在`dfa373d`完整封板。V5a双向single-file data plane与generation resume已闭合；V5a-3a/3b现在让Controller transfer journal、active Put以及Device→Controller Get private part/checkpoint都可跨Controller进程重启恢复。当前single-file durability只剩Host端：Put必须重开part/checkpoint，Get必须重证source identity/manifest并恢复同TransferId。Host gate闭合前`Feature::FileResume`继续reserved，不进入directory/multi-transfer调度。
+V4已在`dfa373d`完整封板。V5a-3a/3b/3c现已让Controller与Host两端的single-file Put/Get都可跨自身进程重启恢复：Controller durable journal/Get part、Host Put part/Get source binding以及finalize crash window均有focused与真实Gamma证据。当前single-file data/durability本身已闭合；下一块只把`Feature::FileResume`从reserved提升为真正implemented/negotiated capability，并冻结旧peer/unknown feature/wire-major compatibility。feature gate通过前仍不进入directory/multi-transfer调度。
 
 ### Change log
+
+- **2026-09-04** — V5a-3c Host process-restart durability DONE：Host新增per-membership Controller/Site/Device-bound双槽transfer journal，Put按part实际length+prefix SHA恢复、Get重开source并重证manifest；Finalize先journal private finalizing path再atomic commit，crash-after-commit只按该路径size/SHA恢复。真机首轮发现跨Host进程checkpoint revision reset会被旧strict successor拒绝，改为同进程strict revision、跨generation以scope/hash/offset re-proof。exact binary `41e5a8dc...0f3b9`；Put在Controller offset2,998,272/Host part6,496,256时hard-kill，原TransferId重启续到16MiB/SHA一致；Get generation2 offset4,395,008时hard-kill，Controller part12,083,200，Host重启generation3后原TransferId完成16MiB/SHA一致。workspace **213/0/6**。下一块V5a-3d FileResume feature negotiation；feature仍reserved。
 
 - **2026-09-04** — V5a-3b Controller Get process-restart durability DONE：Controller Get新增private durable part+首次manifest，chunk先sync part再推进offset；重启以part实际长度重建prefix checkpoint并重新GetBegin证明source manifest。真实16MiB gate在CLI offset 2,838,528时强杀Controller，而part已5,505,024；同state新Controller原TransferId续到Completed 16,777,216，final SHA与Gamma source一致、part清理；workspace **211/0/6**。下一块V5a-3c Host put/get process-restart durability；FileResume仍reserved。`8dfa8cf feat: resume controller gets after restart`。
 

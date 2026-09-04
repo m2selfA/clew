@@ -315,7 +315,7 @@ where
     F: Future<Output = ()>,
 {
     let (endpoint, service, shell_service, file_transfer_service) =
-        member_remote_config(membership)?;
+        member_remote_config(membership, layout)?;
     tokio::pin!(shutdown);
     let outer = tokio::select! {
         _ = &mut shutdown => return Ok(()),
@@ -351,7 +351,7 @@ pub async fn serve_networked_membership_once(
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
     let (endpoint, service, shell_service, file_transfer_service) =
-        member_remote_config(membership)?;
+        member_remote_config(membership, None)?;
     let outer = IrohOuter::bind().await?;
     serve_networked_membership_with_outer(
         membership,
@@ -370,7 +370,7 @@ pub async fn serve_networked_membership_once_with_layout(
     membership: &HostMembership,
 ) -> Result<(), HostRemoteError> {
     let (endpoint, service, shell_service, file_transfer_service) =
-        member_remote_config(membership)?;
+        member_remote_config(membership, Some(layout))?;
     let outer = IrohOuter::bind().await?;
     serve_networked_membership_with_outer(
         membership,
@@ -386,6 +386,7 @@ pub async fn serve_networked_membership_once_with_layout(
 
 fn member_remote_config(
     membership: &HostMembership,
+    layout: Option<&StateLayout>,
 ) -> Result<
     (
         EndpointAddr,
@@ -417,18 +418,29 @@ fn member_remote_config(
             .transpose()?;
         let can_get = grant.is_some_and(|grant| grant.read);
         let can_put = grant.is_some_and(|grant| grant.write);
-        let file_transfer_service = (can_get || can_put)
-            .then(|| {
-                HostFileTransferService::new(
+        let file_transfer_service = if can_get || can_put {
+            Some(match layout {
+                Some(layout) => HostFileTransferService::load_or_create(
                     policy.clone(),
                     membership.marker.controller.controller_id,
                     membership.marker.site_id,
                     membership.marker.device_id,
                     can_get,
                     can_put,
-                )
+                    layout,
+                )?,
+                None => HostFileTransferService::new(
+                    policy.clone(),
+                    membership.marker.controller.controller_id,
+                    membership.marker.site_id,
+                    membership.marker.device_id,
+                    can_get,
+                    can_put,
+                )?,
             })
-            .transpose()?;
+        } else {
+            None
+        };
         (
             Some(HostReadService::new(policy)?),
             shell_service,
@@ -1282,6 +1294,8 @@ pub enum HostRemoteError {
     FsMutation(#[from] clew_transport::FsMutationProtocolError),
     #[error(transparent)]
     FileTransfer(#[from] clew_transport::FileTransferError),
+    #[error(transparent)]
+    FileTransferState(#[from] crate::HostFileTransferStateError),
     #[error(transparent)]
     TcpForward(#[from] clew_transport::TcpForwardProtocolError),
     #[error(transparent)]

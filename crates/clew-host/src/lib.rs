@@ -15,7 +15,9 @@ mod site;
 mod ui;
 
 pub use clew_core::{DeviceSelectionError, select_executable_device};
-pub use file_transfer::{HARD_MAX_HOST_FILE_TRANSFERS, HostFileTransferService};
+pub use file_transfer::{
+    HARD_MAX_HOST_FILE_TRANSFERS, HostFileTransferService, HostFileTransferStateError,
+};
 pub use forward::HostTcpForwardService;
 pub use instance::{HostInstance, HostInstanceKey, HostInstanceStart, acquire_host_instance};
 pub use membership::{
