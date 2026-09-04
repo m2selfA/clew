@@ -25,8 +25,9 @@ pub use control::{ControlStoreError, ControllerControlSnapshot, ControllerContro
 pub use controller::{ControllerError, ControllerRuntime, ControllerStart, start_controller};
 pub use directory_transfer::{
     ControllerDirectoryTransferError, ControllerDirectoryTransferManager,
-    ControllerDirectoryTransferPhase, DirectoryGetInfo, DirectoryPutInfo, DirectoryTransferInfo,
-    HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS,
+    ControllerDirectoryTransferPhase, DirectoryActiveChild, DirectoryGetInfo, DirectoryPutInfo,
+    DirectoryTransferInfo, HARD_MAX_CONTROLLER_DIRECTORY_ACTIVE_CHILDREN,
+    HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS, HARD_MAX_DIRECTORY_CHILDREN_PER_TRANSFER,
 };
 pub use forward::{
     ForwardInfo, HARD_MAX_FORWARD_LISTENERS, TcpForwardManager, TcpForwardManagerError,

@@ -1305,13 +1305,18 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ### V5b-3 — Bounded multi-file concurrency
 
-**Status：TODO**
+**Status：DONE（2026-09-04） / V5 FILE PLANE DONE**
 
-- 只在V5b-2 durable outer journal之上增加有界并发，不改canonical manifest、whole-tree re-proof或atomic finalize语义；
-- 设计必须同时给出**per-directory window**与**Controller-wide child budget**，不能让最多8个outer task各自无界占用V5a hard-cap-16 single-file manager；
-- 并发child允许乱序完成后，不能继续把`completed_files`误当唯一事实来源。journal需要持久化bounded in-flight child集合/文件index，并只推进contiguous completed prefix；restart必须复用每个已保留child TransferId，Cancel必须覆盖全部in-flight child；
-- progress需聚合所有in-flight confirmed offsets且不重复计数；Local API/GUI若展示并发状态，应保持bounded projection，不泄露Controller-private path；
-- 先做deterministic window scheduler + restart/cancel tests，再做真实multi-file并发/断线/hard-kill gate；验证通过后才考虑目录Rename/Replace等更复杂conflict policy。
+- 并发模型冻结为**每个directory outer最多4个active child**、**单Controller所有directory outer合计最多8个未完成child**；继续保留V5a single-file manager hard cap 16。directory manager使用全局8-permit semaphore；single-file namespace暂满时outer做cancel-aware bounded wait，不把瞬时capacity误报为任务失败；
+- `DirectoryPutInfo/DirectoryGetInfo`新增Controller-private `active_children[]`：每项只记录bounded `file_index + relative_path + child TransferId + completed`。旧`current_relative_path/current_file_transfer_id`保留为**最老未完成/最前active child兼容投影**，因此现有Local API/CLI状态仍可读；peer manifest没有新增Controller-local path，也没有wire-version变化；
+- `completed_files`语义正式冻结为**contiguous completed prefix**。后面的child可以先完成并在journal中标`completed=true`，但prefix不能越过未完成gap；confirmed bytes按“已提交prefix + active窗口内已完成文件size + 未完成child confirmed offset”聚合，不重复计数。首child补齐后可以一次推进多个已完成ahead child；
+- scheduler在启动child前先durable reserve window中的TransferId；restart优先接管原single-file child journal，缺失时才用同一reserved ID补启动。pre-V5b-3旧journal若只有`current_*` pair，会在load时规范化为1项active window；新validator拒绝>4、重复TransferId、非连续file index、path/manifest错位、aggregate progress越界、first child已completed但prefix未推进等状态；
+- Cancel/Failure不再只处理兼容投影里的第一个child，而是覆盖全部active child；outer Cancel会让每个in-flight single-file child进入Cancelling/Cancelled，再执行既有Host directory staging cleanup。owner-dropped仍只停止旧worker并保留durable state，不和显式Cancel混淆；
+- focused directory suite **15/15 PASS**：包括Put/Get四child并发、后三个先完成但prefix不越gap、三outer竞争下Controller-wide incomplete child始终≤8、释放permit后才准入第9个child、四active child跨manager restart保留原IDs/completion flags、Cancel覆盖全部active child、legacy journal migration与bounded corruption validator；
+- final gates：`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets` PASS / **0 warnings**；`cargo test --workspace --all-targets` **239 passed / 0 failed / 6 ignored**；`git diff --check` PASS；
+- 真实Windows process hard-kill Put：12×4MiB=**50,331,648 bytes**，outer `67791c9e-8774-4aad-a4c3-70ea48dc434c`在`2,023,424` bytes、`0/12`、active window精确4项时强杀Controller PID 106484。Host foreground进程全程保持；replacement PID 27104加载后原outer与四个原child IDs全部存在并从各自约560KiB checkpoint继续，window依次滚动0..3→4..7→8..11且max active=4；最终`12/12`、48MiB完成，12文件SHA-256逐一一致；
+- 对称真实Get：outer `c76a5f54-b394-4369-84c9-f878446276af`在`4,943,872` bytes、`0/12`、4 active时强杀PID 27104；kill时final destination不存在，`.clew-dir-<outer>.part`与四个`.clew-<child>.part`均存在。replacement PID 4344保留同outer和四个原child IDs/约1.30MiB durable offsets，继续滚动三轮window至`12/12`；最终48MiB 12文件hash一致、atomic destination可见、private staging消失、Host始终online；
+- **V5至此封板**：single-file Put/Get + process-restart FileResume + bounded directory Put/Get + whole-tree re-proof/atomic finalize + bounded concurrency均完成。Directory conflict仍刻意只支持`FailIfExists`；Rename/Replace若将来有明确产品需求再单独设计，不作为V5完成条件。
 
 ## 13. V6 — Release Packaging
 
@@ -1383,13 +1388,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V5 — File Plane（IN PROGRESS；V5a single-file + V5b-0 contract + V5b-1a/1b serial Put/Get + V5b-2 Controller restart durability DONE）**
+**Current block：V5 — File Plane（DONE；V5a single-file + process-restart FileResume + V5b bounded directory Put/Get/restart/concurrency）**
 
-**Next block：V5b-3 — bounded multi-file concurrency**
+**Next block：V6 — Release Packaging（先收口 reproducible unsigned cross-platform artifact baseline，再进入平台签名/品牌化/Distribution Studio）**
 
-V4已在`dfa373d`完整封板。V5a single-file Put/Get/FileResume与V5b serial directory Put/Get都已闭合；V5b-2进一步让outer directory task本身跨Controller hard-kill/restart保持同一TransferId、canonical manifest、private staging/source binding、child IDs与已完成前缀，并通过真实16MiB双向hard-kill验证。下一步才允许在这个durable模型上引入bounded multi-file concurrency：必须先冻结per-directory window + Controller-wide child budget，并把journal从“单current child”升级为bounded in-flight set/contiguous prefix，不能为了吞吐牺牲restart/cancel/whole-tree atomicity。
+V4已在`dfa373d`完整封板，V5现在也完整封板。V5b-3在V5b-2 durable模型上冻结per-directory 4-child window + Controller-wide 8-child budget，journal可表达乱序completion但只推进contiguous prefix；multi-active restart/cancel与真实48MiB Put/Get Controller hard-kill均通过。下一阶段进入V6；第一步不碰需要外部证书/账号的签名门禁，先盘点现有CI/build/package面并建立Windows/macOS/Linux可复现unsigned artifact、版本/资源元数据、最小install/run smoke与release manifest/checksum基线，之后再分平台处理signing/notarization/branding。
 
 ### Change log
+
+- **2026-09-04** — V5b-3 bounded multi-file concurrency DONE / **V5 FILE PLANE DONE**：directory scheduler冻结per-outer **4** + Controller-wide incomplete child **8**，新增bounded `active_children` journal，允许乱序completion但只推进contiguous prefix；旧single-child journal可迁移，>4/重复ID/断裂index/progress越界fail closed；restart保留多child原IDs/flags，Cancel覆盖全部active child。focused directory **15/15**，workspace **239/0/6**，check 0 warnings。真实Windows 12×4MiB Put在2,023,424 bytes/0-of-12、4 active时hard-kill Controller，原outer/四child IDs续到48MiB/12-of-12并全hash一致；Get在4,943,872 bytes/0-of-12、4 active时hard-kill，四个local child parts保留并以原IDs续完48MiB/12-of-12，atomic destination/hash/staging cleanup均通过。V5封板，下一块V6 Release Packaging；directory Rename/Replace继续按既定scope deferred。
 
 - **2026-09-04** — V5b-2 directory-level Controller process-restart durability DONE：新增ControllerId-bound directory双槽journal，outer先durable reserve child TransferId再spawn，single-file manager支持caller-reserved ID；Put/Get restart均复用原outer/child ID并重新证明manifest/source/staging scope，Get持久化Host source-verified事实并覆盖atomic rename→Completed journal crash window；同时修复manager owner消失被误判Cancel而删staging。focused directory **9/9** + reserved-child **1/1**，workspace **233/0/6**。真实16MiB Put在12,689,408 bytes/1-of-2时hard-kill后原outer续完且hash一致；Get在1,646,592 bytes/0-of-2时hard-kill，private staging/child part保留，原outer续到2/2并atomic commit/hash一致。下一块V5b-3 bounded multi-file concurrency。
 

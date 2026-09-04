@@ -13,19 +13,22 @@ use clew_core::{
 };
 use clew_host::scan_directory_tree;
 use clew_transport::{
-    DirectoryConflictPolicy, DirectoryTreeEntryKind, DirectoryTreeGetScope, DirectoryTreeManifest,
-    DirectoryTreeReply, DirectoryTreeRequest, FileConflictPolicy, FileTransferDirection,
+    DirectoryConflictPolicy, DirectoryTreeEntry, DirectoryTreeEntryKind, DirectoryTreeGetScope,
+    DirectoryTreeManifest, DirectoryTreeReply, DirectoryTreeRequest, FileConflictPolicy,
+    FileTransferDirection,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::{
     ControllerFileTransferError, ControllerFileTransferManager, ControllerFileTransferPhase,
-    FileTransferInfo, RemoteHub, RemoteHubError,
+    FileGetInfo, FilePutInfo, FileTransferInfo, RemoteHub, RemoteHubError,
 };
 
 pub const HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS: usize = 8;
+pub const HARD_MAX_DIRECTORY_CHILDREN_PER_TRANSFER: usize = 4;
+pub const HARD_MAX_CONTROLLER_DIRECTORY_ACTIVE_CHILDREN: usize = 8;
 const CONTROLLER_DIRECTORY_TRANSFER_STATE_MAX_ENTRIES: usize =
     HARD_MAX_CONTROLLER_DIRECTORY_TRANSFERS;
 
@@ -50,6 +53,15 @@ impl ControllerDirectoryTransferPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryActiveChild {
+    pub file_index: u32,
+    pub relative_path: String,
+    pub transfer_id: TransferId,
+    #[serde(default)]
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryPutInfo {
     pub transfer_id: TransferId,
     pub device_id: DeviceId,
@@ -66,6 +78,8 @@ pub struct DirectoryPutInfo {
     pub total_files: u32,
     #[serde(default)]
     pub completed_files: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_children: Vec<DirectoryActiveChild>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_relative_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +107,8 @@ pub struct DirectoryGetInfo {
     pub total_files: u32,
     #[serde(default)]
     pub completed_files: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_children: Vec<DirectoryActiveChild>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_relative_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +170,7 @@ struct ControllerDirectoryTransferManagerInner {
     controller_id: ControllerId,
     transfers: Mutex<BTreeMap<TransferId, DirectoryTransferEntry>>,
     state_store: Option<ControllerDirectoryTransferStateStore>,
+    child_budget: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -351,6 +368,9 @@ impl ControllerDirectoryTransferManager {
                 controller_id,
                 transfers: Mutex::new(BTreeMap::new()),
                 state_store: None,
+                child_budget: Arc::new(Semaphore::new(
+                    HARD_MAX_CONTROLLER_DIRECTORY_ACTIVE_CHILDREN,
+                )),
             }),
         }
     }
@@ -370,6 +390,9 @@ impl ControllerDirectoryTransferManager {
                 controller_id,
                 transfers: Mutex::new(BTreeMap::new()),
                 state_store: Some(state_store),
+                child_budget: Arc::new(Semaphore::new(
+                    HARD_MAX_CONTROLLER_DIRECTORY_ACTIVE_CHILDREN,
+                )),
             }),
         };
         manager.restore_snapshot(snapshot)?;
@@ -405,6 +428,7 @@ impl ControllerDirectoryTransferManager {
             for record in snapshot.transfers {
                 let (cancel, cancel_rx) = watch::channel(false);
                 let mut info = record.info;
+                normalize_legacy_active_children(&mut info)?;
                 if info.phase() == ControllerDirectoryTransferPhase::Cancelling {
                     resume_cancels.push((
                         info.transfer_id(),
@@ -625,6 +649,7 @@ impl ControllerDirectoryTransferManager {
             confirmed_file_bytes: 0,
             total_files: 0,
             completed_files: 0,
+            active_children: Vec::new(),
             current_relative_path: None,
             current_file_transfer_id: None,
             final_device_root: None,
@@ -693,6 +718,7 @@ impl ControllerDirectoryTransferManager {
             confirmed_file_bytes: 0,
             total_files: 0,
             completed_files: 0,
+            active_children: Vec::new(),
             current_relative_path: None,
             current_file_transfer_id: None,
             final_destination_path: None,
@@ -784,6 +810,1077 @@ impl ControllerDirectoryTransferManager {
 enum DirectoryCancelWake {
     Requested,
     OwnerDropped,
+}
+
+#[derive(Debug)]
+enum DirectoryChildError {
+    Wake(DirectoryCancelWake),
+    Failed(String),
+}
+
+fn sync_put_current_projection(info: &mut DirectoryPutInfo) {
+    if let Some(child) = info.active_children.first() {
+        info.current_relative_path = Some(child.relative_path.clone());
+        info.current_file_transfer_id = Some(child.transfer_id);
+    } else {
+        info.current_relative_path = None;
+        info.current_file_transfer_id = None;
+    }
+}
+
+fn sync_get_current_projection(info: &mut DirectoryGetInfo) {
+    if let Some(child) = info.active_children.first() {
+        info.current_relative_path = Some(child.relative_path.clone());
+        info.current_file_transfer_id = Some(child.transfer_id);
+    } else {
+        info.current_relative_path = None;
+        info.current_file_transfer_id = None;
+    }
+}
+
+fn normalize_legacy_active_children(
+    info: &mut DirectoryTransferInfo,
+) -> Result<(), ControllerDirectoryTransferError> {
+    match info {
+        DirectoryTransferInfo::Put(info) => {
+            if info.active_children.is_empty() {
+                match (
+                    info.current_relative_path.as_ref(),
+                    info.current_file_transfer_id,
+                ) {
+                    (Some(relative_path), Some(transfer_id)) => {
+                        info.active_children.push(DirectoryActiveChild {
+                            file_index: info.completed_files,
+                            relative_path: relative_path.clone(),
+                            transfer_id,
+                            completed: false,
+                        });
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                            "legacy directory child projection is incomplete".into(),
+                        ));
+                    }
+                }
+            }
+            sync_put_current_projection(info);
+        }
+        DirectoryTransferInfo::Get(info) => {
+            if info.active_children.is_empty() {
+                match (
+                    info.current_relative_path.as_ref(),
+                    info.current_file_transfer_id,
+                ) {
+                    (Some(relative_path), Some(transfer_id)) => {
+                        info.active_children.push(DirectoryActiveChild {
+                            file_index: info.completed_files,
+                            relative_path: relative_path.clone(),
+                            transfer_id,
+                            completed: false,
+                        });
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                            "legacy directory child projection is incomplete".into(),
+                        ));
+                    }
+                }
+            }
+            sync_get_current_projection(info);
+        }
+    }
+    Ok(())
+}
+
+fn put_active_child_ids(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    transfer_id: TransferId,
+) -> Vec<TransferId> {
+    current_put_info(manager, transfer_id)
+        .map(|info| {
+            info.active_children
+                .into_iter()
+                .map(|child| child.transfer_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn get_active_child_ids(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    transfer_id: TransferId,
+) -> Vec<TransferId> {
+    current_get_info(manager, transfer_id)
+        .map(|info| {
+            info.active_children
+                .into_iter()
+                .map(|child| child.transfer_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn cancel_child_ids(file_transfers: &ControllerFileTransferManager, child_ids: &[TransferId]) {
+    for child_id in child_ids {
+        let _ = file_transfers.cancel(*child_id);
+    }
+}
+
+async fn acquire_directory_child_permit(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<OwnedSemaphorePermit, DirectoryCancelWake> {
+    let Some(manager) = manager.upgrade() else {
+        return Err(DirectoryCancelWake::OwnerDropped);
+    };
+    let budget = Arc::clone(&manager.child_budget);
+    drop(manager);
+    loop {
+        tokio::select! {
+            permit = Arc::clone(&budget).acquire_owned() => {
+                return permit.map_err(|_| DirectoryCancelWake::OwnerDropped);
+            }
+            changed = cancel.changed() => {
+                match changed {
+                    Ok(()) if *cancel.borrow() => return Err(DirectoryCancelWake::Requested),
+                    Ok(()) => {}
+                    Err(_) => return Err(DirectoryCancelWake::OwnerDropped),
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_file_transfer_capacity(
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), DirectoryCancelWake> {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => return Ok(()),
+            changed = cancel.changed() => {
+                match changed {
+                    Ok(()) if *cancel.borrow() => return Err(DirectoryCancelWake::Requested),
+                    Ok(()) => {}
+                    Err(_) => return Err(DirectoryCancelWake::OwnerDropped),
+                }
+            }
+        }
+    }
+}
+
+fn validate_put_child_scope(
+    info: &FilePutInfo,
+    device_id: DeviceId,
+    source_path: &str,
+    device_path: &str,
+    chunk_size: u32,
+) -> Result<(), DirectoryChildError> {
+    if info.device_id != device_id
+        || info.source_path != source_path
+        || info.device_path != device_path
+        || info.chunk_size != chunk_size
+    {
+        return Err(DirectoryChildError::Failed(
+            "persisted directory child Put changed transfer scope".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_get_child_scope(
+    info: &FileGetInfo,
+    device_id: DeviceId,
+    device_path: &str,
+    destination_path: &str,
+    chunk_size: u32,
+) -> Result<(), DirectoryChildError> {
+    if info.device_id != device_id
+        || info.device_path != device_path
+        || info.destination_path != destination_path
+        || info.chunk_size != chunk_size
+    {
+        return Err(DirectoryChildError::Failed(
+            "persisted directory child Get changed transfer scope".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_put_child_started(
+    file_transfers: &ControllerFileTransferManager,
+    child_id: TransferId,
+    device_id: DeviceId,
+    site_id: SiteId,
+    source_path: &str,
+    device_path: &str,
+    chunk_size: u32,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<FilePutInfo, DirectoryChildError> {
+    loop {
+        match file_transfers.status(child_id) {
+            Ok(FileTransferInfo::Put(info)) => {
+                validate_put_child_scope(&info, device_id, source_path, device_path, chunk_size)?;
+                return Ok(info);
+            }
+            Ok(FileTransferInfo::Get(_)) => {
+                return Err(DirectoryChildError::Failed(
+                    "persisted directory child transfer direction changed".into(),
+                ));
+            }
+            Err(ControllerFileTransferError::NotFound(_)) => {
+                match file_transfers.start_put_with_transfer_id(
+                    child_id,
+                    device_id,
+                    site_id,
+                    source_path.to_owned(),
+                    device_path.to_owned(),
+                    chunk_size,
+                    FileConflictPolicy::FailIfExists,
+                ) {
+                    Ok(info) => return Ok(info),
+                    Err(ControllerFileTransferError::Capacity) => {
+                        wait_for_file_transfer_capacity(cancel)
+                            .await
+                            .map_err(DirectoryChildError::Wake)?;
+                    }
+                    Err(ControllerFileTransferError::TransferIdConflict(_)) => continue,
+                    Err(error) => return Err(DirectoryChildError::Failed(error.to_string())),
+                }
+            }
+            Err(error) => return Err(DirectoryChildError::Failed(error.to_string())),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_get_child_started(
+    file_transfers: &ControllerFileTransferManager,
+    child_id: TransferId,
+    device_id: DeviceId,
+    site_id: SiteId,
+    device_path: &str,
+    destination_path: &str,
+    chunk_size: u32,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<FileGetInfo, DirectoryChildError> {
+    loop {
+        match file_transfers.status(child_id) {
+            Ok(FileTransferInfo::Get(info)) => {
+                validate_get_child_scope(
+                    &info,
+                    device_id,
+                    device_path,
+                    destination_path,
+                    chunk_size,
+                )?;
+                return Ok(info);
+            }
+            Ok(FileTransferInfo::Put(_)) => {
+                return Err(DirectoryChildError::Failed(
+                    "persisted directory child transfer direction changed".into(),
+                ));
+            }
+            Err(ControllerFileTransferError::NotFound(_)) => {
+                match file_transfers.start_get_with_transfer_id(
+                    child_id,
+                    device_id,
+                    site_id,
+                    device_path.to_owned(),
+                    destination_path.to_owned(),
+                    chunk_size,
+                    FileConflictPolicy::FailIfExists,
+                ) {
+                    Ok(info) => return Ok(info),
+                    Err(ControllerFileTransferError::Capacity) => {
+                        wait_for_file_transfer_capacity(cancel)
+                            .await
+                            .map_err(DirectoryChildError::Wake)?;
+                    }
+                    Err(ControllerFileTransferError::TransferIdConflict(_)) => continue,
+                    Err(error) => return Err(DirectoryChildError::Failed(error.to_string())),
+                }
+            }
+            Err(error) => return Err(DirectoryChildError::Failed(error.to_string())),
+        }
+    }
+}
+
+async fn cancel_put_window(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    remote: &RemoteHub,
+    file_transfers: &ControllerFileTransferManager,
+    transfer_id: TransferId,
+    device_id: DeviceId,
+    manifest: &DirectoryTreeManifest,
+) {
+    let child_ids = put_active_child_ids(manager, transfer_id);
+    cancel_child_ids(file_transfers, &child_ids);
+    cancel_remote_directory(remote, device_id, manifest).await;
+    set_cancelled(manager, transfer_id);
+    persist_directory_manager_state_or_warn(manager, transfer_id);
+}
+
+async fn fail_put_window(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    remote: &RemoteHub,
+    file_transfers: &ControllerFileTransferManager,
+    transfer_id: TransferId,
+    device_id: DeviceId,
+    manifest: &DirectoryTreeManifest,
+    error: String,
+) {
+    let child_ids = put_active_child_ids(manager, transfer_id);
+    cancel_child_ids(file_transfers, &child_ids);
+    cancel_remote_directory(remote, device_id, manifest).await;
+    set_failed(manager, transfer_id, error);
+    persist_directory_manager_state_or_warn(manager, transfer_id);
+}
+
+fn cancel_get_window(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    file_transfers: &ControllerFileTransferManager,
+    transfer_id: TransferId,
+    staging_root: &Path,
+) {
+    let child_ids = get_active_child_ids(manager, transfer_id);
+    cancel_child_ids(file_transfers, &child_ids);
+    cleanup_local_directory(staging_root);
+    set_get_cancelled(manager, transfer_id);
+    persist_directory_manager_state_or_warn(manager, transfer_id);
+}
+
+fn fail_get_window(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    file_transfers: &ControllerFileTransferManager,
+    transfer_id: TransferId,
+    staging_root: &Path,
+    error: String,
+) {
+    let child_ids = get_active_child_ids(manager, transfer_id);
+    cancel_child_ids(file_transfers, &child_ids);
+    cleanup_local_directory(staging_root);
+    set_get_failed(manager, transfer_id, error);
+    persist_directory_manager_state_or_warn(manager, transfer_id);
+}
+
+fn file_entry_at<'a>(
+    files: &'a [&'a DirectoryTreeEntry],
+    file_index: u32,
+) -> Result<&'a DirectoryTreeEntry, DirectoryChildError> {
+    files.get(file_index as usize).copied().ok_or_else(|| {
+        DirectoryChildError::Failed("directory child index exceeds the manifest file set".into())
+    })
+}
+
+fn advance_put_window_state(
+    info: &mut DirectoryPutInfo,
+    files: &[&DirectoryTreeEntry],
+    completed_ids: &BTreeSet<TransferId>,
+    offsets: &BTreeMap<TransferId, u64>,
+) -> Result<bool, ControllerDirectoryTransferError> {
+    let mut structural = false;
+    for child in &mut info.active_children {
+        if !child.completed && completed_ids.contains(&child.transfer_id) {
+            child.completed = true;
+            structural = true;
+        }
+    }
+    while info
+        .active_children
+        .first()
+        .is_some_and(|child| child.file_index == info.completed_files && child.completed)
+    {
+        info.active_children.remove(0);
+        info.completed_files = info.completed_files.saturating_add(1);
+        structural = true;
+    }
+    let mut confirmed: u64 = files
+        .iter()
+        .take(info.completed_files as usize)
+        .map(|entry| entry.size)
+        .sum();
+    for child in &info.active_children {
+        let entry = files.get(child.file_index as usize).ok_or_else(|| {
+            ControllerDirectoryTransferError::InvalidPersistedState(
+                "directory active child index exceeds manifest".into(),
+            )
+        })?;
+        confirmed = confirmed.saturating_add(if child.completed {
+            entry.size
+        } else {
+            offsets
+                .get(&child.transfer_id)
+                .copied()
+                .unwrap_or(0)
+                .min(entry.size)
+        });
+    }
+    info.confirmed_file_bytes = confirmed.min(info.total_file_bytes);
+    sync_put_current_projection(info);
+    Ok(structural)
+}
+
+fn advance_get_window_state(
+    info: &mut DirectoryGetInfo,
+    files: &[&DirectoryTreeEntry],
+    completed_ids: &BTreeSet<TransferId>,
+    offsets: &BTreeMap<TransferId, u64>,
+) -> Result<bool, ControllerDirectoryTransferError> {
+    let mut structural = false;
+    for child in &mut info.active_children {
+        if !child.completed && completed_ids.contains(&child.transfer_id) {
+            child.completed = true;
+            structural = true;
+        }
+    }
+    while info
+        .active_children
+        .first()
+        .is_some_and(|child| child.file_index == info.completed_files && child.completed)
+    {
+        info.active_children.remove(0);
+        info.completed_files = info.completed_files.saturating_add(1);
+        structural = true;
+    }
+    let mut confirmed: u64 = files
+        .iter()
+        .take(info.completed_files as usize)
+        .map(|entry| entry.size)
+        .sum();
+    for child in &info.active_children {
+        let entry = files.get(child.file_index as usize).ok_or_else(|| {
+            ControllerDirectoryTransferError::InvalidPersistedState(
+                "directory active child index exceeds manifest".into(),
+            )
+        })?;
+        confirmed = confirmed.saturating_add(if child.completed {
+            entry.size
+        } else {
+            offsets
+                .get(&child.transfer_id)
+                .copied()
+                .unwrap_or(0)
+                .min(entry.size)
+        });
+    }
+    info.confirmed_file_bytes = confirmed.min(info.total_file_bytes);
+    sync_get_current_projection(info);
+    Ok(structural)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_put_child_window(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    remote: &RemoteHub,
+    file_transfers: &ControllerFileTransferManager,
+    transfer_id: TransferId,
+    device_id: DeviceId,
+    site_id: SiteId,
+    manifest: &DirectoryTreeManifest,
+    files: &[&DirectoryTreeEntry],
+    canonical_root: &Path,
+    staging_root: &str,
+    chunk_size: u32,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    let mut permits: BTreeMap<TransferId, OwnedSemaphorePermit> = BTreeMap::new();
+    loop {
+        if *cancel.borrow() {
+            cancel_put_window(
+                manager,
+                remote,
+                file_transfers,
+                transfer_id,
+                device_id,
+                manifest,
+            )
+            .await;
+            return false;
+        }
+        let mut outer = match current_put_info(manager, transfer_id) {
+            Ok(info) => info,
+            Err(error) => {
+                fail_put_window(
+                    manager,
+                    remote,
+                    file_transfers,
+                    transfer_id,
+                    device_id,
+                    manifest,
+                    error.to_string(),
+                )
+                .await;
+                return false;
+            }
+        };
+        if outer.completed_files == files.len() as u32 && outer.active_children.is_empty() {
+            return true;
+        }
+
+        while outer.active_children.len() < HARD_MAX_DIRECTORY_CHILDREN_PER_TRANSFER {
+            let next_index = outer
+                .active_children
+                .last()
+                .map_or(outer.completed_files, |child| {
+                    child.file_index.saturating_add(1)
+                });
+            if next_index >= files.len() as u32 {
+                break;
+            }
+            let permit = match acquire_directory_child_permit(manager, cancel).await {
+                Ok(permit) => permit,
+                Err(DirectoryCancelWake::OwnerDropped) => return false,
+                Err(DirectoryCancelWake::Requested) => {
+                    cancel_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                    )
+                    .await;
+                    return false;
+                }
+            };
+            if *cancel.borrow() {
+                drop(permit);
+                cancel_put_window(
+                    manager,
+                    remote,
+                    file_transfers,
+                    transfer_id,
+                    device_id,
+                    manifest,
+                )
+                .await;
+                return false;
+            }
+            let entry = match file_entry_at(files, next_index) {
+                Ok(entry) => entry,
+                Err(DirectoryChildError::Failed(error)) => {
+                    drop(permit);
+                    fail_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                        error,
+                    )
+                    .await;
+                    return false;
+                }
+                Err(DirectoryChildError::Wake(_)) => unreachable!(),
+            };
+            let child_id = TransferId::new();
+            update_info(manager, transfer_id, |info| {
+                info.active_children.push(DirectoryActiveChild {
+                    file_index: next_index,
+                    relative_path: entry.relative_path.clone(),
+                    transfer_id: child_id,
+                    completed: false,
+                });
+                sync_put_current_projection(info);
+            });
+            if let Err(error) = persist_directory_manager_state(manager) {
+                drop(permit);
+                fail_put_window(
+                    manager,
+                    remote,
+                    file_transfers,
+                    transfer_id,
+                    device_id,
+                    manifest,
+                    error.to_string(),
+                )
+                .await;
+                return false;
+            }
+            permits.insert(child_id, permit);
+            outer = match current_put_info(manager, transfer_id) {
+                Ok(info) => info,
+                Err(error) => {
+                    fail_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                        error.to_string(),
+                    )
+                    .await;
+                    return false;
+                }
+            };
+        }
+
+        let active = outer.active_children.clone();
+        let mut completed_ids = BTreeSet::new();
+        let mut offsets = BTreeMap::new();
+        for child in &active {
+            let entry = match file_entry_at(files, child.file_index) {
+                Ok(entry) => entry,
+                Err(DirectoryChildError::Failed(error)) => {
+                    fail_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                        error,
+                    )
+                    .await;
+                    return false;
+                }
+                Err(DirectoryChildError::Wake(_)) => unreachable!(),
+            };
+            if child.completed {
+                offsets.insert(child.transfer_id, entry.size);
+                continue;
+            }
+            if !permits.contains_key(&child.transfer_id) {
+                let permit = match acquire_directory_child_permit(manager, cancel).await {
+                    Ok(permit) => permit,
+                    Err(DirectoryCancelWake::OwnerDropped) => return false,
+                    Err(DirectoryCancelWake::Requested) => {
+                        cancel_put_window(
+                            manager,
+                            remote,
+                            file_transfers,
+                            transfer_id,
+                            device_id,
+                            manifest,
+                        )
+                        .await;
+                        return false;
+                    }
+                };
+                permits.insert(child.transfer_id, permit);
+            }
+            let local_path = join_relative(canonical_root, &entry.relative_path);
+            let Some(local_path) = local_path.to_str() else {
+                fail_put_window(
+                    manager,
+                    remote,
+                    file_transfers,
+                    transfer_id,
+                    device_id,
+                    manifest,
+                    "Controller source path is not valid UTF-8".into(),
+                )
+                .await;
+                return false;
+            };
+            let device_path = join_device_relative(staging_root, &entry.relative_path);
+            let info = match ensure_put_child_started(
+                file_transfers,
+                child.transfer_id,
+                device_id,
+                site_id,
+                local_path,
+                &device_path,
+                chunk_size,
+                cancel,
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(DirectoryChildError::Wake(DirectoryCancelWake::OwnerDropped)) => return false,
+                Err(DirectoryChildError::Wake(DirectoryCancelWake::Requested)) => {
+                    cancel_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                    )
+                    .await;
+                    return false;
+                }
+                Err(DirectoryChildError::Failed(error)) => {
+                    fail_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                        error,
+                    )
+                    .await;
+                    return false;
+                }
+            };
+            offsets.insert(child.transfer_id, info.confirmed_offset.min(entry.size));
+            match info.phase {
+                ControllerFileTransferPhase::Completed => {
+                    completed_ids.insert(child.transfer_id);
+                    permits.remove(&child.transfer_id);
+                }
+                ControllerFileTransferPhase::Failed => {
+                    fail_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                        info.error.unwrap_or_else(|| "child file Put failed".into()),
+                    )
+                    .await;
+                    return false;
+                }
+                ControllerFileTransferPhase::Cancelled => {
+                    cancel_put_window(
+                        manager,
+                        remote,
+                        file_transfers,
+                        transfer_id,
+                        device_id,
+                        manifest,
+                    )
+                    .await;
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        let mut structural = false;
+        let mut state_error = None;
+        update_info(manager, transfer_id, |info| match advance_put_window_state(
+            info,
+            files,
+            &completed_ids,
+            &offsets,
+        ) {
+            Ok(changed) => structural = changed,
+            Err(error) => state_error = Some(error.to_string()),
+        });
+        if let Some(error) = state_error {
+            fail_put_window(
+                manager,
+                remote,
+                file_transfers,
+                transfer_id,
+                device_id,
+                manifest,
+                error,
+            )
+            .await;
+            return false;
+        }
+        if structural && let Err(error) = persist_directory_manager_state(manager) {
+            fail_put_window(
+                manager,
+                remote,
+                file_transfers,
+                transfer_id,
+                device_id,
+                manifest,
+                error.to_string(),
+            )
+            .await;
+            return false;
+        }
+
+        let outer = match current_put_info(manager, transfer_id) {
+            Ok(info) => info,
+            Err(error) => {
+                fail_put_window(
+                    manager,
+                    remote,
+                    file_transfers,
+                    transfer_id,
+                    device_id,
+                    manifest,
+                    error.to_string(),
+                )
+                .await;
+                return false;
+            }
+        };
+        if outer.completed_files == files.len() as u32 && outer.active_children.is_empty() {
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            changed = cancel.changed() => {
+                match changed {
+                    Ok(()) if *cancel.borrow() => {
+                        cancel_put_window(
+                            manager,
+                            remote,
+                            file_transfers,
+                            transfer_id,
+                            device_id,
+                            manifest,
+                        ).await;
+                        return false;
+                    }
+                    Ok(()) => {}
+                    Err(_) => return false,
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_get_child_window(
+    manager: &Weak<ControllerDirectoryTransferManagerInner>,
+    file_transfers: &ControllerFileTransferManager,
+    transfer_id: TransferId,
+    device_id: DeviceId,
+    site_id: SiteId,
+    manifest: &DirectoryTreeManifest,
+    files: &[&DirectoryTreeEntry],
+    staging_root: &Path,
+    chunk_size: u32,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    let mut permits: BTreeMap<TransferId, OwnedSemaphorePermit> = BTreeMap::new();
+    loop {
+        if *cancel.borrow() {
+            cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+            return false;
+        }
+        let mut outer = match current_get_info(manager, transfer_id) {
+            Ok(info) => info,
+            Err(error) => {
+                fail_get_window(
+                    manager,
+                    file_transfers,
+                    transfer_id,
+                    staging_root,
+                    error.to_string(),
+                );
+                return false;
+            }
+        };
+        if outer.completed_files == files.len() as u32 && outer.active_children.is_empty() {
+            return true;
+        }
+
+        while outer.active_children.len() < HARD_MAX_DIRECTORY_CHILDREN_PER_TRANSFER {
+            let next_index = outer
+                .active_children
+                .last()
+                .map_or(outer.completed_files, |child| {
+                    child.file_index.saturating_add(1)
+                });
+            if next_index >= files.len() as u32 {
+                break;
+            }
+            let permit = match acquire_directory_child_permit(manager, cancel).await {
+                Ok(permit) => permit,
+                Err(DirectoryCancelWake::OwnerDropped) => return false,
+                Err(DirectoryCancelWake::Requested) => {
+                    cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+                    return false;
+                }
+            };
+            if *cancel.borrow() {
+                drop(permit);
+                cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+                return false;
+            }
+            let entry = match file_entry_at(files, next_index) {
+                Ok(entry) => entry,
+                Err(DirectoryChildError::Failed(error)) => {
+                    drop(permit);
+                    fail_get_window(manager, file_transfers, transfer_id, staging_root, error);
+                    return false;
+                }
+                Err(DirectoryChildError::Wake(_)) => unreachable!(),
+            };
+            let child_id = TransferId::new();
+            update_get_info(manager, transfer_id, |info| {
+                info.active_children.push(DirectoryActiveChild {
+                    file_index: next_index,
+                    relative_path: entry.relative_path.clone(),
+                    transfer_id: child_id,
+                    completed: false,
+                });
+                sync_get_current_projection(info);
+            });
+            if let Err(error) = persist_directory_manager_state(manager) {
+                drop(permit);
+                fail_get_window(
+                    manager,
+                    file_transfers,
+                    transfer_id,
+                    staging_root,
+                    error.to_string(),
+                );
+                return false;
+            }
+            permits.insert(child_id, permit);
+            outer = match current_get_info(manager, transfer_id) {
+                Ok(info) => info,
+                Err(error) => {
+                    fail_get_window(
+                        manager,
+                        file_transfers,
+                        transfer_id,
+                        staging_root,
+                        error.to_string(),
+                    );
+                    return false;
+                }
+            };
+        }
+
+        let active = outer.active_children.clone();
+        let mut completed_ids = BTreeSet::new();
+        let mut offsets = BTreeMap::new();
+        for child in &active {
+            let entry = match file_entry_at(files, child.file_index) {
+                Ok(entry) => entry,
+                Err(DirectoryChildError::Failed(error)) => {
+                    fail_get_window(manager, file_transfers, transfer_id, staging_root, error);
+                    return false;
+                }
+                Err(DirectoryChildError::Wake(_)) => unreachable!(),
+            };
+            if child.completed {
+                offsets.insert(child.transfer_id, entry.size);
+                continue;
+            }
+            if !permits.contains_key(&child.transfer_id) {
+                let permit = match acquire_directory_child_permit(manager, cancel).await {
+                    Ok(permit) => permit,
+                    Err(DirectoryCancelWake::OwnerDropped) => return false,
+                    Err(DirectoryCancelWake::Requested) => {
+                        cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+                        return false;
+                    }
+                };
+                permits.insert(child.transfer_id, permit);
+            }
+            let device_path = join_device_relative(&manifest.device_root, &entry.relative_path);
+            let local_path = join_relative(staging_root, &entry.relative_path);
+            let Some(local_path) = local_path.to_str() else {
+                fail_get_window(
+                    manager,
+                    file_transfers,
+                    transfer_id,
+                    staging_root,
+                    "Controller directory staging path is not valid UTF-8".into(),
+                );
+                return false;
+            };
+            let info = match ensure_get_child_started(
+                file_transfers,
+                child.transfer_id,
+                device_id,
+                site_id,
+                &device_path,
+                local_path,
+                chunk_size,
+                cancel,
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(DirectoryChildError::Wake(DirectoryCancelWake::OwnerDropped)) => return false,
+                Err(DirectoryChildError::Wake(DirectoryCancelWake::Requested)) => {
+                    cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+                    return false;
+                }
+                Err(DirectoryChildError::Failed(error)) => {
+                    fail_get_window(manager, file_transfers, transfer_id, staging_root, error);
+                    return false;
+                }
+            };
+            offsets.insert(child.transfer_id, info.confirmed_offset.min(entry.size));
+            match info.phase {
+                ControllerFileTransferPhase::Completed => {
+                    completed_ids.insert(child.transfer_id);
+                    permits.remove(&child.transfer_id);
+                }
+                ControllerFileTransferPhase::Failed => {
+                    fail_get_window(
+                        manager,
+                        file_transfers,
+                        transfer_id,
+                        staging_root,
+                        info.error.unwrap_or_else(|| "child file Get failed".into()),
+                    );
+                    return false;
+                }
+                ControllerFileTransferPhase::Cancelled => {
+                    cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        let mut structural = false;
+        let mut state_error = None;
+        update_get_info(manager, transfer_id, |info| match advance_get_window_state(
+            info,
+            files,
+            &completed_ids,
+            &offsets,
+        ) {
+            Ok(changed) => structural = changed,
+            Err(error) => state_error = Some(error.to_string()),
+        });
+        if let Some(error) = state_error {
+            fail_get_window(manager, file_transfers, transfer_id, staging_root, error);
+            return false;
+        }
+        if structural && let Err(error) = persist_directory_manager_state(manager) {
+            fail_get_window(
+                manager,
+                file_transfers,
+                transfer_id,
+                staging_root,
+                error.to_string(),
+            );
+            return false;
+        }
+
+        let outer = match current_get_info(manager, transfer_id) {
+            Ok(info) => info,
+            Err(error) => {
+                fail_get_window(
+                    manager,
+                    file_transfers,
+                    transfer_id,
+                    staging_root,
+                    error.to_string(),
+                );
+                return false;
+            }
+        };
+        if outer.completed_files == files.len() as u32 && outer.active_children.is_empty() {
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            changed = cancel.changed() => {
+                match changed {
+                    Ok(()) if *cancel.borrow() => {
+                        cancel_get_window(manager, file_transfers, transfer_id, staging_root);
+                        return false;
+                    }
+                    Ok(()) => {}
+                    Err(_) => return false,
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -939,8 +2036,8 @@ async fn run_directory_put(
                 info.phase = ControllerDirectoryTransferPhase::Completed;
                 info.confirmed_file_bytes = info.total_file_bytes;
                 info.completed_files = info.total_files;
-                info.current_relative_path = None;
-                info.current_file_transfer_id = None;
+                info.active_children.clear();
+                sync_put_current_projection(info);
                 info.final_device_root = Some(final_device_root);
                 info.error = None;
             });
@@ -982,7 +2079,7 @@ async fn run_directory_put(
         );
         return;
     }
-    let mut completed_bytes: u64 = files
+    let completed_prefix_bytes: u64 = files
         .iter()
         .take(initial_info.completed_files as usize)
         .map(|entry| entry.size)
@@ -1018,35 +2115,18 @@ async fn run_directory_put(
     if initial_info.completed_files < files.len() as u32 {
         update_info(&manager, transfer_id, |info| {
             info.phase = ControllerDirectoryTransferPhase::Running;
-            if info.current_file_transfer_id.is_none() {
-                info.confirmed_file_bytes = completed_bytes;
+            if info.active_children.is_empty() {
+                info.confirmed_file_bytes = completed_prefix_bytes;
             }
             info.error = None;
+            sync_put_current_projection(info);
         });
         if let Err(error) = persist_directory_manager_state(&manager) {
             cancel_remote_directory(&remote, device_id, &manifest).await;
             set_failed(&manager, transfer_id, error.to_string());
             return;
         }
-    }
-
-    for (file_index, entry) in files
-        .iter()
-        .enumerate()
-        .skip(initial_info.completed_files as usize)
-    {
-        if *cancel.borrow() {
-            if let Ok(info) = current_put_info(&manager, transfer_id)
-                && let Some(child_id) = info.current_file_transfer_id
-            {
-                let _ = file_transfers.cancel(child_id);
-            }
-            cancel_remote_directory(&remote, device_id, &manifest).await;
-            set_cancelled(&manager, transfer_id);
-            persist_directory_manager_state_or_warn(&manager, transfer_id);
-            return;
-        }
-        let Some(canonical_root) = canonical_root.as_ref() else {
+        let Some(canonical_root) = canonical_root.as_deref() else {
             cancel_remote_directory(&remote, device_id, &manifest).await;
             set_failed(
                 &manager,
@@ -1055,184 +2135,23 @@ async fn run_directory_put(
             );
             return;
         };
-        let local_path = join_relative(canonical_root, &entry.relative_path);
-        let Some(local_path) = local_path.to_str().map(str::to_owned) else {
-            cancel_remote_directory(&remote, device_id, &manifest).await;
-            set_failed(
-                &manager,
-                transfer_id,
-                "Controller source path is not valid UTF-8".into(),
-            );
+        if !run_put_child_window(
+            &manager,
+            &remote,
+            &file_transfers,
+            transfer_id,
+            device_id,
+            site_id,
+            &manifest,
+            &files,
+            canonical_root,
+            &staging_root,
+            chunk_size,
+            &mut cancel,
+        )
+        .await
+        {
             return;
-        };
-        let device_path = join_device_relative(&staging_root, &entry.relative_path);
-        let outer = match current_put_info(&manager, transfer_id) {
-            Ok(info) => info,
-            Err(error) => {
-                cancel_remote_directory(&remote, device_id, &manifest).await;
-                set_failed(&manager, transfer_id, error.to_string());
-                return;
-            }
-        };
-        let child_id = match (
-            outer.current_relative_path.as_deref(),
-            outer.current_file_transfer_id,
-        ) {
-            (Some(relative), Some(child_id)) if relative == entry.relative_path => child_id,
-            (None, None) => {
-                let child_id = TransferId::new();
-                update_info(&manager, transfer_id, |info| {
-                    info.current_relative_path = Some(entry.relative_path.clone());
-                    info.current_file_transfer_id = Some(child_id);
-                    info.confirmed_file_bytes = completed_bytes;
-                });
-                if let Err(error) = persist_directory_manager_state(&manager) {
-                    cancel_remote_directory(&remote, device_id, &manifest).await;
-                    set_failed(&manager, transfer_id, error.to_string());
-                    return;
-                }
-                child_id
-            }
-            _ => {
-                cancel_remote_directory(&remote, device_id, &manifest).await;
-                set_failed(
-                    &manager,
-                    transfer_id,
-                    "persisted directory child does not match the next manifest file".into(),
-                );
-                return;
-            }
-        };
-        let child = match file_transfers.status(child_id) {
-            Ok(FileTransferInfo::Put(info)) => {
-                if info.device_id != device_id
-                    || info.source_path != local_path
-                    || info.device_path != device_path
-                    || info.chunk_size != chunk_size
-                {
-                    cancel_remote_directory(&remote, device_id, &manifest).await;
-                    set_failed(
-                        &manager,
-                        transfer_id,
-                        "persisted directory child Put changed transfer scope".into(),
-                    );
-                    return;
-                }
-                info
-            }
-            Ok(FileTransferInfo::Get(_)) => {
-                cancel_remote_directory(&remote, device_id, &manifest).await;
-                set_failed(
-                    &manager,
-                    transfer_id,
-                    "persisted directory child transfer direction changed".into(),
-                );
-                return;
-            }
-            Err(ControllerFileTransferError::NotFound(_)) => {
-                match file_transfers.start_put_with_transfer_id(
-                    child_id,
-                    device_id,
-                    site_id,
-                    local_path,
-                    device_path,
-                    chunk_size,
-                    FileConflictPolicy::FailIfExists,
-                ) {
-                    Ok(info) => info,
-                    Err(error) => {
-                        cancel_remote_directory(&remote, device_id, &manifest).await;
-                        set_failed(&manager, transfer_id, error.to_string());
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                cancel_remote_directory(&remote, device_id, &manifest).await;
-                set_failed(&manager, transfer_id, error.to_string());
-                return;
-            }
-        };
-
-        loop {
-            if *cancel.borrow() {
-                let _ = file_transfers.cancel(child_id);
-                cancel_remote_directory(&remote, device_id, &manifest).await;
-                set_cancelled(&manager, transfer_id);
-                persist_directory_manager_state_or_warn(&manager, transfer_id);
-                return;
-            }
-            match file_transfers.status(child_id) {
-                Ok(FileTransferInfo::Put(info)) => {
-                    update_info(&manager, transfer_id, |directory| {
-                        directory.confirmed_file_bytes =
-                            completed_bytes.saturating_add(info.confirmed_offset.min(entry.size));
-                    });
-                    match info.phase {
-                        ControllerFileTransferPhase::Completed => {
-                            completed_bytes = completed_bytes.saturating_add(entry.size);
-                            update_info(&manager, transfer_id, |directory| {
-                                directory.completed_files = (file_index + 1) as u32;
-                                directory.confirmed_file_bytes = completed_bytes;
-                                directory.current_relative_path = None;
-                                directory.current_file_transfer_id = None;
-                            });
-                            if let Err(error) = persist_directory_manager_state(&manager) {
-                                cancel_remote_directory(&remote, device_id, &manifest).await;
-                                set_failed(&manager, transfer_id, error.to_string());
-                                return;
-                            }
-                            break;
-                        }
-                        ControllerFileTransferPhase::Failed => {
-                            cancel_remote_directory(&remote, device_id, &manifest).await;
-                            set_failed(
-                                &manager,
-                                transfer_id,
-                                info.error.unwrap_or_else(|| "child file Put failed".into()),
-                            );
-                            return;
-                        }
-                        ControllerFileTransferPhase::Cancelled => {
-                            cancel_remote_directory(&remote, device_id, &manifest).await;
-                            set_cancelled(&manager, transfer_id);
-                            persist_directory_manager_state_or_warn(&manager, transfer_id);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(FileTransferInfo::Get(_)) => {
-                    cancel_remote_directory(&remote, device_id, &manifest).await;
-                    set_failed(
-                        &manager,
-                        transfer_id,
-                        "child transfer direction changed".into(),
-                    );
-                    return;
-                }
-                Err(error) => {
-                    cancel_remote_directory(&remote, device_id, &manifest).await;
-                    set_failed(&manager, transfer_id, error.to_string());
-                    return;
-                }
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                changed = cancel.changed() => {
-                    match changed {
-                        Ok(()) if *cancel.borrow() => {
-                            let _ = file_transfers.cancel(child.transfer_id);
-                            cancel_remote_directory(&remote, device_id, &manifest).await;
-                            set_cancelled(&manager, transfer_id);
-                            persist_directory_manager_state_or_warn(&manager, transfer_id);
-                            return;
-                        }
-                        Ok(()) => {}
-                        Err(_) => return,
-                    }
-                }
-            }
         }
     }
 
@@ -1246,8 +2165,8 @@ async fn run_directory_put(
         info.phase = ControllerDirectoryTransferPhase::Finalizing;
         info.confirmed_file_bytes = info.total_file_bytes;
         info.completed_files = info.total_files;
-        info.current_relative_path = None;
-        info.current_file_transfer_id = None;
+        info.active_children.clear();
+        sync_put_current_projection(info);
     });
     if let Err(error) = persist_directory_manager_state(&manager) {
         cancel_remote_directory(&remote, device_id, &manifest).await;
@@ -1363,8 +2282,8 @@ async fn run_directory_get(
                     info.phase = ControllerDirectoryTransferPhase::Completed;
                     info.confirmed_file_bytes = info.total_file_bytes;
                     info.completed_files = info.total_files;
-                    info.current_relative_path = None;
-                    info.current_file_transfer_id = None;
+                    info.active_children.clear();
+                    sync_get_current_projection(info);
                     info.final_destination_path = Some(final_path);
                     info.error = None;
                 });
@@ -1557,7 +2476,7 @@ async fn run_directory_get(
         return;
     }
     let allow_create_staging = initial_info.completed_files == 0
-        && initial_info.current_file_transfer_id.is_none()
+        && initial_info.active_children.is_empty()
         && !source_verified;
     let staging_for_prepare = staging_root.clone();
     let final_for_prepare = final_root.clone();
@@ -1588,16 +2507,11 @@ async fn run_directory_get(
         }
     }
     if *cancel.borrow() {
-        if let Some(child_id) = initial_info.current_file_transfer_id {
-            let _ = file_transfers.cancel(child_id);
-        }
-        cleanup_local_directory(&staging_root);
-        set_get_cancelled(&manager, transfer_id);
-        persist_directory_manager_state_or_warn(&manager, transfer_id);
+        cancel_get_window(&manager, &file_transfers, transfer_id, &staging_root);
         return;
     }
 
-    let mut completed_bytes: u64 = files
+    let completed_prefix_bytes: u64 = files
         .iter()
         .take(initial_info.completed_files as usize)
         .map(|entry| entry.size)
@@ -1605,212 +2519,32 @@ async fn run_directory_get(
     if initial_info.completed_files < files.len() as u32 {
         update_get_info(&manager, transfer_id, |info| {
             info.phase = ControllerDirectoryTransferPhase::Running;
-            if info.current_file_transfer_id.is_none() {
-                info.confirmed_file_bytes = completed_bytes;
+            if info.active_children.is_empty() {
+                info.confirmed_file_bytes = completed_prefix_bytes;
             }
             info.error = None;
+            sync_get_current_projection(info);
         });
         if let Err(error) = persist_directory_manager_state(&manager) {
             cleanup_local_directory(&staging_root);
             set_get_failed(&manager, transfer_id, error.to_string());
             return;
         }
-    }
-
-    for (file_index, entry) in files
-        .iter()
-        .enumerate()
-        .skip(initial_info.completed_files as usize)
-    {
-        if *cancel.borrow() {
-            if let Ok(info) = current_get_info(&manager, transfer_id)
-                && let Some(child_id) = info.current_file_transfer_id
-            {
-                let _ = file_transfers.cancel(child_id);
-            }
-            cleanup_local_directory(&staging_root);
-            set_get_cancelled(&manager, transfer_id);
-            persist_directory_manager_state_or_warn(&manager, transfer_id);
+        if !run_get_child_window(
+            &manager,
+            &file_transfers,
+            transfer_id,
+            device_id,
+            site_id,
+            &manifest,
+            &files,
+            &staging_root,
+            chunk_size,
+            &mut cancel,
+        )
+        .await
+        {
             return;
-        }
-        let device_path = join_device_relative(&manifest.device_root, &entry.relative_path);
-        let local_path = join_relative(&staging_root, &entry.relative_path);
-        let Some(local_path) = local_path.to_str().map(str::to_owned) else {
-            cleanup_local_directory(&staging_root);
-            set_get_failed(
-                &manager,
-                transfer_id,
-                "Controller directory staging path is not valid UTF-8".into(),
-            );
-            return;
-        };
-        let outer = match current_get_info(&manager, transfer_id) {
-            Ok(info) => info,
-            Err(error) => {
-                cleanup_local_directory(&staging_root);
-                set_get_failed(&manager, transfer_id, error.to_string());
-                return;
-            }
-        };
-        let child_id = match (
-            outer.current_relative_path.as_deref(),
-            outer.current_file_transfer_id,
-        ) {
-            (Some(relative), Some(child_id)) if relative == entry.relative_path => child_id,
-            (None, None) => {
-                let child_id = TransferId::new();
-                update_get_info(&manager, transfer_id, |info| {
-                    info.current_relative_path = Some(entry.relative_path.clone());
-                    info.current_file_transfer_id = Some(child_id);
-                    info.confirmed_file_bytes = completed_bytes;
-                });
-                if let Err(error) = persist_directory_manager_state(&manager) {
-                    cleanup_local_directory(&staging_root);
-                    set_get_failed(&manager, transfer_id, error.to_string());
-                    return;
-                }
-                child_id
-            }
-            _ => {
-                cleanup_local_directory(&staging_root);
-                set_get_failed(
-                    &manager,
-                    transfer_id,
-                    "persisted directory child does not match the next manifest file".into(),
-                );
-                return;
-            }
-        };
-        let child = match file_transfers.status(child_id) {
-            Ok(FileTransferInfo::Get(info)) => {
-                if info.device_id != device_id
-                    || info.device_path != device_path
-                    || info.destination_path != local_path
-                    || info.chunk_size != chunk_size
-                {
-                    cleanup_local_directory(&staging_root);
-                    set_get_failed(
-                        &manager,
-                        transfer_id,
-                        "persisted directory child Get changed transfer scope".into(),
-                    );
-                    return;
-                }
-                info
-            }
-            Ok(FileTransferInfo::Put(_)) => {
-                cleanup_local_directory(&staging_root);
-                set_get_failed(
-                    &manager,
-                    transfer_id,
-                    "persisted directory child transfer direction changed".into(),
-                );
-                return;
-            }
-            Err(ControllerFileTransferError::NotFound(_)) => {
-                match file_transfers.start_get_with_transfer_id(
-                    child_id,
-                    device_id,
-                    site_id,
-                    device_path,
-                    local_path,
-                    chunk_size,
-                    FileConflictPolicy::FailIfExists,
-                ) {
-                    Ok(info) => info,
-                    Err(error) => {
-                        cleanup_local_directory(&staging_root);
-                        set_get_failed(&manager, transfer_id, error.to_string());
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                cleanup_local_directory(&staging_root);
-                set_get_failed(&manager, transfer_id, error.to_string());
-                return;
-            }
-        };
-
-        loop {
-            if *cancel.borrow() {
-                let _ = file_transfers.cancel(child_id);
-                cleanup_local_directory(&staging_root);
-                set_get_cancelled(&manager, transfer_id);
-                persist_directory_manager_state_or_warn(&manager, transfer_id);
-                return;
-            }
-            match file_transfers.status(child_id) {
-                Ok(FileTransferInfo::Get(info)) => {
-                    update_get_info(&manager, transfer_id, |directory| {
-                        directory.confirmed_file_bytes =
-                            completed_bytes.saturating_add(info.confirmed_offset.min(entry.size));
-                    });
-                    match info.phase {
-                        ControllerFileTransferPhase::Completed => {
-                            completed_bytes = completed_bytes.saturating_add(entry.size);
-                            update_get_info(&manager, transfer_id, |directory| {
-                                directory.completed_files = (file_index + 1) as u32;
-                                directory.confirmed_file_bytes = completed_bytes;
-                                directory.current_relative_path = None;
-                                directory.current_file_transfer_id = None;
-                            });
-                            if let Err(error) = persist_directory_manager_state(&manager) {
-                                cleanup_local_directory(&staging_root);
-                                set_get_failed(&manager, transfer_id, error.to_string());
-                                return;
-                            }
-                            break;
-                        }
-                        ControllerFileTransferPhase::Failed => {
-                            cleanup_local_directory(&staging_root);
-                            set_get_failed(
-                                &manager,
-                                transfer_id,
-                                info.error.unwrap_or_else(|| "child file Get failed".into()),
-                            );
-                            return;
-                        }
-                        ControllerFileTransferPhase::Cancelled => {
-                            cleanup_local_directory(&staging_root);
-                            set_get_cancelled(&manager, transfer_id);
-                            persist_directory_manager_state_or_warn(&manager, transfer_id);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(FileTransferInfo::Put(_)) => {
-                    cleanup_local_directory(&staging_root);
-                    set_get_failed(
-                        &manager,
-                        transfer_id,
-                        "child transfer direction changed".into(),
-                    );
-                    return;
-                }
-                Err(error) => {
-                    cleanup_local_directory(&staging_root);
-                    set_get_failed(&manager, transfer_id, error.to_string());
-                    return;
-                }
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                changed = cancel.changed() => {
-                    match changed {
-                        Ok(()) if *cancel.borrow() => {
-                            let _ = file_transfers.cancel(child.transfer_id);
-                            cleanup_local_directory(&staging_root);
-                            set_get_cancelled(&manager, transfer_id);
-                            persist_directory_manager_state_or_warn(&manager, transfer_id);
-                            return;
-                        }
-                        Ok(()) => {}
-                        Err(_) => return,
-                    }
-                }
-            }
         }
     }
 
@@ -1824,8 +2558,8 @@ async fn run_directory_get(
         info.phase = ControllerDirectoryTransferPhase::Finalizing;
         info.confirmed_file_bytes = info.total_file_bytes;
         info.completed_files = info.total_files;
-        info.current_relative_path = None;
-        info.current_file_transfer_id = None;
+        info.active_children.clear();
+        sync_get_current_projection(info);
     });
     if let Err(error) = persist_directory_manager_state(&manager) {
         cleanup_local_directory(&staging_root);
@@ -1930,6 +2664,8 @@ async fn run_directory_get(
         info.phase = ControllerDirectoryTransferPhase::Completed;
         info.confirmed_file_bytes = info.total_file_bytes;
         info.completed_files = info.total_files;
+        info.active_children.clear();
+        sync_get_current_projection(info);
         info.final_destination_path = Some(final_path);
         info.error = durability_warning;
     });
@@ -1972,13 +2708,29 @@ async fn recover_directory_cancel(
     info: &DirectoryTransferInfo,
     durable_state: Option<&DurableControllerDirectoryState>,
 ) {
-    let current_child = match info {
-        DirectoryTransferInfo::Put(info) => info.current_file_transfer_id,
-        DirectoryTransferInfo::Get(info) => info.current_file_transfer_id,
+    let child_ids: Vec<TransferId> = match info {
+        DirectoryTransferInfo::Put(info) => {
+            if info.active_children.is_empty() {
+                info.current_file_transfer_id.into_iter().collect()
+            } else {
+                info.active_children
+                    .iter()
+                    .map(|child| child.transfer_id)
+                    .collect()
+            }
+        }
+        DirectoryTransferInfo::Get(info) => {
+            if info.active_children.is_empty() {
+                info.current_file_transfer_id.into_iter().collect()
+            } else {
+                info.active_children
+                    .iter()
+                    .map(|child| child.transfer_id)
+                    .collect()
+            }
+        }
     };
-    if let Some(child_id) = current_child {
-        let _ = file_transfers.cancel(child_id);
-    }
+    cancel_child_ids(file_transfers, &child_ids);
     match durable_state {
         Some(DurableControllerDirectoryState::Put { manifest, .. }) => {
             cancel_remote_directory(remote, device_id, manifest).await;
@@ -2068,16 +2820,16 @@ fn set_failed(
     update_info(manager, transfer_id, |info| {
         info.phase = ControllerDirectoryTransferPhase::Failed;
         info.error = Some(error);
-        info.current_relative_path = None;
-        info.current_file_transfer_id = None;
+        info.active_children.clear();
+        sync_put_current_projection(info);
     });
 }
 
 fn set_cancelled(manager: &Weak<ControllerDirectoryTransferManagerInner>, transfer_id: TransferId) {
     update_info(manager, transfer_id, |info| {
         info.phase = ControllerDirectoryTransferPhase::Cancelled;
-        info.current_relative_path = None;
-        info.current_file_transfer_id = None;
+        info.active_children.clear();
+        sync_put_current_projection(info);
     });
 }
 
@@ -2105,8 +2857,8 @@ fn set_get_failed(
     update_get_info(manager, transfer_id, |info| {
         info.phase = ControllerDirectoryTransferPhase::Failed;
         info.error = Some(error);
-        info.current_relative_path = None;
-        info.current_file_transfer_id = None;
+        info.active_children.clear();
+        sync_get_current_projection(info);
     });
 }
 
@@ -2116,8 +2868,8 @@ fn set_get_cancelled(
 ) {
     update_get_info(manager, transfer_id, |info| {
         info.phase = ControllerDirectoryTransferPhase::Cancelled;
-        info.current_relative_path = None;
-        info.current_file_transfer_id = None;
+        info.active_children.clear();
+        sync_get_current_projection(info);
     });
 }
 
@@ -2519,6 +3271,7 @@ fn validate_durable_directory_record(
         confirmed_file_bytes,
         total_files,
         completed_files,
+        active_children,
         current_relative_path,
         current_child,
     ) = match &record.info {
@@ -2532,6 +3285,7 @@ fn validate_durable_directory_record(
                 info.confirmed_file_bytes,
                 info.total_files,
                 info.completed_files,
+                info.active_children.as_slice(),
                 info.current_relative_path.as_deref(),
                 info.current_file_transfer_id,
             )
@@ -2546,6 +3300,7 @@ fn validate_durable_directory_record(
                 info.confirmed_file_bytes,
                 info.total_files,
                 info.completed_files,
+                info.active_children.as_slice(),
                 info.current_relative_path.as_deref(),
                 info.current_file_transfer_id,
             )
@@ -2556,11 +3311,25 @@ fn validate_durable_directory_record(
             "directory current relative path and child TransferId must appear together".into(),
         ));
     }
+    if active_children.len() > HARD_MAX_DIRECTORY_CHILDREN_PER_TRANSFER {
+        return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+            "directory active child window exceeds the hard per-transfer bound".into(),
+        ));
+    }
+    if let Some(first) = active_children.first()
+        && (current_relative_path != Some(first.relative_path.as_str())
+            || current_child != Some(first.transfer_id))
+    {
+        return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+            "directory current child projection disagrees with the active window".into(),
+        ));
+    }
     let Some(state) = &record.state else {
         if total_file_bytes != 0
             || confirmed_file_bytes != 0
             || total_files != 0
             || completed_files != 0
+            || !active_children.is_empty()
             || current_relative_path.is_some()
             || !matches!(
                 phase,
@@ -2707,36 +3476,86 @@ fn validate_durable_directory_record(
             "persisted directory confirmed bytes regress behind completed file prefix".into(),
         ));
     }
-    if let Some(relative) = current_relative_path {
-        let Some(current) = files.get(completed_files as usize) else {
+    if active_children.is_empty() {
+        if let Some(relative) = current_relative_path {
+            let Some(current) = files.get(completed_files as usize) else {
+                return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                    "persisted current child exists after all manifest files completed".into(),
+                ));
+            };
+            if current.relative_path != relative
+                || confirmed_file_bytes > completed_prefix_bytes.saturating_add(current.size)
+            {
+                return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                    "persisted current directory child is not the next manifest file".into(),
+                ));
+            }
+        } else if confirmed_file_bytes != completed_prefix_bytes && !phase.terminal() {
             return Err(ControllerDirectoryTransferError::InvalidPersistedState(
-                "persisted current child exists after all manifest files completed".into(),
-            ));
-        };
-        if current.relative_path != relative
-            || confirmed_file_bytes > completed_prefix_bytes.saturating_add(current.size)
-        {
-            return Err(ControllerDirectoryTransferError::InvalidPersistedState(
-                "persisted current directory child is not the next manifest file".into(),
+                "persisted directory bytes extend beyond completed prefix without an active child"
+                    .into(),
             ));
         }
-    } else if confirmed_file_bytes != completed_prefix_bytes && !phase.terminal() {
+    } else {
+        if completed_files >= total_files {
+            return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                "directory active child window appears after all manifest files completed".into(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        let mut minimum_confirmed = completed_prefix_bytes;
+        let mut maximum_confirmed = completed_prefix_bytes;
+        for (slot, child) in active_children.iter().enumerate() {
+            let expected_index = completed_files.saturating_add(slot as u32);
+            if child.file_index != expected_index {
+                return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                    "directory active child window is not a contiguous manifest range".into(),
+                ));
+            }
+            let Some(entry) = files.get(child.file_index as usize) else {
+                return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                    "directory active child index exceeds the manifest file set".into(),
+                ));
+            };
+            if child.relative_path != entry.relative_path || !ids.insert(child.transfer_id) {
+                return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                    "directory active child identity/path disagrees with the manifest".into(),
+                ));
+            }
+            if slot == 0 && child.completed {
+                return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                    "directory completed-prefix journal was not advanced past its first child"
+                        .into(),
+                ));
+            }
+            maximum_confirmed = maximum_confirmed.saturating_add(entry.size);
+            if child.completed {
+                minimum_confirmed = minimum_confirmed.saturating_add(entry.size);
+            }
+        }
+        if confirmed_file_bytes < minimum_confirmed || confirmed_file_bytes > maximum_confirmed {
+            return Err(ControllerDirectoryTransferError::InvalidPersistedState(
+                "directory aggregate progress falls outside the active child window".into(),
+            ));
+        }
+    }
+    if phase.terminal() && !active_children.is_empty() {
         return Err(ControllerDirectoryTransferError::InvalidPersistedState(
-            "persisted directory bytes extend beyond completed prefix without a current child"
-                .into(),
+            "terminal directory transfer retains active children".into(),
         ));
     }
     if phase == ControllerDirectoryTransferPhase::Completed
         && (completed_files != total_files
             || confirmed_file_bytes != total_file_bytes
-            || current_child.is_some())
+            || current_child.is_some()
+            || !active_children.is_empty())
     {
         return Err(ControllerDirectoryTransferError::InvalidPersistedState(
             "Completed directory transfer must cover the entire manifest".into(),
         ));
     }
     if matches!(phase, ControllerDirectoryTransferPhase::Finalizing)
-        && completed_files != total_files
+        && (completed_files != total_files || !active_children.is_empty())
     {
         return Err(ControllerDirectoryTransferError::InvalidPersistedState(
             "directory Finalizing state requires every manifest file completed".into(),
@@ -2926,6 +3745,9 @@ mod tests {
                     confirmed_file_bytes: 0,
                     total_files: 1,
                     completed_files: 0,
+                    // Explicitly model the pre-V5b-3 journal shape: the authoritative
+                    // active window did not exist yet, only the compatibility current-child pair.
+                    active_children: Vec::new(),
                     current_relative_path: Some("a.txt".into()),
                     current_file_transfer_id: Some(child_id),
                     final_device_root: None,
@@ -3000,6 +3822,18 @@ mod tests {
             recovered_info.current_relative_path.as_deref(),
             Some("a.txt")
         );
+        assert!(recovered_info.active_children.is_empty());
+        let mut normalized = recovered.transfers[0].info.clone();
+        normalize_legacy_active_children(&mut normalized).unwrap();
+        let DirectoryTransferInfo::Put(normalized) = normalized else {
+            unreachable!();
+        };
+        assert_eq!(normalized.active_children.len(), 1);
+        assert_eq!(normalized.active_children[0].file_index, 0);
+        assert_eq!(normalized.active_children[0].relative_path, "a.txt");
+        assert_eq!(normalized.active_children[0].transfer_id, child_id);
+        assert!(!normalized.active_children[0].completed);
+        assert_eq!(normalized.current_file_transfer_id, Some(child_id));
 
         let duplicate = ControllerDirectoryTransferSnapshot {
             controller_id,
@@ -3030,6 +3864,109 @@ mod tests {
         info.current_relative_path = Some("wrong.txt".into());
         assert!(matches!(
             validate_durable_directory_record(&record, controller_id),
+            Err(ControllerDirectoryTransferError::InvalidPersistedState(_))
+        ));
+    }
+
+    #[test]
+    fn directory_journal_validates_bounded_out_of_order_active_window() {
+        let temp = tempdir().unwrap();
+        let controller_id = ControllerId::new();
+        let (mut record, transfer_id, _) = durable_directory_put_record(temp.path(), controller_id);
+        let site_id = record.site_id;
+        let device_id = record.info.device_id();
+        let entries = (0..5_u32)
+            .map(|index| {
+                DirectoryTreeEntry::file(format!("{index}.txt"), 5, file_sha256_hex(b"alpha"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let manifest = DirectoryTreeManifest::new(
+            transfer_id,
+            controller_id,
+            site_id,
+            device_id,
+            FileTransferDirection::ControllerToDevice,
+            "/device/target-tree",
+            entries,
+            Some(DirectoryConflictPolicy::FailIfExists),
+        )
+        .unwrap();
+        let active = (0..4_u32)
+            .map(|file_index| DirectoryActiveChild {
+                file_index,
+                relative_path: format!("{file_index}.txt"),
+                transfer_id: TransferId::new(),
+                completed: matches!(file_index, 1 | 3),
+            })
+            .collect::<Vec<_>>();
+        let DirectoryTransferInfo::Put(info) = &mut record.info else {
+            unreachable!();
+        };
+        info.total_file_bytes = manifest.total_file_bytes;
+        info.total_files = 5;
+        info.completed_files = 0;
+        info.confirmed_file_bytes = 10;
+        info.active_children = active;
+        sync_put_current_projection(info);
+        record.state = Some(DurableControllerDirectoryState::Put {
+            manifest,
+            staging_device_root: Some(format!("/device/.clew-directory-{transfer_id}.part")),
+        });
+        validate_durable_directory_record(&record, controller_id).unwrap();
+
+        let mut too_wide = record.clone();
+        let DirectoryTransferInfo::Put(info) = &mut too_wide.info else {
+            unreachable!();
+        };
+        info.active_children.push(DirectoryActiveChild {
+            file_index: 4,
+            relative_path: "4.txt".into(),
+            transfer_id: TransferId::new(),
+            completed: false,
+        });
+        assert!(matches!(
+            validate_durable_directory_record(&too_wide, controller_id),
+            Err(ControllerDirectoryTransferError::InvalidPersistedState(_))
+        ));
+
+        let mut duplicate = record.clone();
+        let DirectoryTransferInfo::Put(info) = &mut duplicate.info else {
+            unreachable!();
+        };
+        info.active_children[2].transfer_id = info.active_children[1].transfer_id;
+        assert!(matches!(
+            validate_durable_directory_record(&duplicate, controller_id),
+            Err(ControllerDirectoryTransferError::InvalidPersistedState(_))
+        ));
+
+        let mut broken_index = record.clone();
+        let DirectoryTransferInfo::Put(info) = &mut broken_index.info else {
+            unreachable!();
+        };
+        info.active_children[2].file_index = 4;
+        assert!(matches!(
+            validate_durable_directory_record(&broken_index, controller_id),
+            Err(ControllerDirectoryTransferError::InvalidPersistedState(_))
+        ));
+
+        let mut regressed = record.clone();
+        let DirectoryTransferInfo::Put(info) = &mut regressed.info else {
+            unreachable!();
+        };
+        info.confirmed_file_bytes = 5;
+        assert!(matches!(
+            validate_durable_directory_record(&regressed, controller_id),
+            Err(ControllerDirectoryTransferError::InvalidPersistedState(_))
+        ));
+
+        let mut stale_prefix = record;
+        let DirectoryTransferInfo::Put(info) = &mut stale_prefix.info else {
+            unreachable!();
+        };
+        info.active_children[0].completed = true;
+        assert!(matches!(
+            validate_durable_directory_record(&stale_prefix, controller_id),
             Err(ControllerDirectoryTransferError::InvalidPersistedState(_))
         ));
     }
