@@ -1,6 +1,6 @@
 # Advanced Service Runtime
 
-Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a 只实现 Linux `systemd --user`；Windows Service 与 Linux system service 属于后续 V7b/V7c。
+Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 已完成；V7b 分成 Windows machine runtime 与 user-session control plane 两层，其中 V7b-1 machine Connector service 已完成，V7b-2 用户态 GUI/CLI 安全控制面仍在推进；Linux system service 属于后续 V7c。
 
 ## V7a：Linux `systemd --user`
 
@@ -20,7 +20,7 @@ clew service enable-linger --scope user
 clew service disable-linger --scope user
 ```
 
-`--scope user` 当前是唯一实现的 scope，因此可省略。
+Linux user runtime 下 `--scope user` 可省略。Windows machine runtime 必须显式写 `--scope machine`，避免把 machine-level persistence 变成默认动作。
 
 ### 生命周期语义
 
@@ -79,9 +79,64 @@ Clew **拒绝覆盖或卸载同路径的非 Clew-managed unit**。更新已有 C
 
 查询本身不改变任何 lifecycle state。
 
+## V7b-1：Windows machine Connector service
+
+V7b-1 服务化的是**朋友侧长期在线 Connector Host runtime**，不是把现有 user Controller 塞进 Windows Service。入口为：
+
+```text
+clew service status --scope machine
+clew service install --scope machine --site PATH\TO\site.clew
+clew service enable --scope machine
+clew service start --scope machine
+clew service stop --scope machine
+clew service disable --scope machine
+clew service uninstall --scope machine
+```
+
+安装/卸载需要显式管理员权限。`install` 只创建 SCM service 与 machine state，不 enable、不 start；`enable` 只把 start type 改成 AutoStart，仍不立即启动；`start` / `stop` 只改变当前 service 运行状态；`disable` 只阻止后续自动启动；`uninstall` 删除 Clew-owned service 和 machine state。
+
+### machine identity 与权限
+
+Windows machine service：
+
+- SCM account 固定为 `NT AUTHORITY\LocalService`，不是 LocalSystem；
+- runtime 固定使用 `%ProgramData%\Clew\Service`，不读取或迁移 `%LOCALAPPDATA%\Clew` 的 user DeviceKey；
+- install 把当前 Clew executable、已验证的 `site.clew` 与其引用的 Outfit/nearby 资源复制进 machine root，并写 `service.json` 绑定 binary/Site Kit SHA-256；
+- enrollment 强制使用 `HostLaunchMode::ConnectorOnly`。即使原 Site Kit 允许 EXECUTE，也只申请 `connector=true / execute=false`，不开放 Read/Shell/File；
+- uninstall 删除 machine identity/state；以后重新 install 会作为新的 machine member enrollment，而不是偷偷复活旧 user identity。
+
+machine root 在任何 DeviceKey/Site Kit state 写入前就被收紧为 protected DACL。ACL 直接使用 Win32 security API写入并反验，不依赖本地化 `icacls` 文本或 service-account 名称解析；仅允许：
+
+```text
+SYSTEM
+BUILTIN\Administrators
+NT SERVICE\ClewConnector 的 service SID
+```
+
+三者均为 inheritable FullControl，DACL禁止从父目录继续继承。SCM同时把 `ClewConnector` 设为 `ServiceSidType::Unrestricted`，使运行进程token包含该独立 service SID；其它同为 LocalService 的服务不会因此得到 Clew machine state权限。
+
+### lifecycle 与恢复
+
+`ClewConnector` 是 `WIN32_OWN_PROCESS`，正常 stop 走 SCM Stop → graceful Host shutdown。异常退出配置有限 SCM recovery：2 秒、10 秒、60 秒三次 restart，1 小时后重置失败计数；之后不无限 crash-loop。
+
+`start` / `enable` 会重新验证 SCM identity、protected DACL、binary/Site Kit hash。若 payload 被篡改，启动 fail closed。`stop` / `disable` / `uninstall` 只要求能证明该 SCM entry 与 metadata 属于 Clew，因此即使 binary/Site Kit 已损坏，管理员仍能停止和卸载，不会被坏安装锁死。
+
+V7b-1 不创建任何交互窗口，也没有跨 Session 0 的普通用户控制 pipe；当前 machine lifecycle 由提升权限的 CLI/SCM管理。
+
+## V7b-2：user-session control plane（NEXT）
+
+下一层才把 tray/GUI/普通用户 CLI 变成 machine service 的 client：
+
+- 新建独立的 machine service status/control IPC，不复用 Host 单实例 `wake` pipe；
+- named pipe 必须显式绑定 authorized local user SID + service/system/admin ACL；
+- 用户 session只持有被授权的控制凭据/句柄，machine DeviceKey仍只留在 protected ProgramData state；
+- GUI明确区分“关闭窗口”和“停止后台服务”；
+- UI永远运行在交互用户 session，不进入 Session 0。
+
+完成这层以前，不宣称 Windows Service 的 user-session GUI/CLI control plane 已收口。
+
 ## 后续 V7
 
-- **V7b Windows Service**：machine-level runtime + 用户 session 中的 GUI/tray Local API client；不把 UI 放进 Session 0。
 - **V7c Linux system service**：专用低权限 service account 与 machine state scope。
 
 machine-level service 不得静默复用 portable/user DeviceKey，也不得因为 service account 权限较高就自动扩大 Shell/File/EXECUTE policy。相关总原则见 `01-design.md`、`03-gui.md` 与 `06-gaps.md`。
