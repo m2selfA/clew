@@ -1366,9 +1366,16 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6b-3 — Windows signing + macOS signing/notarization baseline
 
-**Status：NEXT**
+**Status：IN PROGRESS — pipeline baseline implemented；real-credential acceptance pending**
 
-下一步建立**显式opt-in、无secret入仓库、可独立verify**的签名管线：Windows Authenticode签名/验签，macOS Developer ID codesign + hardened runtime + notarization/staple/verify；无凭据环境继续稳定产出V6a/V6b-2 unsigned artifact而不是静默ad-hoc签名。签名会改变payload bytes，因此signed manifest必须在签名后重新计算逐文件hash并明确`unsigned=false`/签名身份，不能复用unsigned manifest。ClientFlavor/Distribution Studio成品签名与cache仍后置。
+- 新增显式第二阶段`cargo xtask sign-package`；默认`cargo xtask package`完全保留schema-2 unsigned语义且`signing=None`不序列化。signer只接受已经验证的`dirty=false / unsigned=true / schema=2` sidecar+ZIP，重新核对archive filename/size/SHA、embedded manifest、逐文件path/size/hash/mode后才解到private temp；只签temp副本，绝不改`target/<triple>/<profile>` build-tree binary或输入unsigned ZIP；失败前不会创建signed release文件；
+- signed release升级为schema **3**：`unsigned=false`并新增公开`signing { mechanism, identity, timestamped, notarized, stapled, notary_submission_id? }`；签名后重新枚举并hash最终payload，Windows不允许任何新增文件，当前macOS bundle只允许codesign新增`Clew.app/Contents/_CodeSignature/CodeResources`，其它普通文件、symlink、路径/数量/size越界全部fail closed。signed artifact因secure timestamp/notary ticket不再要求字节reproducible，改由最终archive SHA + post-signing逐文件hash + OS native verify共同证明；
+- Windows Authenticode不接受PFX/password参数，只接受OS certificate store中的公开40-hex SHA-1 thumbprint、RFC3161 URL、可选SignTool路径和显式machine-store选择；SignTool按显式路径→PATH→Windows Kits 10最新版架构目录发现，sign固定`/fd SHA256 /tr <url> /td SHA256`，随后`verify /pa /all /v`，最终ZIP再解包验签；
+- cap00 native无凭据gate：Windows Kits SignTool已被xtask自动发现；标准RFC3161地址被接受后，真实SignTool明确返回`No certificates were found that met all the given criteria.`。失败前后clean unsigned ZIP SHA仍=`fa11c96d...a6d9`，build-tree `clew.exe` SHA仍=`ced0ce2f...49487`，signed output files=`0`；当前`CurrentUser\\My`带private key的CodeSigningCert数量为0，因此不伪造成功签名；
+- macOS路径已实现inside-out Developer ID：先签/验`Contents/Resources/clew`，再以`--timestamp --options runtime`签/验`.app`，用`notarytool submit --keychain-profile ... --wait --output-format json`要求`Accepted`并记录submission id，随后`stapler staple/validate + spctl --assess`；最终用`ditto`封装stapled app并解包重复验签。CLI只接收公开Developer ID identity和Keychain profile名称，Apple credential/private key不进入参数/manifest/repo；`macos-3dv0`当前工具齐全但`security find-identity -p codesigning`为**0 valid identities**，native compile/no-identity fail-closed与真实Developer ID acceptance继续作为本块剩余gate；
+- 新增`docs/RELEASE_SIGNING.md`冻结操作/secret/CI边界；xtask focused从6增至**10/10 PASS**，覆盖schema2兼容、schema3 roundtrip、dirty/already-signed/Linux拒绝、签名输入bounds与macOS新增文件白名单。当前`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets --locked` PASS / 0 warnings；`cargo test --workspace --all-targets --locked` **249 passed / 0 failed / 6 ignored**。
+
+本块剩余 acceptance 只允许使用正式Windows code-signing certificate与正式Apple Developer ID/notary profile；无凭据环境继续稳定产出unsigned artifact，绝不以ad-hoc/self-signed结果冒充发布签名。ClientFlavor/Distribution Studio成品签名与cache仍后置。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1427,11 +1434,11 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current block：V6 — Release Packaging（IN PROGRESS；V6a + V6b-1 + V6b-2 native unsigned artifact DONE）**
+**Current block：V6b-3 — Release Signing（IN PROGRESS；pipeline baseline implemented，real-credential acceptance pending）**
 
-**Next block：V6b-3 — Windows signing + macOS signing/notarization baseline**
+**Next gate：macOS native compile/no-identity fail-closed → real Windows Authenticode + macOS Developer ID/notarization acceptance**
 
-V6a建立reproducible unsigned baseline，V6b-1把Clew identity嵌入Windows PE，V6b-2把同一identity扩到macOS `.app`/ICNS/Info.plist与Linux portable `bin+share` layout，并把manifest升级到逐文件hash的schema 2；Windows/macOS/Linux unsigned artifact现在都有native layout和真机解包smoke。下一步只做显式签名/notarization与验签边界；无凭据环境必须继续可复现地产出unsigned artifact，Distribution Studio成品管线继续后置。
+V6a/V6b-2的unsigned artifact继续作为可复现基线；V6b-3已把签名变成独立、显式、secret-free CLI surface，并建立signed schema 3与post-signing/native verification边界。cap00已证明无证书时SignTool fail closed且不污染任何unsigned/build-tree bytes；下一步先把同一实现commit投到macos-3dv0做native compile和0-identity对称gate，之后本块唯一不可伪造的完成条件就是正式Windows证书与正式Apple Developer ID/notary profile的真实acceptance。
 
 ### Change log
 
