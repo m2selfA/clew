@@ -7,13 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Rehearse unsigned release or publish from an existing v<version> tag"
+        description: "Rehearse, publish a normal unsigned 0.x release, or publish a signed 1.x+ release from an existing v<version> tag"
         required: true
         default: rehearsal
         type: choice
         options:
           - rehearsal
-          - publish
+          - release
+          - signed
 
 concurrency:
   group: clew-release-${{ github.ref }}
@@ -28,7 +29,8 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
-      publish_requested: ${{ steps.meta.outputs.publish_requested }}
+      release_requested: ${{ steps.meta.outputs.release_requested }}
+      signed_requested: ${{ steps.meta.outputs.signed_requested }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$(awk '
-            /^\[package\]$/ { in_package=1; next }
+            /^\[workspace.package\]$/ { in_package=1; next }
             /^\[/ { if (in_package) exit }
             in_package && /^version = "/ {
               value=$0
@@ -53,23 +55,41 @@ jobs:
           ' Cargo.toml)"
           test -n "$version"
 
-          publish_requested=false
+          major="${version%%.*}"
+          [[ "$major" =~ ^[0-9]+$ ]]
+
+          release_requested=false
+          signed_requested=false
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            publish_requested=true
-          elif [[ "${DISPATCH_MODE:-rehearsal}" == "publish" ]]; then
-            publish_requested=true
+            if (( major == 0 )); then
+              release_requested=true
+            else
+              signed_requested=true
+            fi
+          elif [[ "${DISPATCH_MODE:-rehearsal}" == "release" ]]; then
+            release_requested=true
+          elif [[ "${DISPATCH_MODE:-rehearsal}" == "signed" ]]; then
+            signed_requested=true
           fi
 
-          if [[ "$publish_requested" == "true" ]]; then
+          if [[ "$release_requested" == "true" || "$signed_requested" == "true" ]]; then
             test "$GITHUB_REF_TYPE" = "tag"
             test "$GITHUB_REF_NAME" = "v$version"
           elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             test "$GITHUB_REF_NAME" = "v$version"
           fi
 
+          if [[ "$release_requested" == "true" ]]; then
+            test "$major" = "0"
+          fi
+          if [[ "$signed_requested" == "true" ]]; then
+            (( major >= 1 ))
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "publish_requested=$publish_requested" >> "$GITHUB_OUTPUT"
-          echo "version=$version publish_requested=$publish_requested ref=$GITHUB_REF"
+          echo "release_requested=$release_requested" >> "$GITHUB_OUTPUT"
+          echo "signed_requested=$signed_requested" >> "$GITHUB_OUTPUT"
+          echo "version=$version major=$major release_requested=$release_requested signed_requested=$signed_requested ref=$GITHUB_REF"
 
   unsigned:
     name: Unsigned ${{ matrix.os }}
@@ -161,9 +181,85 @@ jobs:
             dist-client-flavors/**/cache-entry.json
           if-no-files-found: error
 
+  publish-unsigned:
+    name: Publish unsigned GitHub Release
+    if: needs.metadata.outputs.release_requested == 'true'
+    needs:
+      - metadata
+      - unsigned
+      - unsigned-linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download unsigned Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-windows-2022
+          path: inputs/windows
+
+      - name: Download unsigned macOS
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-macos-14
+          path: inputs/macos
+
+      - name: Download verified Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-linux-glibc217
+          path: inputs/linux
+
+      - name: Assemble exact unsigned release file set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-files
+          for dir in inputs/windows inputs/macos inputs/linux; do
+            find "$dir" -type f \( -name '*.zip' -o -name '*.release.json' \) -exec cp '{}' release-files/ \;
+          done
+          count="$(find release-files -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$count" = "6"
+          (
+            cd release-files
+            sha256sum -- *.zip *.release.json | sort -k2 > SHA256SUMS
+          )
+          cat release-files/SHA256SUMS
+
+      - name: Write unsigned release notes
+        shell: bash
+        run: |
+          cat > RELEASE_NOTES.md <<'EOF'
+          This is a normal public Clew 0.x release.
+
+          - Linux x86_64 is built and verified inside the manylinux2014 / glibc 2.17 compatibility environment, with the final ELF symbol-version gate enforced.
+          - Windows is independently verified but **unsigned**, so Windows trust / SmartScreen warnings are expected.
+          - macOS is independently verified but **unsigned and unnotarized**, so Gatekeeper may block normal launch.
+
+          Unsigned 0.x releases are intentionally published as normal GitHub Releases. A future signed release will use a new major version (1.x or later) and remains gated on the external Windows Code Signing certificate and macOS Developer ID / notarization credentials. Existing unsigned assets are never promoted in place or relabeled as signed artifacts.
+          EOF
+
+      - name: Publish immutable unsigned release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "v${{ needs.metadata.outputs.version }}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; refusing to overwrite immutable assets" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "Clew ${{ needs.metadata.outputs.version }}" \
+            --notes-file RELEASE_NOTES.md \
+            release-files/*
+
   sign-windows:
     name: Sign Windows
-    if: needs.metadata.outputs.publish_requested == 'true'
+    if: needs.metadata.outputs.signed_requested == 'true'
     needs:
       - metadata
       - unsigned
@@ -224,7 +320,7 @@ jobs:
 
   sign-macos:
     name: Sign and notarize macOS
-    if: needs.metadata.outputs.publish_requested == 'true'
+    if: needs.metadata.outputs.signed_requested == 'true'
     needs:
       - metadata
       - unsigned
@@ -287,9 +383,9 @@ jobs:
             dist-client-flavors/**/cache-entry.json
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub Release
-    if: needs.metadata.outputs.publish_requested == 'true'
+  publish-signed:
+    name: Publish signed GitHub Release
+    if: needs.metadata.outputs.signed_requested == 'true'
     needs:
       - metadata
       - unsigned

@@ -1519,13 +1519,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 ## 17. 当前 checkpoint
 
-**Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
+**Current signed-major release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
 **Parallel unblocked implementation block：none — V6c productization / Site Kit / docs blocks are closed**
 
-V7 Advanced Service Runtime 已全线封板。V6c-1 ClientFlavor cache、V6c-2 protected release workflow、V6c-3双launcher Site Kit assembly、V6c-4产品侧artifact store/Local API/GUI完整输出以及V6c-5文档一致性均已封板；Linux已有release-ready exact-clean完整Site Kit native证据。仓库现已公开发布到 `https://github.com/m2selfA/clew`，`main` 跟踪 `origin/main`；public CI 对 Windows 2022 与 Linux glibc 2.17 基线均有真实 GitHub-hosted gate，macOS 14继续作为额外native覆盖。当前唯一正式release blocker仍是V6b-3b外部真实Windows Code Signing证书与macOS Developer ID/notary凭据 acceptance；除该外部凭据gate外没有已知未完成的V6/V7实现块。V8+保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
+V7 Advanced Service Runtime 已全线封板。V6c-1 ClientFlavor cache、V6c-2 protected release workflow、V6c-3双launcher Site Kit assembly、V6c-4产品侧artifact store/Local API/GUI完整输出以及V6c-5文档一致性均已封板；Linux已有release-ready exact-clean完整Site Kit native证据。仓库现已公开发布到 `https://github.com/m2selfA/clew`，`main` 跟踪 `origin/main`；public CI 对 Windows 2022 与 Linux glibc 2.17 基线均有真实 GitHub-hosted gate，macOS 14继续作为额外native覆盖。发布策略现冻结为：`0.x` 的 Windows/macOS unsigned + Linux verified 产物照常作为**普通 GitHub Release**发布，并在 release notes 明确平台签名状态；未来 Windows Code Signing + macOS Developer ID/notary 凭据齐备后，不覆盖或重标现有 unsigned asset，而是升到新的 major version（`1.x+`）走 signed release gate。当前唯一 signed-major blocker 是 V6b-3b 外部凭据 acceptance；除该 gate 外没有已知未完成的 V6/V7 实现块。V8+保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — GitHub Release policy corrected：发现原 `release.yml` 同时存在两项会导致 Releases 为空的边界：tag push 被直接解释为“必须签名发布”，而当前外部签名凭据尚未就绪；metadata 还错误从 root `[package] version = ...` 读取版本，而实际 authority 是 `[workspace.package] version = "0.1.0"`。现改为 semver-major 分流：`0.x` tag push 发布 normal unsigned Release，`1.x+` tag push 只能进入 signed chain；手动 dispatch 同样区分 `release` / `signed`，并硬拒绝 unsigned 1.x 或 signed 0.x。CI branch push 与 tag release 触发解耦，避免 tag 重复跑普通 CI。下一步以 exact workflow commit 打 `v0.1.0` 并验收真实 GitHub Release + 三平台附件。
 
 - **2026-09-05** — Public GitHub + production CI **DONE**：使用既有 `m2selfA` 凭证创建 public repo `m2selfA/clew` 并让本地 `main` 跟踪 `origin/main`。`902b468` 将普通 CI 拆成 Windows/macOS native + Linux `quay.io/pypa/manylinux2014_x86_64`，release workflow 的 Linux 输入也强制复用同一 glibc-2.17 路径；容器脚本先硬验 `getconf GNU_LIBC_VERSION == 2.17`，再跑 locked fmt/check/test/package/independent verify/release-ready ClientFlavor cache，并对最终打包 ELF 扫描 `GLIBC_*` symbol versions。首轮真实 GitHub CI 抓出 ZIP 顶层目录探测错误与 Linux-only `Stdio` warning，`c8e99b2` 修复后二轮 run `33950764752` 在 exact HEAD `c8e99b2a8618e8257be776eb664fe0eedc07b1cc` 全绿：Windows 2022 check/test/package/upload PASS，macOS 14 PASS，Linux glibc-2.17 full gate PASS；Linux release ZIP SHA=`b5027aba82128019dd88c6842519c9885b44efedd01b01c5637a97b224825d3e`、cache `release_ready=true`，最终 runtime 最大依赖仅 `GLIBC_2.16`，低于2.17兼容上限。本地最终 locked workspace仍 **285 passed / 0 failed**、fmt/check/diff-check PASS。
 
