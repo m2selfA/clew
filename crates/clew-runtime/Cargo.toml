@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 base64.workspace = true
 clew-core = { path = "../clew-core" }
+clew-distribution = { path = "../clew-distribution" }
 clew-host = { path = "../clew-host" }
 clew-identity = { path = "../clew-identity" }
 clew-transport = { path = "../clew-transport" }

@@ -9,28 +9,30 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use clew_distribution::{
+    ArtifactInfo, ArtifactManifest, CLIENT_FLAVOR_CACHE_SCHEMA_VERSION, ClientFlavorCacheEntry,
+    MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES, PayloadFile, PayloadManifest, RELEASE_SCHEMA_VERSION,
+    ReleaseClientFlavorInfo, ReleasePlatform, SIGNED_RELEASE_SCHEMA_VERSION,
+    SITE_KIT_LAUNCHER_SCHEMA_VERSION, SigningInfo, SiteKitArtifactManifest, SiteKitLauncherInfo,
+    SiteKitPayloadManifest, ToolchainInfo, client_flavor_cache_key,
+};
 use clew_host::{
     ClientFlavor, MAX_OUTFIT_BUILD_SPEC_BYTES, OutfitAssetRef, OutfitBuildSpec, OutfitPreset,
     OutfitProfile, SignedSiteClew, SiteKitContract, TargetPlatform, verify_outfit_asset_bytes,
 };
 use flate2::{Compression, write::GzEncoder};
 use image::{DynamicImage, ImageFormat, RgbaImage};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const PRODUCT: &str = "clew";
 const APP_ID: &str = "io.clew.app";
-const RELEASE_SCHEMA_VERSION: u32 = 2;
-const SIGNED_RELEASE_SCHEMA_VERSION: u32 = 3;
 const MAX_EMBEDDED_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SIGNED_PAYLOAD_FILES: usize = 128;
 const MAX_SIGNED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SIGNED_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MACOS_CODE_RESOURCES: &str = "Clew.app/Contents/_CodeSignature/CodeResources";
-const CLIENT_FLAVOR_CACHE_SCHEMA_VERSION: u32 = 1;
-const MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES: u64 = 64 * 1024;
-const SITE_KIT_LAUNCHER_SCHEMA_VERSION: u32 = 1;
 const MACOS_ROLE_APP: &str = "Clew Role.app";
 const MACOS_ROLE_CODE_RESOURCES: &str = "Clew Role.app/Contents/_CodeSignature/CodeResources";
 
@@ -150,13 +152,6 @@ enum Signer {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReleasePlatform {
-    Windows,
-    Macos,
-    Linux,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ArchiveFile {
     path: String,
@@ -171,55 +166,6 @@ struct PackageLayout {
     entrypoint: String,
     cli_binary: String,
     files: Vec<ArchiveFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct PayloadFile {
-    path: String,
-    size: u64,
-    sha256: String,
-    mode: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ToolchainInfo {
-    release: String,
-    commit_hash: String,
-    host: String,
-    llvm_version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct SigningInfo {
-    mechanism: String,
-    identity: String,
-    timestamped: bool,
-    notarized: bool,
-    stapled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    notary_submission_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ReleaseClientFlavorInfo {
-    id: String,
-    outfit_id: String,
-    outfit_revision: u32,
-    build_cache_key: String,
-    app_display_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    publisher_label: Option<String>,
-    icon_format: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    icon_asset_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct SiteKitLauncherInfo {
-    schema_version: u32,
-    executable_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bundle_root: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,123 +193,10 @@ struct BuildBranding {
     icon_asset_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct PayloadManifest {
-    schema_version: u32,
-    product: String,
-    version: String,
-    target: String,
-    profile: String,
-    archive_format: String,
-    layout: String,
-    app_id: String,
-    entrypoint: String,
-    cli_binary: String,
-    source_commit: String,
-    source_date_epoch: u64,
-    rustc: ToolchainInfo,
-    cargo_lock_sha256: String,
-    dirty: bool,
-    unsigned: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    signing: Option<SigningInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    client_flavor: Option<ReleaseClientFlavorInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    site_kit_launcher: Option<SiteKitLauncherInfo>,
-    files: Vec<PayloadFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ArtifactInfo {
-    file: String,
-    size: u64,
-    sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ArtifactManifest {
-    payload: PayloadManifest,
-    artifact: ArtifactInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct ClientFlavorCacheEntry {
-    schema_version: u32,
-    cache_key: String,
-    client_flavor: ReleaseClientFlavorInfo,
-    version: String,
-    target: String,
-    profile: String,
-    source_commit: String,
-    release_ready: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    signing: Option<SigningInfo>,
-    artifact_file: String,
-    artifact_sha256: String,
-    manifest_file: String,
-    manifest_sha256: String,
-}
-
-#[derive(Serialize)]
-struct ClientFlavorCacheKeyMaterial<'a> {
-    client_flavor_id: &'a str,
-    build_cache_key: &'a str,
-    version: &'a str,
-    target: &'a str,
-    profile: &'a str,
-    source_commit: &'a str,
-    signing_mechanism: &'a str,
-    signing_identity: &'a str,
-}
-
-fn client_flavor_cache_key(
-    client_flavor: &ReleaseClientFlavorInfo,
-    payload: &PayloadManifest,
-) -> Result<String, Box<dyn Error>> {
-    let (signing_mechanism, signing_identity) = payload
-        .signing
-        .as_ref()
-        .map(|signing| (signing.mechanism.as_str(), signing.identity.as_str()))
-        .unwrap_or(("unsigned", "unsigned"));
-    let material = ClientFlavorCacheKeyMaterial {
-        client_flavor_id: &client_flavor.id,
-        build_cache_key: &client_flavor.build_cache_key,
-        version: &payload.version,
-        target: &payload.target,
-        profile: &payload.profile,
-        source_commit: &payload.source_commit,
-        signing_mechanism,
-        signing_identity,
-    };
-    Ok(format!(
-        "client-flavor-v1-{}",
-        sha256_bytes(&serde_json::to_vec(&material)?)
-    ))
-}
-
 const SITE_KIT_SCHEMA_VERSION: u32 = 1;
 const USE_ROLE_DIR: &str = "1 Use this computer";
 const HELPER_ROLE_DIR: &str = "2 Help nearby computers";
 const ROLE_HINT_FILE: &str = "role-hint.clew";
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct SiteKitPayloadManifest {
-    schema_version: u32,
-    source_cache_key: String,
-    client_flavor: ReleaseClientFlavorInfo,
-    target: String,
-    source_release_sha256: String,
-    site_sha256: String,
-    runtime_release_ready: bool,
-    files: Vec<PayloadFile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct SiteKitArtifactManifest {
-    payload: SiteKitPayloadManifest,
-    artifact: ArtifactInfo,
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();

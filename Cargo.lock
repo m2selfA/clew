@@ -806,6 +806,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "clew-distribution"
+version = "0.1.0"
+dependencies = [
+ "clew-core",
+ "clew-host",
+ "clew-identity",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "zip",
+]
+
+[[package]]
 name = "clew-host"
 version = "0.1.0"
 dependencies = [
@@ -859,6 +875,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "clew-core",
+ "clew-distribution",
  "clew-host",
  "clew-identity",
  "clew-transport",
@@ -7484,6 +7501,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "clew-distribution",
  "clew-host",
  "flate2",
  "image",

@@ -1,18 +1,18 @@
 [package]
-name = "xtask"
+name = "clew-distribution"
 version.workspace = true
 edition.workspace = true
-publish = false
 
 [dependencies]
-clap.workspace = true
-clew-distribution = { path = "../crates/clew-distribution" }
-clew-host = { path = "../crates/clew-host" }
+clew-host = { path = "../clew-host" }
 flate2 = "1.1.10"
-image.workspace = true
-resvg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tempfile.workspace = true
+thiserror.workspace = true
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+clew-core = { path = "../clew-core" }
+clew-identity = { path = "../clew-identity" }
+tempfile.workspace = true

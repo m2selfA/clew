@@ -1423,7 +1423,25 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 - macOS正式Site Kit不使用普通ZIP库假装保真：release-ready路径用`ditto`从已notarize release ZIP展开并复制主app/role app，再用`ditto --keepParent`生成最终ZIP；最终ZIP再次展开，对`.clew-runtime/Clew.app`和两个role app逐一重复codesign + stapler + Gatekeeper验证。Windows正式Site Kit也从最终ZIP重新抽取主exe+两个role launcher跑SignTool；unsigned rehearsal可跨平台组装但不能冒充release-ready；
 - Windows dirty package smoke：ZIP SHA=`bebaeeddc423eea19cb38871160c48421a62e3d1adcc10343f5e4f558d7df2e6`，manifest exact shape=`README 0644 + clew-role-launcher.exe 0755 + clew.exe 0755`，role PE ProductName/FileDescription=`Clew`且associated icon可提取。首次独立verify暴露validator仍把新launcher误判为0644，统一按`site_kit_launcher.executable_path`识别后同一artifact verify PASS；dirty cache negative control仍明确拒绝。pre-commit gates：fmt PASS；workspace locked check 0 warning；workspace tests **274 passed / 0 failed / 7 ignored**；xtask **13/13**；git diff check PASS。下一步固定implementation SHA，从clean SHA完成真实Controller mint→release/cache→Site Kit assembly与三平台native rehearsal后再标DONE。
 
-#### V6c-4 — Release docs/checkpoint cleanup
+#### V6c-4 — Product-side ClientFlavor / complete Site Kit integration
+
+**Status：IN PROGRESS**
+
+##### V6c-4a — Shared distribution authority + Controller artifact store + composite Local API
+
+**Status：DONE（2026-09-05）**
+
+- 新增workspace crate `clew-distribution`，把release schema 2/3、ClientFlavor cache schema 1、Site Kit launcher/schema、artifact/cache key material与strict verifier从repo-only `xtask`下沉为唯一共享authority；`xtask`改为直接使用同一struct/常量/cache-key函数，不再各维护一份wire schema；
+- `ClientFlavorArtifactStore`进入Controller per-user `StateLayout/client-flavors`：只导入`release_ready=true`的immutable cache entry，逐层重验regular/non-symlink、manifest/artifact exact hash、embedded release manifest、payload exact file set/hash、semantic cache key==目录identity、clean provenance、launcher containment、平台签名evidence与字段hard bounds；最多256个artifact，并持久化per-ClientFlavor active pointer。Windows真测顺手修复只读`File::open().sync_all()`触发`Access is denied`，改为可写句柄flush；
+- 产品assembler `clew_distribution::assemble_site_kit`只接受store已经验证的active release-ready artifact + freshly signed `site.clew` +精确Outfit assets；再次验证Site签名、ClientFlavor/build-key绑定。Windows/Linux复制原签名runtime/role launcher字节；macOS正式路径只允许macOS native `ditto` + codesign/stapler/spctl最终容器复验。输出事务式生成archive + sidecar + SHA256SUMS，既有输出fail closed不覆盖；
+- Local API新增ClientFlavor import/list与复合`SiteKitCreate`。完整Site Kit当前刻意只允许Controller native platform：先preflight active release-ready ClientFlavor，成功后才签invite；签发后asset/serialize/assembler/worker任一失败都会自动close刚签的InviteId，不留下悬空有效授权。跨平台sidecar继续沿旧`invite_issue`，不把Windows拼装出的macOS包冒充Gatekeeper-ready；
+- focused：`clew-distribution` **6/6 PASS**（含Windows release-ready product assembler exact runtime/双marker/Site绑定、wrong flavor fail closed、cache import/tamper）；Local API preflight/rollback **2/2 PASS**，最大256条ClientFlavor列表仍低于1 MiB frame；`cargo fmt -- --check` PASS；`cargo check --workspace --all-targets --locked` 0 warning；workspace **284 passed / 0 failed**（环境/interactive ignore保持原语义）。V6c-4a封板。
+
+##### V6c-4b — Controller GUI complete Site Kit output
+
+**Status：IN PROGRESS** — GUI Invite从“只保存`site.clew`并让用户自己找matching runtime”升级为native-platform完整Site Kit；显示active ClientFlavor readiness，提供release-ready artifact import入口，并调用复合`SiteKitCreate`而不是GUI自行复制签名/组装逻辑。没有matching artifact时明确阻止，不签invite。
+
+#### V6c-5 — Release docs/checkpoint cleanup
 
 **Status：TODO** — README/checkpoint/Distribution Studio/Site Kit文档与最终生产链对齐，清理V1.5/V5/V6中已经失效的“后续V6再做launcher”陈述。
 
@@ -1502,11 +1520,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel unblocked implementation block：V6c-3 — friend-facing Site Kit assembly + dual role launchers**
+**Parallel unblocked implementation block：V6c-4b — Controller GUI complete Site Kit output（V6c-3 exact Linux native closeout 同时运行）**
 
-V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据；V6c-1 ClientFlavor cache与V6c-2 protected release workflow已封板。final gap audit又确认friend-facing Site Kit的双role物理入口尚未由V6真正组装，因此当前无凭据可推进块转为V6c-3；完成后再做V6c-4纯文档一致性收口。V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
+V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据；V6c-1 ClientFlavor cache与V6c-2 protected release workflow已封板，V6c-3代码/Windows/macOS exact closeout完成、Linux exact native closeout仍在跑。进一步产品审计发现repo-only assembler还不足以满足Controller GUI一键分发，因此V6c-4a已把release/cache/Site Kit authority下沉到产品库并接入Controller；当前继续V6c-4b GUI完整Site Kit输出，最后才做V6c-5纯文档一致性收口。V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c-4a product distribution backend **DONE**：新增共享`clew-distribution` release/cache/Site Kit authority、Controller-owned release-ready ClientFlavor artifact store、native-platform product assembler与复合Local API `SiteKitCreate`；preflight发生在invite签发前，后半段失败自动close新Invite。Windows store测试实际抓修只读句柄`sync_all`的Access denied；distribution **6/6**、SiteKit transaction **2/2**、workspace **284/0**、locked check 0 warning。下一块V6c-4b Controller GUI完整Site Kit输出；V6c-3 Linux exact native closeout并行继续。
 
 - **2026-09-05** — V6c-3 Site Kit assembly implementation complete / exact-clean closeout pending：新增一次签名可复用role launcher、release `site_kit_launcher` provenance、Win/mac双launcher签名/最终分发包native verify、immutable cache + signed site.clew assembler与deterministic Linux tar。dirty Windows release ZIP=`bebaeedd...df2e6`独立verify PASS，role PE metadata/icon反读通过，dirty cache negative control PASS；workspace **274/0/7**、check 0 warning。下一步固定SHA后从clean artifact做真实Site Kit闭环。
 

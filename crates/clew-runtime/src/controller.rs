@@ -6,6 +6,7 @@ use std::{
 };
 
 use clew_core::STATE_SCHEMA_VERSION;
+use clew_distribution::ClientFlavorArtifactStore;
 use clew_identity::{ControllerIdentityStore, DeviceIdentityStoreError};
 use clew_transport::IrohOuter;
 use thiserror::Error;
@@ -166,6 +167,9 @@ pub async fn start_controller(
     let outfit_assets = Arc::new(Mutex::new(OutfitAssetStore::load_or_create(
         layout.clone(),
     )?));
+    let client_flavors = Arc::new(Mutex::new(ClientFlavorArtifactStore::new(
+        layout.client_flavor_artifacts_root(),
+    )?));
     let remote = IrohOuter::bind_with_secret(controller_identity.iroh_endpoint_secret()).await?;
     let remote_endpoint_id = remote.addr().id.to_string();
     let remote_hub = RemoteHub::default();
@@ -210,6 +214,7 @@ pub async fn start_controller(
         control,
         outfits,
         outfit_assets,
+        client_flavors,
         remote: remote_hub,
         forwards,
         socks5,
@@ -244,6 +249,8 @@ pub enum ControllerError {
     OutfitStore(#[from] crate::OutfitStoreError),
     #[error(transparent)]
     OutfitAsset(#[from] crate::OutfitAssetError),
+    #[error(transparent)]
+    Distribution(#[from] clew_distribution::DistributionError),
     #[error(transparent)]
     FileTransfer(#[from] crate::ControllerFileTransferError),
     #[error(transparent)]

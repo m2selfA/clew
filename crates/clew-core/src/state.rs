@@ -149,6 +149,11 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn client_flavor_artifacts_root(&self) -> PathBuf {
+        self.version_root().join("client-flavors")
+    }
+
+    #[must_use]
     pub fn membership_dir(&self, controller_id: ControllerId, site_id: SiteId) -> PathBuf {
         self.version_root()
             .join("memberships")

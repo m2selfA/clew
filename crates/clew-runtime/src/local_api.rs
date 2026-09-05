@@ -14,6 +14,10 @@ use clew_core::{
     DeviceSummary, ForwardId, InviteId, ProxyId, ReadPolicy, SiteId, StateLayout, TaskId,
     TransferId,
 };
+use clew_distribution::{
+    ClientFlavorArtifactStore, ClientFlavorArtifactSummary, SiteKitAssemblyRequest, SiteKitAsset,
+    assemble_site_kit,
+};
 use clew_host::{
     ClientFlavor, HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew,
     TargetPlatform,
@@ -52,6 +56,8 @@ const LOCAL_API_RESPONSE_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_ACTIVITY_LIST_LIMIT: u32 = 200;
 const MAX_BACKUP_PATH_BYTES: usize = 4096;
 const MAX_ASSET_IMPORT_PATH_BYTES: usize = 4096;
+const MAX_CLIENT_FLAVOR_IMPORT_PATH_BYTES: usize = 4096;
+const MAX_SITE_KIT_OUTPUT_PATH_BYTES: usize = 4096;
 const SECRET_BYTES: usize = 32;
 const SECRET_HEX_LEN: usize = SECRET_BYTES * 2;
 const SECRET_LOAD_RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -103,6 +109,22 @@ pub struct InviteIssueRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteIssueResult {
     pub site_file: SignedSiteClew,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SiteKitCreateRequest {
+    pub invite: InviteIssueRequest,
+    pub output_dir: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SiteKitCreateResult {
+    pub archive_path: String,
+    pub manifest_path: String,
+    pub checksums_path: String,
+    pub site_id: SiteId,
+    pub invite_id: InviteId,
+    pub client_flavor_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -355,6 +377,16 @@ pub struct OutfitAssetPreviewResponse {
     pub rgba_base64: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClientFlavorImportRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClientFlavorArtifactList {
+    pub entries: Vec<ClientFlavorArtifactSummary>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalApiErrorCode {
@@ -451,6 +483,7 @@ pub(crate) struct LocalApiState {
     pub control: Arc<Mutex<ControllerControlStore>>,
     pub outfits: Arc<Mutex<OutfitLibrary>>,
     pub outfit_assets: Arc<Mutex<OutfitAssetStore>>,
+    pub client_flavors: Arc<Mutex<ClientFlavorArtifactStore>>,
     pub remote: RemoteHub,
     pub forwards: TcpForwardManager,
     pub socks5: Socks5ProxyManager,
@@ -476,6 +509,7 @@ enum LocalMethod {
         device_id: DeviceId,
     },
     InviteIssue(InviteIssueRequest),
+    SiteKitCreate(SiteKitCreateRequest),
     InviteClose {
         invite_id: InviteId,
     },
@@ -556,6 +590,8 @@ enum LocalMethod {
         max_edge: u32,
     },
     OutfitSetAsset(OutfitSetAssetRequest),
+    ClientFlavorList,
+    ClientFlavorImport(ClientFlavorImportRequest),
     BackupExport(BackupExportRequest),
     RecoveryStatus,
     RecoveryConfirm,
@@ -569,6 +605,7 @@ enum LocalResponse {
     DeviceList(DeviceList),
     SessionPathInfo(RemoteSessionPathInfo),
     InviteIssued(InviteIssueResult),
+    SiteKitCreated(SiteKitCreateResult),
     DeviceRenamed(DeviceRecord),
     ReadResult(RemoteReadResult),
     ReadError(clew_transport::ReadErrorBody),
@@ -598,6 +635,8 @@ enum LocalResponse {
     OutfitAssetInfo(OutfitAssetInfo),
     OutfitAssetData(OutfitAssetDataResponse),
     OutfitAssetPreview(OutfitAssetPreviewResponse),
+    ClientFlavorArtifactList(ClientFlavorArtifactList),
+    ClientFlavorArtifact(ClientFlavorArtifactSummary),
     RecoveryStatus(RecoveryStatus),
     Ack,
     Error(LocalApiErrorBody),
@@ -678,6 +717,9 @@ async fn dispatch(
             (session_path_info_response(state, device_id), false)
         }
         LocalMethod::InviteIssue(request) => (issue_invite_response(state, request).await, false),
+        LocalMethod::SiteKitCreate(request) => {
+            (create_site_kit_response(state, request).await, false)
+        }
         LocalMethod::InviteClose { invite_id } => {
             let response = with_control(state, |store| {
                 store.transaction(|snapshot| {
@@ -913,6 +955,31 @@ async fn dispatch(
                 .map(LocalResponse::OutfitProfile)
                 .unwrap_or_else(LocalResponse::Error),
                 Err(error) => LocalResponse::Error(error),
+            };
+            (response, false)
+        }
+        LocalMethod::ClientFlavorList => {
+            let response = with_client_flavors(state, |store| store.list())
+                .map(|entries| {
+                    LocalResponse::ClientFlavorArtifactList(ClientFlavorArtifactList { entries })
+                })
+                .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::ClientFlavorImport(request) => {
+            let path = request.path.trim();
+            let response = if path.is_empty()
+                || path.len() > MAX_CLIENT_FLAVOR_IMPORT_PATH_BYTES
+                || !Path::new(path).is_absolute()
+            {
+                local_error(
+                    LocalApiErrorCode::InvalidRequest,
+                    "ClientFlavor import path must be a bounded absolute directory path",
+                )
+            } else {
+                with_client_flavors(state, |store| store.import_release_ready(Path::new(path)))
+                    .map(LocalResponse::ClientFlavorArtifact)
+                    .unwrap_or_else(LocalResponse::Error)
             };
             (response, false)
         }
@@ -1159,6 +1226,192 @@ async fn issue_invite_response(
     match committed {
         Ok(()) => LocalResponse::InviteIssued(InviteIssueResult { site_file }),
         Err(error) => LocalResponse::Error(error),
+    }
+}
+
+async fn create_site_kit_response(
+    state: &LocalApiState,
+    request: SiteKitCreateRequest,
+) -> LocalResponse {
+    let output_dir = request.output_dir.trim();
+    if output_dir.is_empty()
+        || output_dir.len() > MAX_SITE_KIT_OUTPUT_PATH_BYTES
+        || !Path::new(output_dir).is_absolute()
+    {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            "Site Kit output directory must be a bounded absolute path",
+        );
+    }
+    if request.invite.target_platform.is_some() || request.invite.target_arch.is_some() {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            "complete Site Kits are assembled only for the Controller's native platform; use invite_issue for cross-platform sidecars",
+        );
+    }
+
+    let profile = match with_outfits(state, |store| {
+        let outfit_id = request
+            .invite
+            .outfit_id
+            .clone()
+            .unwrap_or_else(|| store.snapshot().default_outfit_id.clone());
+        store.get(&outfit_id)
+    }) {
+        Ok(profile) => profile,
+        Err(error) => return LocalResponse::Error(error),
+    };
+    let flavor = match ClientFlavor::from_outfit_current(&profile) {
+        Ok(flavor) => flavor,
+        Err(error) => {
+            return local_error(
+                LocalApiErrorCode::InvalidRequest,
+                format!("Outfit cannot produce a current ClientFlavor: {error}"),
+            );
+        }
+    };
+    let flavor_id = match flavor.id() {
+        Ok(id) => id.path_component(),
+        Err(error) => {
+            return local_error(
+                LocalApiErrorCode::InvalidRequest,
+                format!("Outfit ClientFlavor identity is invalid: {error}"),
+            );
+        }
+    };
+    let artifact = match with_client_flavors(state, |store| store.active_for_flavor(&flavor_id)) {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => {
+            return local_error(
+                LocalApiErrorCode::InvalidRequest,
+                format!(
+                    "no release-ready ClientFlavor is active for this Outfit/current runtime ({flavor_id})"
+                ),
+            );
+        }
+        Err(error) => return LocalResponse::Error(error),
+    };
+
+    let issued = match issue_invite_response(state, request.invite).await {
+        LocalResponse::InviteIssued(result) => result,
+        LocalResponse::Error(error) => return LocalResponse::Error(error),
+        _ => {
+            return local_error(
+                LocalApiErrorCode::Internal,
+                "invite issuance returned an unexpected response",
+            );
+        }
+    };
+    let invite_id = issued.site_file.payload.bootstrap.payload.invite_id;
+    let site_id = issued.site_file.payload.bootstrap.payload.site_id;
+    let site_bytes = match issued.site_file.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return site_kit_failure_after_issue(
+                state,
+                invite_id,
+                LocalApiErrorCode::Internal,
+                format!("could not serialize freshly issued site.clew: {error}"),
+            );
+        }
+    };
+    let asset_ids = issued
+        .site_file
+        .payload
+        .outfit_profile
+        .as_ref()
+        .map(OutfitProfile::imported_asset_ids)
+        .unwrap_or_default();
+    let assets = match with_outfit_assets(state, |store| {
+        let mut output = Vec::with_capacity(asset_ids.len());
+        for asset_id in &asset_ids {
+            let data = store.read(asset_id)?;
+            output.push(SiteKitAsset {
+                asset_id: data.info.asset_id,
+                extension: data.info.format.extension().into(),
+                bytes: data.bytes,
+            });
+        }
+        Ok(output)
+    }) {
+        Ok(assets) => assets,
+        Err(error) => {
+            return site_kit_failure_after_issue(
+                state,
+                invite_id,
+                LocalApiErrorCode::InvalidRequest,
+                format!(
+                    "could not load Outfit assets for Site Kit: {}",
+                    error.message
+                ),
+            );
+        }
+    };
+
+    let site_file = issued.site_file;
+    let output_dir = Path::new(output_dir).to_path_buf();
+    let client_flavor_id = artifact.entry.client_flavor.id.clone();
+    let site_label = profile.display_name.clone();
+    let assembled = tokio::task::spawn_blocking(move || {
+        assemble_site_kit(SiteKitAssemblyRequest {
+            artifact: &artifact,
+            site_label: &site_label,
+            site_file: &site_file,
+            site_bytes: &site_bytes,
+            assets: &assets,
+            out_dir: &output_dir,
+        })
+    })
+    .await;
+    let result = match assembled {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return site_kit_failure_after_issue(
+                state,
+                invite_id,
+                LocalApiErrorCode::InvalidRequest,
+                format!("Site Kit assembly failed: {error}"),
+            );
+        }
+        Err(error) => {
+            return site_kit_failure_after_issue(
+                state,
+                invite_id,
+                LocalApiErrorCode::Internal,
+                format!("Site Kit assembly worker failed: {error}"),
+            );
+        }
+    };
+    LocalResponse::SiteKitCreated(SiteKitCreateResult {
+        archive_path: result.archive_path.to_string_lossy().into_owned(),
+        manifest_path: result.manifest_path.to_string_lossy().into_owned(),
+        checksums_path: result.checksums_path.to_string_lossy().into_owned(),
+        site_id,
+        invite_id,
+        client_flavor_id,
+    })
+}
+
+fn site_kit_failure_after_issue(
+    state: &LocalApiState,
+    invite_id: InviteId,
+    code: LocalApiErrorCode,
+    message: String,
+) -> LocalResponse {
+    match with_control(state, |store| {
+        store.transaction(|snapshot| {
+            snapshot.registry.close_invite(invite_id);
+            Ok(())
+        })
+    }) {
+        Ok(()) => local_error(code, message),
+        Err(rollback) => local_error(
+            LocalApiErrorCode::Internal,
+            format!(
+                "{message}; additionally failed to close the newly issued invite: {}",
+                rollback.message
+            ),
+        ),
     }
 }
 
@@ -2464,6 +2717,22 @@ fn with_outfit_assets<R>(
     })
 }
 
+fn with_client_flavors<R>(
+    state: &LocalApiState,
+    operation: impl FnOnce(
+        &ClientFlavorArtifactStore,
+    ) -> Result<R, clew_distribution::DistributionError>,
+) -> Result<R, LocalApiErrorBody> {
+    let store = state.client_flavors.lock().map_err(|_| LocalApiErrorBody {
+        code: LocalApiErrorCode::Internal,
+        message: "ClientFlavor artifact store is unavailable".into(),
+    })?;
+    operation(&store).map_err(|error| LocalApiErrorBody {
+        code: LocalApiErrorCode::InvalidRequest,
+        message: error.to_string(),
+    })
+}
+
 fn with_outfits<R>(
     state: &LocalApiState,
     operation: impl FnOnce(&mut OutfitLibrary) -> Result<R, crate::OutfitStoreError>,
@@ -2556,6 +2825,17 @@ impl LocalApiClient {
     ) -> Result<InviteIssueResult, LocalApiClientError> {
         match self.request(LocalMethod::InviteIssue(request)).await? {
             LocalResponse::InviteIssued(result) => Ok(result),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn site_kit_create(
+        &self,
+        request: SiteKitCreateRequest,
+    ) -> Result<SiteKitCreateResult, LocalApiClientError> {
+        match self.request(LocalMethod::SiteKitCreate(request)).await? {
+            LocalResponse::SiteKitCreated(result) => Ok(result),
             LocalResponse::Error(error) => Err(remote_error(error)),
             _ => Err(LocalApiClientError::UnexpectedResponse),
         }
@@ -3091,6 +3371,30 @@ impl LocalApiClient {
         }
     }
 
+    pub async fn client_flavor_list(
+        &self,
+    ) -> Result<ClientFlavorArtifactList, LocalApiClientError> {
+        match self.request(LocalMethod::ClientFlavorList).await? {
+            LocalResponse::ClientFlavorArtifactList(result) => Ok(result),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn client_flavor_import(
+        &self,
+        request: ClientFlavorImportRequest,
+    ) -> Result<ClientFlavorArtifactSummary, LocalApiClientError> {
+        match self
+            .request(LocalMethod::ClientFlavorImport(request))
+            .await?
+        {
+            LocalResponse::ClientFlavorArtifact(result) => Ok(result),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
     pub async fn backup_export(
         &self,
         request: BackupExportRequest,
@@ -3266,7 +3570,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use clew_identity::ControllerIdentityStore;
+    use clew_identity::{ControllerIdentityStore, DeviceIdentity, EnrollmentError};
     use tokio::io::{AsyncWriteExt, duplex};
 
     use super::*;
@@ -3278,6 +3582,9 @@ mod tests {
             .load_or_create()
             .unwrap();
         let controller_id = controller_identity.identity().controller_id();
+        let client_flavors = Arc::new(Mutex::new(
+            ClientFlavorArtifactStore::new(layout.client_flavor_artifacts_root()).unwrap(),
+        ));
         LocalApiState {
             status: ControllerStatus {
                 ready: true,
@@ -3301,6 +3608,7 @@ mod tests {
             outfit_assets: Arc::new(Mutex::new(
                 OutfitAssetStore::load_or_create(layout).unwrap(),
             )),
+            client_flavors,
             remote: RemoteHub::default(),
             forwards: TcpForwardManager::new(RemoteHub::default()),
             socks5: Socks5ProxyManager::new(RemoteHub::default()),
@@ -3312,6 +3620,24 @@ mod tests {
                 controller_id,
             ),
             shutdown_tx: watch::channel(false).0,
+        }
+    }
+
+    fn test_invite_request() -> InviteIssueRequest {
+        InviteIssueRequest {
+            site_name: "Site Kit Transaction".into(),
+            outfit_id: None,
+            target_platform: None,
+            target_arch: None,
+            roots: vec!["C:/site-kit-test".into()],
+            max_claims: 4,
+            valid_for_ms: 60_000,
+            deployment_window_ms: 30_000,
+            max_result_bytes: 4096,
+            read_timeout_ms: 1_000,
+            allow_write: false,
+            allow_shell: false,
+            allow_tcp_egress: false,
         }
     }
 
@@ -3338,6 +3664,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_flavor_store_lists_empty_and_rejects_relative_imports() {
+        let state = test_state();
+        let secret = LocalApiSecret("a".repeat(SECRET_HEX_LEN));
+        let (response, shutdown_after_reply) = dispatch(
+            LocalRequest {
+                api_version: LOCAL_API_VERSION,
+                auth: secret.0.clone(),
+                method: LocalMethod::ClientFlavorList,
+            },
+            &secret,
+            &state,
+        )
+        .await;
+        assert!(!shutdown_after_reply);
+        assert!(matches!(
+            response,
+            LocalResponse::ClientFlavorArtifactList(ClientFlavorArtifactList { entries })
+                if entries.is_empty()
+        ));
+
+        let (response, shutdown_after_reply) = dispatch(
+            LocalRequest {
+                api_version: LOCAL_API_VERSION,
+                auth: secret.0.clone(),
+                method: LocalMethod::ClientFlavorImport(ClientFlavorImportRequest {
+                    path: "relative/cache-entry".into(),
+                }),
+            },
+            &secret,
+            &state,
+        )
+        .await;
+        assert!(!shutdown_after_reply);
+        assert!(matches!(
+            response,
+            LocalResponse::Error(LocalApiErrorBody {
+                code: LocalApiErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn site_kit_create_preflights_release_ready_flavor_before_invite_issue() {
+        let state = test_state();
+        let output = tempfile::tempdir().unwrap();
+        let response = create_site_kit_response(
+            &state,
+            SiteKitCreateRequest {
+                invite: test_invite_request(),
+                output_dir: output.path().to_string_lossy().into_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            LocalResponse::Error(LocalApiErrorBody {
+                code: LocalApiErrorCode::InvalidRequest,
+                message,
+            }) if message.contains("no release-ready ClientFlavor is active")
+        ));
+        let snapshot = state.control.lock().unwrap().snapshot().clone();
+        assert!(snapshot.catalog.sites.is_empty());
+    }
+
+    #[test]
+    fn site_kit_failure_closes_newly_registered_invite() {
+        let state = test_state();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let pass = state
+            .controller_identity
+            .identity()
+            .issue_site_bootstrap(SiteBootstrapSpec {
+                site_id,
+                invite_id,
+                site_name: "Rollback Site".into(),
+                grant: PermissionGrant::EXECUTE_READ,
+                not_before_unix_ms: now,
+                expires_unix_ms: now + 60_000,
+                deployment_window_ms: 30_000,
+                max_claims: 2,
+            })
+            .unwrap();
+        with_control(&state, |store| {
+            store.transaction(|snapshot| {
+                snapshot.registry.register_pass(&pass)?;
+                Ok(())
+            })
+        })
+        .unwrap();
+
+        let response = site_kit_failure_after_issue(
+            &state,
+            invite_id,
+            LocalApiErrorCode::InvalidRequest,
+            "forced assembly failure".into(),
+        );
+        assert!(matches!(
+            response,
+            LocalResponse::Error(LocalApiErrorBody {
+                code: LocalApiErrorCode::InvalidRequest,
+                message,
+            }) if message == "forced assembly failure"
+        ));
+
+        let mut registry = state.control.lock().unwrap().snapshot().registry.clone();
+        let device = DeviceIdentity::generate().unwrap().public_identity();
+        assert!(matches!(
+            registry.claim(&pass, device, now + 1),
+            Err(EnrollmentError::InviteClosed)
+        ));
+    }
+
+    #[tokio::test]
     async fn systemd_user_lifecycle_rejects_local_api_shutdown() {
         let mut state = test_state();
         state.status.lifecycle_owner = crate::ControllerLifecycleOwner::SystemdUser;
@@ -3360,6 +3805,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn maximum_client_flavor_list_stays_within_local_api_frame_bound() {
+        let entry = ClientFlavorArtifactSummary {
+            cache_key: format!("client-flavor-v1-{}", "a".repeat(64)),
+            client_flavor_id: "f".repeat(128),
+            outfit_id: "o".repeat(128),
+            outfit_revision: u32::MAX,
+            build_cache_key: format!("outfit-v1-{}", "b".repeat(64)),
+            app_display_name: "A".repeat(256),
+            version: "1".repeat(64),
+            target: "x".repeat(128),
+            platform: clew_distribution::ReleasePlatform::Linux,
+            arch: "x86_64".into(),
+            source_commit: "c".repeat(40),
+            release_ready: true,
+            active: false,
+        };
+        let response = LocalResponse::ClientFlavorArtifactList(ClientFlavorArtifactList {
+            entries: vec![entry; clew_distribution::MAX_STORED_CLIENT_FLAVORS],
+        });
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= MAX_LOCAL_API_FRAME_SIZE);
     }
 
     #[test]

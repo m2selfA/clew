@@ -17,6 +17,10 @@ mod transfer;
 mod transport;
 
 pub use backup::{ControllerBackupIoError, export_controller_backup, restore_controller_backup};
+pub use clew_distribution::{
+    ClientFlavorArtifactStore, ClientFlavorArtifactSummary, DistributionError, ReleasePlatform,
+    ValidatedClientFlavorArtifact,
+};
 pub use clew_transport::{
     FileConflictPolicy, FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus,
 };
@@ -40,17 +44,17 @@ pub use http_connect::{
     HttpConnectProxyManager, HttpConnectProxyManagerError,
 };
 pub use local_api::{
-    ActivityList, BackupExportRequest, ControllerStatus, DeviceList, ForwardAddRequest,
-    ForwardList, HttpConnectAddRequest, HttpConnectList, InviteIssueRequest, InviteIssueResult,
-    LOCAL_API_VERSION, LocalApiClient, LocalApiClientError, LocalApiErrorCode,
-    MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE, OutfitAssetDataResponse,
-    OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse, OutfitCloneRequest,
-    OutfitCreateRequest, OutfitList, OutfitSetAssetRequest, OutfitSetFieldRequest,
-    OutfitUpdateRequest, RecoveryStatus, RemoteDirectoryGetRequest, RemoteDirectoryPutRequest,
-    RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest, RemoteGlobRequest,
-    RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest, RemoteReadResult,
-    RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest,
-    Socks5AddRequest, Socks5List,
+    ActivityList, BackupExportRequest, ClientFlavorArtifactList, ClientFlavorImportRequest,
+    ControllerStatus, DeviceList, ForwardAddRequest, ForwardList, HttpConnectAddRequest,
+    HttpConnectList, InviteIssueRequest, InviteIssueResult, LOCAL_API_VERSION, LocalApiClient,
+    LocalApiClientError, LocalApiErrorCode, MAX_LOCAL_API_CONNECTIONS, MAX_LOCAL_API_FRAME_SIZE,
+    OutfitAssetDataResponse, OutfitAssetImportRequest, OutfitAssetList, OutfitAssetPreviewResponse,
+    OutfitCloneRequest, OutfitCreateRequest, OutfitList, OutfitSetAssetRequest,
+    OutfitSetFieldRequest, OutfitUpdateRequest, RecoveryStatus, RemoteDirectoryGetRequest,
+    RemoteDirectoryPutRequest, RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest,
+    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
+    RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
+    RemoteWriteRequest, SiteKitCreateRequest, SiteKitCreateResult, Socks5AddRequest, Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,
