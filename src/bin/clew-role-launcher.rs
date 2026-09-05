@@ -3,11 +3,14 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{Command, ExitCode},
 };
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+#[cfg(any(windows, target_os = "macos"))]
+use std::process::Stdio;
 
 const ROLE_FILE: &str = "role-hint.clew";
 const USE_THIS_MACHINE: &[u8] = b"use-this-machine\n";

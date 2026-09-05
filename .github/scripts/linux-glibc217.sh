@@ -61,9 +61,10 @@ extract_root="$(mktemp -d)"
 trap 'rm -rf "$extract_root"' EXIT
 unzip -q "$archive" -d "$extract_root"
 
-binary="$extract_root/bin/clew"
+archive_root="$extract_root/$(basename "$archive" .zip)"
+binary="$archive_root/bin/clew"
 if [[ ! -x "$binary" ]]; then
-  echo "packaged Linux runtime is missing or not executable: bin/clew" >&2
+  echo "packaged Linux runtime is missing or not executable: $(basename "$archive" .zip)/bin/clew" >&2
   exit 1
 fi
 
