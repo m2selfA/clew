@@ -1,6 +1,6 @@
 # Clew Development Checkpoint
 
-状态：**正式开发 / V2 Agent Minimum IN PROGRESS**
+状态：**正式开发 / V7 Advanced Service Runtime DONE；V6b-3b external credential acceptance BLOCKED**
 架构基线：**Architecture v1.5**
 更新时间：**2026-09-05**
 
@@ -62,8 +62,8 @@
 | V4 | Dynamic networking | DONE | Controller-owned TCP forward / SOCKS5 CONNECT / HTTP CONNECT + non-migration |
 | V5 | File plane | DONE | single-file + directory Put/Get、process-restart durability、bounded multi-file concurrency 全闭合 |
 | V6 | Release packaging | IN PROGRESS | reproducible unsigned/native/sign+verify baseline DONE；real credential acceptance 外部阻塞 |
-| V7 | Advanced Service Runtime | IN PROGRESS | V7a/V7b DONE；V7c implementation complete，exact-commit native closeout pending |
-| V8+ | Deferred expansion | TODO | 仅按真实需求评估 Directory、dedicated relay、第二 transport 等 |
+| V7 | Advanced Service Runtime | DONE | Linux user/system + Windows machine/user-session lifecycle、低权限 identity 与恢复边界全闭合 |
+| V8+ | Deferred expansion | TODO | 仅按真实需求评估 federation、dedicated relay、第二 transport 等 |
 
 **第一条对外可用版本仍是 V1.4 完成后的 V1。** Studio 和 Connector 都不能阻塞 direct Read。
 
@@ -1393,7 +1393,7 @@ Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”�
 
 ## 14. V7 — Advanced Service Runtime
 
-**Status：IN PROGRESS**
+**Status：DONE（2026-09-05）**
 
 服务化是高级显式 opt-in，不改变 v1 portable/tray/foreground 默认路径。
 
@@ -1422,17 +1422,17 @@ cap00 exact-commit native acceptance（`f38af723...`）：ControllerId保持 `a3
 
 **V7b-2 Windows user-session control plane：DONE。** implementation commit `3ebc9fe22258746a0cc2c3253c1c2c9d769fdde5`，docs close `cbd4890b666f74b86a62efe70caa66c162e79981`。installer user SID固化进SCM/control-pipe ACL；restricted-token验收证明authorized standard user可status/start/stop，却不能CHANGE_CONFIG/DELETE，也不能读取ProgramData machine secrets。mzd Active RDP Session 2的同session inspector确认`Clew Background Service`窗口真实可见，`WM_CLOSE`后同PID保持而窗口隐藏，完成close-to-tray语义。
 
-**V7c Linux machine Connector service：IN PROGRESS（implementation complete；exact-commit native closeout pending）。** 新增`clew-service`静态低权限system account、独立`/var/lib/clew-service` machine identity/state、root-owned只读kit/config、service-owned可写state，以及`/usr/local/lib/clew-service/clew`固定binary。unit强制`--foreground --connector-only`并启用systemd hardening；install/enable/start/stop/disable/uninstall严格分离。`start`/`enable`重证managed files、uid/gid、mode与binary/Site Kit SHA；损坏payload不能启动但仍可disable/uninstall。Host foreground新增SIGTERM graceful shutdown。Distribution mint同时补`--target-platform/--target-arch`，允许Controller安全签出目标Linux ClientFlavor，默认未指定时保持当前平台语义。
+**V7c Linux machine Connector service：DONE（2026-09-05）。** implementation commit `921a5f430327cc3597048f67430387c9adf5b495`。新增`clew-service`静态低权限system account、独立`/var/lib/clew-service` machine identity/state、root-owned只读kit/config、service-owned可写state，以及`/usr/local/lib/clew-service/clew`固定binary。unit强制`--foreground --connector-only`并启用systemd hardening；install/enable/start/stop/disable/uninstall严格分离。`start`/`enable`重证managed files、uid/gid、mode与binary/Site Kit SHA；损坏payload不能启动但仍可disable/uninstall。Host foreground新增SIGTERM graceful shutdown。Distribution mint同时补`--target-platform/--target-arch`，允许Controller安全签出目标Linux ClientFlavor，默认未指定时保持当前平台语义。
 
-wmn02 EL8/systemd 239 dirty-worktree native acceptance使用固定Rust/Cargo 1.96.0：workspace all-target check PASS，V7c **2/2**、既有service **3/3**、binary build PASS。install-only后disabled/inactive；权限独立反读为binary root:root 0755，machine root/kit/config root:clew-service只读，state clew-service:clew-service 0700；普通用户读Site/config拒绝，service user可读不可改且可写state。enable仍inactive；start后unit active并明确输出“connecting only as a nearby connection helper”。正常stop→start从PID `846412`到`846824`，SIGKILL后systemd 2秒恢复为`846987`，三阶段`device-key.pending.json` SHA均为`8d0ba76c...bdeb55`，证明machine identity没有因service lifecycle重建。篡改installed binary后start hash fail closed，而disable/uninstall仍成功，最终unit/root/user/group全清空。
+wmn02 EL8/systemd 239完整lifecycle acceptance使用固定Rust/Cargo 1.96.0：install-only后disabled/inactive；权限独立反读为binary root:root 0755，machine root/kit/config root:clew-service只读，state clew-service:clew-service 0700；普通用户读Site/config拒绝，service user可读不可改且可写state。enable仍inactive；start后unit active并明确输出“connecting only as a nearby connection helper”。正常stop→start从PID `846412`到`846824`，SIGKILL后systemd 2秒恢复为`846987`，三阶段`device-key.pending.json` SHA均为`8d0ba76c...bdeb55`，证明machine identity没有因service lifecycle重建。篡改installed binary后start hash fail closed，而disable/uninstall仍成功，最终unit/root/user/group全清空。implementation commit固定后再次从clean checkout `921a5f430327...` 原生复核：Rust/Cargo 1.96.0，`cargo check -p clew --all-targets --locked` PASS，V7c **4/4**、既有service **3/3**、binary build PASS；exact-SHA install仍严格disabled/inactive，account/mode/read-write反证与`systemd-analyze verify`全部通过，uninstall再次回到零状态。cap00最终`cargo test --workspace --all-targets --locked`为 **272 passed / 0 failed**。
 
-当前同一wmn02上的fresh public enrollment被外部relay链路阻断：`clew-service`与普通foreground Host使用同一binary/Site Kit都无法完成claim；同机Controller甚至明确报`iroh endpoint did not become relay-online before timeout`，因此已用A/B排除systemd sandbox/account。旧journal在同机网络可用时曾完成Connector-only enrollment；本轮不把该历史证据冒充最终exact-commit claim，也不把当前relay故障归类为V7c代码回归。实现提交后仍需用固定SHA做短native closeout。
+当前同一wmn02上的fresh public enrollment被外部relay链路阻断：`clew-service`与普通foreground Host使用同一binary/Site Kit都无法完成claim；同机Controller甚至明确报`iroh endpoint did not become relay-online before timeout`，因此已用A/B排除systemd sandbox/account。旧journal在同机网络可用时曾完成Connector-only enrollment；本轮不把该历史证据冒充final claim，也不把当前relay故障归类为V7c代码回归。V7c的service/runtime acceptance已由独立systemd mechanics、identity durability、tamper与exact-commit权限闭环满足。
 
 ## 15. V8+ — 明确后置
 
 在真实需求出现前不实现：
 
-- Directory/federation；
+- federation / 超出 V5 bounded tree transfer 的大规模目录语义；
 - dedicated relay management；
 - 第二 transport；
 - Linux desktop tray；
@@ -1464,15 +1464,15 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel closeout block：V7c — implementation complete；exact-commit native closeout pending**
+**Parallel unblocked implementation block：none — V7 complete；V8+ remains explicitly deferred**
 
-V6b-3b仍只剩外部正式签名凭据。V7a与V7b已封板；V7c machine system service的代码、权限模型、systemd mechanics与tamper/recovery真机验收已完成，当前只剩固定implementation SHA后的短native复核与docs封板。wmn02当前到n0 relay的fresh enrollment链路异常已用同机ordinary Host/local Controller A/B证明为环境问题，不扩大V7c代码范围。Distribution Studio signed-output/cache继续后置到真实签名acceptance。
+V7 Advanced Service Runtime 已全线封板：Linux `systemd --user`、Windows machine Connector + authorized user-session control plane、Linux system Connector service均完成代码和native acceptance。当前路线图唯一正式release blocker仍是V6b-3b的外部真实签名凭据；在这些凭据可用前不启动V8+ deferred expansion，也不把wmn02当前n0 relay egress异常扩大成新的service开发块。Distribution Studio signed-output/cache继续后置到真实签名acceptance。
 
 ### Change log
 
-- **2026-09-05** — V7c Linux machine Connector service **implementation complete / exact-commit closeout pending**：新增dedicated `clew-service` account、machine-only state、root只读kit/config + service可写state、Connector-only hardened systemd unit、SIGTERM graceful Host、payload hash fail-closed与损坏后可清理语义；同时补跨平台mint target ClientFlavor。wmn02 EL8/systemd239 native check与focused tests通过，真实install/permissions/enable/start/stop/restart/SIGKILL recovery/tamper/uninstall闭环通过，pending DeviceKey SHA跨正常/异常重启保持不变。fresh relay enrollment当前被集群n0 relay egress异常阻断，ordinary Host与local Controller A/B同样失败，因此记录为环境阻塞而非service回归。实现commit固定后做最后短native closeout。
+- **2026-09-05** — V7c Linux machine Connector service **DONE / V7 ADVANCED SERVICE RUNTIME DONE**：implementation commit `921a5f430327cc3597048f67430387c9adf5b495`。新增dedicated `clew-service` account、machine-only state、root只读kit/config + service可写state、Connector-only hardened systemd unit、SIGTERM graceful Host、payload hash fail-closed与损坏后可清理语义，并补跨平台mint target ClientFlavor。wmn02 EL8/systemd239完整install/permissions/enable/start/stop/restart/SIGKILL recovery/tamper/uninstall闭环通过，pending DeviceKey SHA跨正常/异常重启保持不变；exact commit clean checkout再通过check、V7c **4/4**、service **3/3**、build、disabled/inactive install-only、权限反证、unit verify与zero-state uninstall。cap00最终workspace **272/0**。fresh relay enrollment当前被集群n0 relay egress异常阻断，ordinary Host/local Controller A/B同样失败，因此明确记录为环境阻塞而非service回归。V7至此全线封板。
 
-- **2026-09-05** — V7b-2 Windows user-session control plane **DONE**：implementation commit `3ebc9fe service: add Windows user-session control plane`。machine metadata schema 2固化installer user SID+service SID；SCM DACL仅给authorized user Query/Start/Stop/Interrogate/ReadControl，ProgramData仍只允许SYSTEM/Admin/service SID；独立`clew-machine-control-v1` pipe使用explicit SECURITY_ATTRIBUTES + remote-client reject + SCM PID反证，只投影bounded Connector-only runtime status，并冻结16KiB/2s/7-active+1-listener admission。`clew service status --scope machine`合并SCM+runtime，新增`service gui` Eframe/tray client。cap00 restricted-token真机测试移除Administrators后仍通过生产status→stop→start→serving_connector，同时CHANGE_CONFIG/DELETE与ProgramData `service.json`读取均拒绝；root package **33/0/2**，workspace **271/0**，workspace locked check 0 warnings。exact commit binary SHA=`38e5444b8443c1057f73b69684168778c0c0037c8c6c0ad1ae061a10ac45e591` 投到 mzd Active RDP Session 2；同session `EnumWindows` inspector确认PID `24308`存在 visible title=`Clew Background Service`；发送`WM_CLOSE`后同PID仍alive且该窗口`visible=false`，证明close→hide-to-tray语义。mzd临时task/binary/process均清理。V7b整体封板；下一块V7c Linux system service。
+- **2026-09-05** — V7b-2 Windows user-session control plane **DONE**：implementation commit `3ebc9fe service: add Windows user-session control plane`。machine metadata schema 2固化installer user SID+service SID；SCM DACL仅给authorized user Query/Start/Stop/Interrogate/ReadControl，ProgramData仍只允许SYSTEM/Admin/service SID；独立`clew-machine-control-v1` pipe使用explicit SECURITY_ATTRIBUTES + remote-client reject + SCM PID反证，只投影bounded Connector-only runtime status，并冻结16KiB/2s/7-active+1-listener admission。`clew service status --scope machine`合并SCM+runtime，新增`service gui` Eframe/tray client。cap00 restricted-token真机测试移除Administrators后仍通过生产status→stop→start→serving_connector，同时CHANGE_CONFIG/DELETE与ProgramData `service.json`读取均拒绝；root package **33/0/2**，workspace **271/0**，workspace locked check 0 warnings。exact commit binary SHA=`38e5444b8443c1057f73b69684168778c0c0037c8c6c0ad1ae061a10ac45e591` 投到 mzd Active RDP Session 2；同session `EnumWindows` inspector确认PID `24308`存在 visible title=`Clew Background Service`；发送`WM_CLOSE`后同PID仍alive且该窗口`visible=false`，证明close→hide-to-tray语义。mzd临时task/binary/process均清理。V7b整体封板。
 
 - **2026-09-05** — V7b-1 Windows machine Connector service DONE：实现 commit `f38af72346db4fab78cbb7a2d53452c4779ee46e`；LocalService +独立service SID、ProgramData machine identity、Win32 protected 3-ACE DACL、Connector-only单调降权、SCM显式生命周期、2s/10s/60s failure restart、payload hash fail-closed且损坏后仍可stop/disable/uninstall。并修复Windows Local API对等价relative state-dir拼写生成不同pipe的问题。focused Windows service/ACL **4/4**、controller CLI **10/10**、workspace **263/0/6**、check 0 warning。cap00 exact-commit install为manual/stopped，独立ACL/SCM/hash反读全匹配；enable不启动；service设备`f3f44d9d-89ce-4163-ac1c-88befee361b1`始终`execute=false/connector=true`，stop/start保持同ID；强杀pid `105492`后SCM拉起`107124`且同ID恢复；篡改binary后start拒绝而uninstall仍成功，最终SCM/root/Controller清空。下一块V7b-2 protected cross-session machine IPC + user-session tray/GUI/CLI client。
 

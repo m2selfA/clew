@@ -1,6 +1,6 @@
 # Advanced Service Runtime
 
-Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 与 V7b Windows machine runtime/user-session control plane 已完成；V7c Linux machine system service 也已进入实现收口，继续保持 Connector-only、独立 machine identity 与显式 lifecycle。
+Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user`、V7b Windows machine runtime/user-session control plane 与 V7c Linux machine system service 均已完成；三条路径都保持显式 lifecycle，machine runtime继续使用独立 identity 并默认 Connector-only。
 
 ## V7a：Linux `systemd --user`
 
