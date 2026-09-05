@@ -1395,17 +1395,17 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6c-1 — Outfit build contract + native ClientFlavor artifact cache
 
-**Status：IN PROGRESS（implementation complete；exact-clean cache closeout pending）**
+**Status：DONE（2026-09-05）**
 
 - 新增无secret `OutfitBuildSpec v1`：profile `build_cache_key`与精确imported asset集合绑定，asset path固定`assets/<sha256-id>.png|svg`，512 KiB hard bound，缺失/额外/重复/path escape/size/hash不一致全部fail closed；`clew outfit export-build`通过独立argv小parser从Local API导出，避免再次扩大Windows root Clap tree，输出只含`outfit-build.json`与内容寻址视觉资产，不包含Controller/Site/Device身份秘密；
 - `cargo xtask package --outfit-build <dir>`现在把同一Outfit真正投影进native发布物：Windows PE ProductName/FileDescription/icon，macOS Info.plist/AppIcon.icns，Linux desktop Name与SVG/PNG icon；自定义Outfit必须真实build，禁止`--no-build`把旧PE冒充新品牌。schema-2/3 manifest增加可选`client_flavor` provenance（ID/outfit revision/build key/app name/icon provenance），旧manifest仍可验证；
 - 新增`cache-client-flavor`不可变缓存：cache key绑定ClientFlavor ID、Outfit build key、runtime version、target/profile/source commit以及signing mechanism/identity，不包含Site/invite；entry发布前与cache hit都重新跑`verify-package`并复核exact file set/hash。Linux clean schema-2可作为当前final；Windows/macOS默认只接受schema-3签名成品，unsigned只可显式`--allow-unsigned-rehearsal`且`release_ready=false`；
 - cap00 dirty-worktree真实链已通过：Research Lab Outfit导入32×32 PNG并升revision 2，export build文件集合精确为spec+单一content-addressed PNG；Windows branded package ZIP SHA=`970c1446...4b39`，独立`verify-package` PASS，manifest记录ClientFlavor=`f0a0ff50...38d34`/Outfit=`v6c-smoke`/PNG asset provenance，PE `ProductName/FileDescription=Research Connect`且associated icon可提取。Windows root/help栈在初版新增Clap节点时暴露回归，最终用独立parser+boxed async future恢复，focused help regression PASS；
-- implementation commit固定后仍需从clean SHA重打同一Outfit，完成`dirty=false` verify以及cache miss→same-key hit，之后才标DONE。
+- implementation=`737849bdedb3650ebb0884983f08094b28f4d63e`，Windows atomic rename fix=`a47c8c064bebdb56dd17c6bc75a37d62ec7b9d7f`。exact clean `a47c8c0`使用同一build spec重包：`dirty=false/source_commit=a47c8c0...`，ZIP SHA=`ad080260f19d75962a1cb0621cc0a1b42af5e10972e796009651bc97807fca73`；cache第一次miss、第二次same-key hit，key=`client-flavor-v1-1143eba422330b9b981932ae5e96fbd53325e8366239ac55fe48ee580c06e565`，两次都重新verify；Windows unsigned rehearsal保持`release_ready=false`。首次cache真机还暴露Windows打开`cache-entry.json`句柄阻止目录rename，显式drop后exact clean复验通过。V6c-1封板。
 
 #### V6c-2 — Protected release workflow / dry-run
 
-**Status：TODO** — 在V6c-1封板后增加tag/workflow_dispatch release pipeline、unsigned rehearsal、protected Windows/macOS signing jobs、独立verify与GitHub Release汇聚；真实签名执行仍由V6b-3b凭据gate约束。
+**Status：IN PROGRESS** — 增加tag/workflow_dispatch release pipeline、unsigned rehearsal、protected Windows/macOS signing jobs、独立verify与GitHub Release汇聚；真实签名执行仍由V6b-3b凭据gate约束。
 
 #### V6c-3 — Release docs/checkpoint cleanup
 
@@ -1486,11 +1486,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel unblocked implementation block：V6c-1 — exact-clean ClientFlavor cache closeout**
+**Parallel unblocked implementation block：V6c-2 — protected release workflow / dry-run**
 
 V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据，但不再等待凭据才建设发布生产系统：V6c先完成Outfit build contract、ClientFlavor cache、protected release workflow与文档收口；V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c-1 ClientFlavor production cache **DONE**：implementation `737849b` + Windows atomic rename fix `a47c8c0`。secret-free Outfit build export、三平台native branding、manifest ClientFlavor provenance与immutable verified cache落地；exact clean Windows branded artifact ZIP=`ad080260...ca73`，cache key=`client-flavor-v1-1143eba4...6e565`完成miss→hit，两次均verify，unsigned Windows明确`release_ready=false`。下一块V6c-2 protected release workflow。
 
 - **2026-09-05** — V6c-1 implementation complete / exact-clean closeout pending：新增secret-free Outfit build export、target-native branded package、manifest ClientFlavor provenance与immutable verified cache；cap00真实PNG Outfit→Windows release链通过，PE name/icon与manifest一致，xtask 12/12及Windows root/help栈focused回归PASS。下一步先固定implementation SHA，再从clean checkout重包并做cache miss→hit后封板。
 
