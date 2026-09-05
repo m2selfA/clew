@@ -1139,7 +1139,7 @@ V4b SOCKS5 TCP至此封板。下一块 V4c：HTTP CONNECT，继续复用同一 C
 
 ## 12. V5 — File Plane
 
-**Status：IN PROGRESS（V5a single-file + process-restart durability + FileResume feature gate DONE；next directory tree）**
+**Status：DONE（2026-09-04）** — V5a single-file/FileResume + V5b bounded directory Put/Get/process-restart durability/multi-file concurrency 均已封板。
 
 ### V5a-0 — Single-file manifest / deterministic chunk contract
 
@@ -1320,7 +1320,7 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ## 13. V6 — Release Packaging
 
-**Status：IN PROGRESS**
+**Status：IMPLEMENTATION COMPLETE / RELEASE ACCEPTANCE BLOCKED ONLY BY V6b-3b EXTERNAL CREDENTIALS**
 
 ### V6a — Reproducible unsigned cross-platform artifact baseline
 
@@ -1337,7 +1337,7 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ### V6b — Native release metadata + branding + portable layout
 
-**Status：IN PROGRESS**
+**Status：IMPLEMENTATION COMPLETE / V6b-3b REAL-CREDENTIAL ACCEPTANCE BLOCKED**
 
 #### V6b-1 — Windows native PE metadata/icon
 
@@ -1366,7 +1366,7 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6b-3 — Windows signing + macOS signing/notarization
 
-**Status：IN PROGRESS（V6b-3a baseline DONE；V6b-3b real-credential acceptance BLOCKED/NEXT）**
+**Status：BASELINE DONE / V6b-3b REAL-CREDENTIAL ACCEPTANCE BLOCKED（外部凭据）**
 
 ##### V6b-3a — Secret-free signing + independent verification baseline
 
@@ -1440,7 +1440,7 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ##### V6c-4b — Controller GUI complete Site Kit output
 
-**Status：DONE（2026-09-05）** — GUI Invite已从“只保存`site.clew`并让用户自己找matching runtime”升级为native-platform完整Site Kit：Snapshot同步ClientFlavor artifact catalog；Invite面板显示default Outfit与matching active release-ready runtime readiness，提供受后端严格校验的ClientFlavor cache import；主按钮只在Outfit revision + runtime version + native platform/arch + active/release-ready全部精确匹配时可用，并调用复合`SiteKitCreate`，没有matching artifact时不签invite。旧sidecar-only路径保留在明确标注的Advanced折叠区。readiness纯函数回归覆盖inactive/not-ready/revision/version/platform/arch六类错配；workspace locked check 0 warning，workspace **285 passed / 0 failed**。
+**Status：DONE（2026-09-05）** — GUI Invite已从“只保存`site.clew`并让用户自己找matching runtime”升级为native-platform完整Site Kit：Snapshot同步ClientFlavor artifact catalog；Invite面板显示default Outfit与matching active release-ready runtime readiness，提供受后端严格校验的ClientFlavor cache import；主按钮只在Outfit revision + runtime version + native platform/arch + active/release-ready全部精确匹配时可用，并调用复合`SiteKitCreate`，没有matching artifact时不签invite。旧sidecar-only路径保留在明确标注的Advanced折叠区。readiness纯函数回归覆盖inactive/not-ready/revision/version/platform/arch六类错配；workspace locked check 0 warning，workspace **285 passed / 0 failed**。最终productization commit=`5b8e0c833ffb16df0ee69e66f417b973f73e98a4`；从该clean HEAD重建的Windows GUI binary SHA-256=`fdac44cb46cddddf1badf9b6275e1cf15e965373c8bb5333dabfe03eca555a97`投到mzd Active RDP Session 2，同session Win32 `EnumWindows` inspector精确看到`pid=17192 / visible=True / title=Clew`且task result=0；GUI与auto-Controller均运行在Session 2。临时task/binary/state/inspector随后全部清理。
 
 #### V6c-5 — Release docs/checkpoint cleanup
 
