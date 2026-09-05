@@ -1,0 +1,25 @@
+self-hosted-runner:
+  # Labels of self-hosted runner in array of strings.
+  labels:
+    - clew-release-windows
+    - clew-release-macos
+
+# Configuration variables in array of strings defined in your repository or
+# organization. `null` means disabling configuration variables check.
+# Empty array means no configuration variable is allowed.
+config-variables:
+  - CLEW_WINDOWS_CERT_SHA1
+  - CLEW_WINDOWS_TIMESTAMP_URL
+  - CLEW_MACOS_DEVELOPER_ID
+  - CLEW_MACOS_NOTARY_PROFILE
+
+# Configuration for file paths. The keys are glob patterns to match to file
+# paths relative to the repository root. The values are the configurations for
+# the file paths. Note that the path separator is always '/'.
+# The following configurations are available.
+#
+# "ignore" is an array of regular expression patterns. Matched error messages
+# are ignored. This is similar to the "-ignore" command line option.
+paths:
+#  .github/workflows/**/*.yml:
+#    ignore: []

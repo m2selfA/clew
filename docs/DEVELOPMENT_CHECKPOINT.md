@@ -1405,7 +1405,13 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6c-2 — Protected release workflow / dry-run
 
-**Status：IN PROGRESS** — 增加tag/workflow_dispatch release pipeline、unsigned rehearsal、protected Windows/macOS signing jobs、独立verify与GitHub Release汇聚；真实签名执行仍由V6b-3b凭据gate约束。
+**Status：IN PROGRESS（implementation complete；exact-clean three-platform rehearsal pending）**
+
+- 新增`.github/workflows/release.yml`：`workflow_dispatch` rehearsal与`v*`/显式publish共用一份workflow；metadata job要求publish ref精确等于`v<Cargo version>`，普通rehearsal只跑GitHub-hosted Windows/macOS/Linux clean package→verify→unsigned cache rehearsal，不触达签名机；
+- Windows/macOS publish jobs只运行于`release` environment保护的`self-hosted + clew-release-windows|macos` runner，workflow只接收公开证书thumbprint/timestamp URL/Developer ID identity/notary profile名称，私钥与认证材料继续只存在OS credential store/Keychain；签后再次独立verify，并要求正式`cache-client-flavor`（无rehearsal flag）进入release-ready缓存；
+- 最终publish job是唯一拥有`contents: write`的job，只汇聚signed Windows、signed/notarized macOS、verified Linux三平台exact 6-file release set，重新生成统一`SHA256SUMS`并`gh release create --verify-tag`；PR/普通CI保持现有secret-free unsigned路径；
+- 新增`.github/actionlint.yaml`登记两个custom runner label与4个允许的公开配置变量。固定`actionlint v1.7.7`对release workflow **0 error**；静态扫描确认workflow没有PFX/P12/password/private-key参数，`contents: write`只出现在最终publish job。下载artifact后的manifest查找使用递归且exact-one校验，避免`upload-artifact`多路径层级差异；
+- implementation commit固定后仍需在clean SHA上按workflow等价命令完成Windows/macOS/Linux native `package → verify-package → cache-client-flavor rehearsal`，再标DONE。真实Windows/macOS签名仍由V6b-3b外部凭据gate收口。
 
 #### V6c-3 — Release docs/checkpoint cleanup
 
@@ -1491,6 +1497,8 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据，但不再等待凭据才建设发布生产系统：V6c先完成Outfit build contract、ClientFlavor cache、protected release workflow与文档收口；V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c-2 protected release workflow implementation complete / native rehearsal pending：新增tag/manual dual-mode workflow、protected self-hosted Windows/macOS signing jobs、独立verify/cache与唯一contents-write GitHub Release汇聚；actionlint 1.7.7零错误，public selector/permission边界静态审计通过。下一步固定SHA后做三平台clean rehearsal。
 
 - **2026-09-05** — V6c-1 ClientFlavor production cache **DONE**：implementation `737849b` + Windows atomic rename fix `a47c8c0`。secret-free Outfit build export、三平台native branding、manifest ClientFlavor provenance与immutable verified cache落地；exact clean Windows branded artifact ZIP=`ad080260...ca73`，cache key=`client-flavor-v1-1143eba4...6e565`完成miss→hit，两次均verify，unsigned Windows明确`release_ready=false`。下一块V6c-2 protected release workflow。
 

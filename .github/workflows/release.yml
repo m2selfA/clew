@@ -1,0 +1,319 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Rehearse unsigned release or publish from an existing v<version> tag"
+        required: true
+        default: rehearsal
+        type: choice
+        options:
+          - rehearsal
+          - publish
+
+concurrency:
+  group: clew-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Validate release ref
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      publish_requested: ${{ steps.meta.outputs.publish_requested }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate version and release mode
+        id: meta
+        shell: bash
+        env:
+          DISPATCH_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ { if (in_package) exit }
+            in_package && /^version = "/ {
+              value=$0
+              sub(/^version = "/, "", value)
+              sub(/"$/, "", value)
+              print value
+              exit
+            }
+          ' Cargo.toml)"
+          test -n "$version"
+
+          publish_requested=false
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            publish_requested=true
+          elif [[ "${DISPATCH_MODE:-rehearsal}" == "publish" ]]; then
+            publish_requested=true
+          fi
+
+          if [[ "$publish_requested" == "true" ]]; then
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "v$version"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish_requested=$publish_requested" >> "$GITHUB_OUTPUT"
+          echo "version=$version publish_requested=$publish_requested ref=$GITHUB_REF"
+
+  unsigned:
+    name: Unsigned ${{ matrix.os }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - macos-14
+          - ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Build deterministic unsigned package
+        run: cargo xtask package --out-dir dist
+
+      - name: Verify and cache rehearsal (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $manifest = Get-ChildItem dist -Filter *.release.json | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $manifest) { throw 'release manifest was not produced' }
+          cargo xtask verify-package --manifest $manifest
+          cargo xtask cache-client-flavor --manifest $manifest --cache-dir dist-client-flavors --allow-unsigned-rehearsal
+
+      - name: Verify and cache rehearsal (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(find dist -maxdepth 1 -type f -name '*.release.json' -print -quit)"
+          test -n "$manifest"
+          cargo xtask verify-package --manifest "$manifest"
+          cargo xtask cache-client-flavor --manifest "$manifest" --cache-dir dist-client-flavors --allow-unsigned-rehearsal
+
+      - name: Upload unsigned release input
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-${{ matrix.os }}
+          path: |
+            dist/*.zip
+            dist/*.release.json
+            dist/SHA256SUMS
+            dist-client-flavors/**/cache-entry.json
+          if-no-files-found: error
+
+  sign-windows:
+    name: Sign Windows
+    if: needs.metadata.outputs.publish_requested == 'true'
+    needs:
+      - metadata
+      - unsigned
+    runs-on:
+      - self-hosted
+      - clew-release-windows
+    environment: release
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+
+      - name: Download unsigned Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-windows-2022
+          path: unsigned
+
+      - name: Require public signing selectors
+        shell: pwsh
+        env:
+          CERT_SHA1: ${{ vars.CLEW_WINDOWS_CERT_SHA1 }}
+          TIMESTAMP_URL: ${{ vars.CLEW_WINDOWS_TIMESTAMP_URL }}
+        run: |
+          if ($env:CERT_SHA1 -notmatch '^[0-9A-Fa-f]{40}$') { throw 'CLEW_WINDOWS_CERT_SHA1 must be a 40-hex public thumbprint' }
+          if ($env:TIMESTAMP_URL -notmatch '^https?://') { throw 'CLEW_WINDOWS_TIMESTAMP_URL must be an RFC3161 HTTP(S) URL' }
+
+      - name: Sign, verify, and publish ClientFlavor cache entry
+        shell: pwsh
+        env:
+          CERT_SHA1: ${{ vars.CLEW_WINDOWS_CERT_SHA1 }}
+          TIMESTAMP_URL: ${{ vars.CLEW_WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $manifests = @(Get-ChildItem unsigned -Recurse -File -Filter *.release.json)
+          if ($manifests.Count -ne 1) { throw "expected exactly one unsigned Windows manifest, found $($manifests.Count)" }
+          $manifest = $manifests[0].FullName
+          cargo xtask sign-package --manifest $manifest --out-dir dist-signed windows --cert-sha1 $env:CERT_SHA1 --timestamp-url $env:TIMESTAMP_URL
+          $signedManifests = @(Get-ChildItem dist-signed -Recurse -File -Filter *.release.json)
+          if ($signedManifests.Count -ne 1) { throw "expected exactly one signed Windows manifest, found $($signedManifests.Count)" }
+          $signedManifest = $signedManifests[0].FullName
+          cargo xtask verify-package --manifest $signedManifest
+          cargo xtask cache-client-flavor --manifest $signedManifest --cache-dir dist-client-flavors
+
+      - name: Upload signed Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-windows
+          path: |
+            dist-signed/*.zip
+            dist-signed/*.release.json
+            dist-signed/SHA256SUMS
+            dist-client-flavors/**/cache-entry.json
+          if-no-files-found: error
+
+  sign-macos:
+    name: Sign and notarize macOS
+    if: needs.metadata.outputs.publish_requested == 'true'
+    needs:
+      - metadata
+      - unsigned
+    runs-on:
+      - self-hosted
+      - clew-release-macos
+    environment: release
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+
+      - name: Download unsigned macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-macos-14
+          path: unsigned
+
+      - name: Require public signing selectors
+        shell: bash
+        env:
+          DEVELOPER_ID: ${{ vars.CLEW_MACOS_DEVELOPER_ID }}
+          NOTARY_PROFILE: ${{ vars.CLEW_MACOS_NOTARY_PROFILE }}
+        run: |
+          set -euo pipefail
+          test -n "$DEVELOPER_ID"
+          test -n "$NOTARY_PROFILE"
+          security find-identity -v -p codesigning | grep -F -- "$DEVELOPER_ID"
+          xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null
+
+      - name: Sign, notarize, verify, and publish ClientFlavor cache entry
+        shell: bash
+        env:
+          DEVELOPER_ID: ${{ vars.CLEW_MACOS_DEVELOPER_ID }}
+          NOTARY_PROFILE: ${{ vars.CLEW_MACOS_NOTARY_PROFILE }}
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < <(find unsigned -type f -name '*.release.json' -print | sort)
+          test "${#manifests[@]}" -eq 1
+          manifest="${manifests[0]}"
+          cargo xtask sign-package --manifest "$manifest" --out-dir dist-signed macos --identity "$DEVELOPER_ID" --notary-profile "$NOTARY_PROFILE"
+          mapfile -t signed_manifests < <(find dist-signed -type f -name '*.release.json' -print | sort)
+          test "${#signed_manifests[@]}" -eq 1
+          signed_manifest="${signed_manifests[0]}"
+          cargo xtask verify-package --manifest "$signed_manifest"
+          cargo xtask cache-client-flavor --manifest "$signed_manifest" --cache-dir dist-client-flavors
+
+      - name: Upload signed macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-macos
+          path: |
+            dist-signed/*.zip
+            dist-signed/*.release.json
+            dist-signed/SHA256SUMS
+            dist-client-flavors/**/cache-entry.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: needs.metadata.outputs.publish_requested == 'true'
+    needs:
+      - metadata
+      - unsigned
+      - sign-windows
+      - sign-macos
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Download signed Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-windows
+          path: inputs/windows
+
+      - name: Download signed macOS
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-macos
+          path: inputs/macos
+
+      - name: Download verified Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-ubuntu-22.04
+          path: inputs/linux
+
+      - name: Assemble exact release file set
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-files
+          for dir in inputs/windows inputs/macos inputs/linux; do
+            find "$dir" -type f \( -name '*.zip' -o -name '*.release.json' \) -exec cp '{}' release-files/ \;
+          done
+          count="$(find release-files -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$count" = "6"
+          (
+            cd release-files
+            sha256sum -- *.zip *.release.json | sort -k2 > SHA256SUMS
+          )
+          cat release-files/SHA256SUMS
+
+      - name: Publish immutable tag release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_NAME" = "v${{ needs.metadata.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "Clew ${{ needs.metadata.outputs.version }}" \
+            --generate-notes \
+            release-files/*

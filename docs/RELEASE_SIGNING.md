@@ -194,6 +194,37 @@ The normal cross-platform CI job remains unsigned and secret-free. It continues 
 cargo xtask package --out-dir dist
 ```
 
-A future protected release job may call `sign-package` only on trusted runners where the platform credential store has already been provisioned. Repository pull requests and ordinary CI must remain able to build and test Clew without signing credentials.
+The protected release workflow may call `sign-package` only on trusted runners where the platform credential store has already been provisioned. Repository pull requests and ordinary CI remain able to build and test Clew without signing credentials.
 
 If a credential is absent, `sign-package` must fail closed. It must never fall back to ad-hoc signing, a self-signed certificate, or `unsigned=false` without a successful native signing/notarization verification chain.
+
+## 7. Protected GitHub release workflow
+
+`.github/workflows/release.yml` has two deliberately different modes:
+
+- **rehearsal** — manual `workflow_dispatch`; Windows/macOS/Linux GitHub-hosted runners build clean unsigned schema-2 artifacts, run `verify-package`, and exercise `cache-client-flavor --allow-unsigned-rehearsal`. It never schedules the signing runners and never receives `contents: write`;
+- **publish** — a pushed `v*` tag, or a manual dispatch explicitly selecting `publish` while the selected ref is the exact release tag. The metadata job requires the tag to be exactly `v<Cargo package version>` before any signing job can run.
+
+Windows and macOS signing use separately labelled **self-hosted** runners behind the GitHub `release` environment:
+
+```text
+clew-release-windows
+clew-release-macos
+```
+
+The workflow accepts only four public configuration variables:
+
+```text
+CLEW_WINDOWS_CERT_SHA1
+CLEW_WINDOWS_TIMESTAMP_URL
+CLEW_MACOS_DEVELOPER_ID
+CLEW_MACOS_NOTARY_PROFILE
+```
+
+They are certificate/profile selectors, not private credentials. Private keys and authentication material stay in the Windows certificate store and macOS Keychain on the protected runners. The workflow has no PFX/P12/password/private-key input or secret parameter.
+
+The signing jobs consume the clean unsigned artifacts produced by the hosted matrix, run native signing/notarization, then independently call `verify-package` and publish a `release_ready=true` ClientFlavor cache entry. Linux remains the verified clean schema-2 artifact until a separate Linux signing policy is explicitly designed.
+
+Only the final `publish` job receives `contents: write`. It downloads the signed Windows artifact, signed/notarized macOS artifact, and verified Linux artifact; requires exactly three ZIPs plus three `.release.json` sidecars; recomputes one consolidated `SHA256SUMS`; verifies the immutable tag again; and only then calls `gh release create --verify-tag`.
+
+Repository/environment policy is part of the operational gate: protect the `release` environment, restrict the two self-hosted runner labels to trusted release machines, and protect release tags. A successful local rehearsal does not substitute for those GitHub controls or for V6b-3b real-credential acceptance.
