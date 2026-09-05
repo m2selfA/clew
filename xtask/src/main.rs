@@ -467,6 +467,7 @@ fn cache_client_flavor(
         let mut file = File::create(&entry_path)?;
         file.write_all(&json_bytes(&expected_entry)?)?;
         file.sync_all()?;
+        drop(file);
         verify_client_flavor_cache_entry(&staging, &expected_entry)?;
         fs::rename(&staging, &target)?;
         Ok(())
