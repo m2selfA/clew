@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/m2selfA/clew/actions/workflows/ci.yml/badge.svg)](https://github.com/m2selfA/clew/actions/workflows/ci.yml)
 
-Public repository: [m2selfA/clew](https://github.com/m2selfA/clew); current downloads are on [GitHub Releases](https://github.com/m2selfA/clew/releases). Windows CI runs natively on `windows-2022`; Linux release compatibility is built and verified inside `manylinux2014_x86_64` with a hard glibc 2.17 container gate plus final ELF `GLIBC_*` symbol-version check. Clew `0.x` builds are published as normal GitHub Releases even though Windows/macOS are unsigned; the first fully Code Signed + notarized cross-platform release will deliberately move to a new major version (`1.x` or later).
+Public repository: [m2selfA/clew](https://github.com/m2selfA/clew); the current normal release is [`v0.2.0`](https://github.com/m2selfA/clew/releases/tag/v0.2.0), with all downloads also listed on [GitHub Releases](https://github.com/m2selfA/clew/releases). Windows CI runs natively on `windows-2022`; Linux release compatibility is built and verified inside `manylinux2014_x86_64` with a hard glibc 2.17 container gate plus final ELF `GLIBC_*` symbol-version check. Clew `0.x` builds are published as normal GitHub Releases even though Windows/macOS are unsigned; the first fully Code Signed + notarized cross-platform release will deliberately move to a new major version (`1.x` or later).
 
 一根穿过 NAT 的线：合作者打开一份预配置的 Site Kit 并双击，你的 agent 就可以在对方机器上读文件、改文件、跑命令、转发端口、走代理、传文件。人在 GUI 里点；agent 走本机 MCP。
 
