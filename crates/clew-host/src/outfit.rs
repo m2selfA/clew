@@ -7,6 +7,8 @@ use thiserror::Error;
 pub const OUTFIT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_OUTFIT_ENCODED_BYTES: usize = 256 * 1024;
 pub const MAX_OUTFIT_ASSET_BYTES: usize = 512 * 1024;
+pub const OUTFIT_BUILD_SPEC_SCHEMA_VERSION: u32 = 1;
+pub const MAX_OUTFIT_BUILD_SPEC_BYTES: usize = 512 * 1024;
 const OUTFIT_BUILD_CACHE_DOMAIN: &[u8] = b"clew/outfit-build-cache/v1\0";
 const MAX_ID_BYTES: usize = 64;
 const MAX_NAME_BYTES: usize = 96;
@@ -158,6 +160,108 @@ pub struct OutfitProfile {
     pub visuals: OutfitVisuals,
     pub strings: OutfitStrings,
     pub distribution_copy: OutfitDistributionCopy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitBuildAsset {
+    pub asset_id: String,
+    pub relative_path: String,
+    pub byte_len: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutfitBuildSpec {
+    pub schema_version: u32,
+    pub profile: OutfitProfile,
+    pub build_cache_key: String,
+    pub assets: Vec<OutfitBuildAsset>,
+}
+
+impl OutfitBuildSpec {
+    pub fn new(
+        profile: OutfitProfile,
+        mut assets: Vec<OutfitBuildAsset>,
+    ) -> Result<Self, OutfitError> {
+        profile.validate()?;
+        assets.sort_by(|left, right| left.asset_id.cmp(&right.asset_id));
+        let build_cache_key = profile.build_cache_key()?;
+        let spec = Self {
+            schema_version: OUTFIT_BUILD_SPEC_SCHEMA_VERSION,
+            profile,
+            build_cache_key,
+            assets,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(&self) -> Result<(), OutfitError> {
+        if self.schema_version != OUTFIT_BUILD_SPEC_SCHEMA_VERSION {
+            return Err(OutfitError::UnsupportedBuildSpecSchema(self.schema_version));
+        }
+        self.profile.validate()?;
+        if self.build_cache_key != self.profile.build_cache_key()? {
+            return Err(OutfitError::BuildCacheKeyMismatch);
+        }
+        let expected_ids = self.profile.imported_asset_ids();
+        let actual_ids = self
+            .assets
+            .iter()
+            .map(|asset| asset.asset_id.clone())
+            .collect::<Vec<_>>();
+        if actual_ids != expected_ids {
+            return Err(OutfitError::BuildAssetSetMismatch);
+        }
+        let mut previous: Option<&str> = None;
+        for asset in &self.assets {
+            validate_asset(&OutfitAssetRef::Imported {
+                asset_id: asset.asset_id.clone(),
+            })?;
+            if previous.is_some_and(|value| value >= asset.asset_id.as_str()) {
+                return Err(OutfitError::BuildAssetSetMismatch);
+            }
+            previous = Some(asset.asset_id.as_str());
+            if asset.byte_len == 0 || asset.byte_len as usize > MAX_OUTFIT_ASSET_BYTES {
+                return Err(OutfitError::InvalidBuildAssetLength {
+                    asset_id: asset.asset_id.clone(),
+                    byte_len: asset.byte_len,
+                });
+            }
+            let expected_prefix = format!("assets/{}.", asset.asset_id);
+            if !asset.relative_path.starts_with(&expected_prefix)
+                || !(asset.relative_path.ends_with(".png") || asset.relative_path.ends_with(".svg"))
+                || asset.relative_path[expected_prefix.len()..].contains('/')
+                || asset.relative_path.contains('\\')
+            {
+                return Err(OutfitError::InvalidBuildAssetPath(
+                    asset.relative_path.clone(),
+                ));
+            }
+        }
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > MAX_OUTFIT_BUILD_SPEC_BYTES {
+            return Err(OutfitError::BuildSpecTooLarge(encoded.len()));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, OutfitError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec_pretty(self)?;
+        if encoded.len() > MAX_OUTFIT_BUILD_SPEC_BYTES {
+            return Err(OutfitError::BuildSpecTooLarge(encoded.len()));
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, OutfitError> {
+        if bytes.len() > MAX_OUTFIT_BUILD_SPEC_BYTES {
+            return Err(OutfitError::BuildSpecTooLarge(bytes.len()));
+        }
+        let spec: Self = serde_json::from_slice(bytes)?;
+        spec.validate()?;
+        Ok(spec)
+    }
 }
 
 impl OutfitProfile {
@@ -643,6 +747,18 @@ pub enum OutfitError {
     TooManyResources { locale: String, count: usize },
     #[error("built-in English fallback is missing required key {0}")]
     MissingBuiltInFallback(String),
+    #[error("unsupported Outfit build-spec schema version {0}")]
+    UnsupportedBuildSpecSchema(u32),
+    #[error("Outfit build-spec cache key does not match its profile")]
+    BuildCacheKeyMismatch,
+    #[error("Outfit build-spec asset set does not exactly match imported profile assets")]
+    BuildAssetSetMismatch,
+    #[error("invalid Outfit build-spec asset path {0:?}")]
+    InvalidBuildAssetPath(String),
+    #[error("invalid Outfit build-spec asset length for {asset_id}: {byte_len} bytes")]
+    InvalidBuildAssetLength { asset_id: String, byte_len: u32 },
+    #[error("Outfit build-spec JSON is too large: {0} bytes")]
+    BuildSpecTooLarge(usize),
     #[error("encoded outfit profile is too large: {0} bytes")]
     EncodedTooLarge(usize),
     #[error("outfit JSON failed: {0}")]
@@ -697,6 +813,50 @@ mod tests {
         let key = profile.build_cache_key().unwrap();
         assert!(key.starts_with("outfit-v1-"));
         assert_eq!(key.len(), 74);
+    }
+
+    #[test]
+    fn build_spec_binds_profile_cache_key_and_exact_imported_assets() {
+        let mut profile = OutfitProfile::preset(OutfitPreset::ResearchLab);
+        let bytes = b"svg-bytes";
+        let asset_id = outfit_asset_id_for_bytes(bytes);
+        profile.visuals.app_icon = OutfitAssetRef::Imported {
+            asset_id: asset_id.clone(),
+        };
+        let spec = OutfitBuildSpec::new(
+            profile.clone(),
+            vec![OutfitBuildAsset {
+                asset_id: asset_id.clone(),
+                relative_path: format!("assets/{asset_id}.svg"),
+                byte_len: bytes.len() as u32,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            OutfitBuildSpec::decode(&spec.encode().unwrap()).unwrap(),
+            spec
+        );
+
+        let mut wrong_key = spec.clone();
+        wrong_key.build_cache_key.push('0');
+        assert!(matches!(
+            wrong_key.validate(),
+            Err(OutfitError::BuildCacheKeyMismatch)
+        ));
+
+        let mut missing = spec.clone();
+        missing.assets.clear();
+        assert!(matches!(
+            missing.validate(),
+            Err(OutfitError::BuildAssetSetMismatch)
+        ));
+
+        let mut unsafe_path = spec;
+        unsafe_path.assets[0].relative_path = format!("assets/../{asset_id}.svg");
+        assert!(matches!(
+            unsafe_path.validate(),
+            Err(OutfitError::InvalidBuildAssetPath(_)) | Err(OutfitError::BuildAssetSetMismatch)
+        ));
     }
 
     #[test]

@@ -61,7 +61,7 @@
 | V3 | Reliability | DONE | reconnect/replay/Shell reattach/sleep-resume/compatibility 已闭合 |
 | V4 | Dynamic networking | DONE | Controller-owned TCP forward / SOCKS5 CONNECT / HTTP CONNECT + non-migration |
 | V5 | File plane | DONE | single-file + directory Put/Get、process-restart durability、bounded multi-file concurrency 全闭合 |
-| V6 | Release packaging | IN PROGRESS | reproducible unsigned/native/sign+verify baseline DONE；real credential acceptance 外部阻塞 |
+| V6 | Release packaging | IN PROGRESS | native/sign+verify baseline DONE；V6c release productionization推进中；real credential acceptance外部阻塞 |
 | V7 | Advanced Service Runtime | DONE | Linux user/system + Windows machine/user-session lifecycle、低权限 identity 与恢复边界全闭合 |
 | V8+ | Deferred expansion | TODO | 仅按真实需求评估 federation、dedicated relay、第二 transport 等 |
 
@@ -1387,7 +1387,29 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 **Status：BLOCKED / NEXT（外部凭据缺失，不是代码失败）**
 
-完成条件只能用正式凭据证明：Windows以正式code-signing certificate产出schema-3 signed ZIP并通过final-archive SignTool verify；macOS以正式Developer ID Application + notary profile完成secure timestamp、Apple notarization Accepted、staple与最终ZIP解包Gatekeeper验证。当前cap00无带private-key CodeSigningCert，macos-3dv0无Developer ID identity，因此明确不以ad-hoc/self-signed结果冒充发布签名。ClientFlavor/Distribution Studio成品签名与cache继续后置到这项真实acceptance之后。
+完成条件只能用正式凭据证明：Windows以正式code-signing certificate产出schema-3 signed ZIP并通过final-archive SignTool verify；macOS以正式Developer ID Application + notary profile完成secure timestamp、Apple notarization Accepted、staple与最终ZIP解包Gatekeeper验证。当前cap00无带private-key CodeSigningCert，macos-3dv0无Developer ID identity，因此明确不以ad-hoc/self-signed结果冒充发布签名。V6c允许先完成secret-free build/cache/release workflow；Windows/macOS cache entry只有schema-3正式签名后才可标`release_ready=true`。
+
+### V6c — Release productionization
+
+**Status：IN PROGRESS**
+
+#### V6c-1 — Outfit build contract + native ClientFlavor artifact cache
+
+**Status：IN PROGRESS（implementation complete；exact-clean cache closeout pending）**
+
+- 新增无secret `OutfitBuildSpec v1`：profile `build_cache_key`与精确imported asset集合绑定，asset path固定`assets/<sha256-id>.png|svg`，512 KiB hard bound，缺失/额外/重复/path escape/size/hash不一致全部fail closed；`clew outfit export-build`通过独立argv小parser从Local API导出，避免再次扩大Windows root Clap tree，输出只含`outfit-build.json`与内容寻址视觉资产，不包含Controller/Site/Device身份秘密；
+- `cargo xtask package --outfit-build <dir>`现在把同一Outfit真正投影进native发布物：Windows PE ProductName/FileDescription/icon，macOS Info.plist/AppIcon.icns，Linux desktop Name与SVG/PNG icon；自定义Outfit必须真实build，禁止`--no-build`把旧PE冒充新品牌。schema-2/3 manifest增加可选`client_flavor` provenance（ID/outfit revision/build key/app name/icon provenance），旧manifest仍可验证；
+- 新增`cache-client-flavor`不可变缓存：cache key绑定ClientFlavor ID、Outfit build key、runtime version、target/profile/source commit以及signing mechanism/identity，不包含Site/invite；entry发布前与cache hit都重新跑`verify-package`并复核exact file set/hash。Linux clean schema-2可作为当前final；Windows/macOS默认只接受schema-3签名成品，unsigned只可显式`--allow-unsigned-rehearsal`且`release_ready=false`；
+- cap00 dirty-worktree真实链已通过：Research Lab Outfit导入32×32 PNG并升revision 2，export build文件集合精确为spec+单一content-addressed PNG；Windows branded package ZIP SHA=`970c1446...4b39`，独立`verify-package` PASS，manifest记录ClientFlavor=`f0a0ff50...38d34`/Outfit=`v6c-smoke`/PNG asset provenance，PE `ProductName/FileDescription=Research Connect`且associated icon可提取。Windows root/help栈在初版新增Clap节点时暴露回归，最终用独立parser+boxed async future恢复，focused help regression PASS；
+- implementation commit固定后仍需从clean SHA重打同一Outfit，完成`dirty=false` verify以及cache miss→same-key hit，之后才标DONE。
+
+#### V6c-2 — Protected release workflow / dry-run
+
+**Status：TODO** — 在V6c-1封板后增加tag/workflow_dispatch release pipeline、unsigned rehearsal、protected Windows/macOS signing jobs、独立verify与GitHub Release汇聚；真实签名执行仍由V6b-3b凭据gate约束。
+
+#### V6c-3 — Release docs/checkpoint cleanup
+
+**Status：TODO** — README/checkpoint/Distribution Studio文档与最终生产链对齐，清理V1.5/V5等陈旧状态。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1464,11 +1486,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel unblocked implementation block：none — V7 complete；V8+ remains explicitly deferred**
+**Parallel unblocked implementation block：V6c-1 — exact-clean ClientFlavor cache closeout**
 
-V7 Advanced Service Runtime 已全线封板：Linux `systemd --user`、Windows machine Connector + authorized user-session control plane、Linux system Connector service均完成代码和native acceptance。当前路线图唯一正式release blocker仍是V6b-3b的外部真实签名凭据；在这些凭据可用前不启动V8+ deferred expansion，也不把wmn02当前n0 relay egress异常扩大成新的service开发块。Distribution Studio signed-output/cache继续后置到真实签名acceptance。
+V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据，但不再等待凭据才建设发布生产系统：V6c先完成Outfit build contract、ClientFlavor cache、protected release workflow与文档收口；V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c-1 implementation complete / exact-clean closeout pending：新增secret-free Outfit build export、target-native branded package、manifest ClientFlavor provenance与immutable verified cache；cap00真实PNG Outfit→Windows release链通过，PE name/icon与manifest一致，xtask 12/12及Windows root/help栈focused回归PASS。下一步先固定implementation SHA，再从clean checkout重包并做cache miss→hit后封板。
 
 - **2026-09-05** — V7c Linux machine Connector service **DONE / V7 ADVANCED SERVICE RUNTIME DONE**：implementation commit `921a5f430327cc3597048f67430387c9adf5b495`。新增dedicated `clew-service` account、machine-only state、root只读kit/config + service可写state、Connector-only hardened systemd unit、SIGTERM graceful Host、payload hash fail-closed与损坏后可清理语义，并补跨平台mint target ClientFlavor。wmn02 EL8/systemd239完整install/permissions/enable/start/stop/restart/SIGKILL recovery/tamper/uninstall闭环通过，pending DeviceKey SHA跨正常/异常重启保持不变；exact commit clean checkout再通过check、V7c **4/4**、service **3/3**、build、disabled/inactive install-only、权限反证、unit verify与zero-state uninstall。cap00最终workspace **272/0**。fresh relay enrollment当前被集群n0 relay egress异常阻断，ordinary Host/local Controller A/B同样失败，因此明确记录为环境阻塞而非service回归。V7至此全线封板。
 

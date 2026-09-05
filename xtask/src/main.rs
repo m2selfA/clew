@@ -9,13 +9,16 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use clew_host::{
+    ClientFlavor, MAX_OUTFIT_BUILD_SPEC_BYTES, OutfitAssetRef, OutfitBuildSpec, OutfitPreset,
+    OutfitProfile, TargetPlatform, verify_outfit_asset_bytes,
+};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const PRODUCT: &str = "clew";
-const APP_NAME: &str = "Clew";
 const APP_ID: &str = "io.clew.app";
 const RELEASE_SCHEMA_VERSION: u32 = 2;
 const SIGNED_RELEASE_SCHEMA_VERSION: u32 = 3;
@@ -24,6 +27,8 @@ const MAX_SIGNED_PAYLOAD_FILES: usize = 128;
 const MAX_SIGNED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SIGNED_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MACOS_CODE_RESOURCES: &str = "Clew.app/Contents/_CodeSignature/CodeResources";
+const CLIENT_FLAVOR_CACHE_SCHEMA_VERSION: u32 = 1;
+const MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask", about = "Clew repository maintenance tasks")]
@@ -54,6 +59,9 @@ enum Task {
         /// Skip native --version/--help execution smoke.
         #[arg(long)]
         skip_smoke: bool,
+        /// Secret-free Outfit build export produced by `clew outfit export-build`.
+        #[arg(long, value_name = "DIR")]
+        outfit_build: Option<PathBuf>,
     },
     /// Sign an existing clean unsigned Clew package without mutating build outputs.
     SignPackage {
@@ -74,6 +82,21 @@ enum Task {
         /// Optional explicit signtool.exe path for signed Windows verification.
         #[arg(long)]
         signtool: Option<PathBuf>,
+    },
+    /// Verify and publish one reusable ClientFlavor artifact into a content-checked cache.
+    CacheClientFlavor {
+        /// Sidecar .release.json belonging to the artifact being cached.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Cache root. Each semantic ClientFlavor/signing identity gets one immutable entry.
+        #[arg(long, default_value = "dist-client-flavors")]
+        cache_dir: PathBuf,
+        /// Optional explicit signtool.exe path for signed Windows verification.
+        #[arg(long)]
+        signtool: Option<PathBuf>,
+        /// Permit clean unsigned Windows/macOS artifacts for release-pipeline rehearsal only.
+        #[arg(long)]
+        allow_unsigned_rehearsal: bool,
     },
 }
 
@@ -156,6 +179,45 @@ struct SigningInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct ReleaseClientFlavorInfo {
+    id: String,
+    outfit_id: String,
+    outfit_revision: u32,
+    build_cache_key: String,
+    app_display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publisher_label: Option<String>,
+    icon_format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon_asset_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildIconFormat {
+    Svg,
+    Png,
+}
+
+impl BuildIconFormat {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Svg => "svg",
+            Self::Png => "png",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BuildBranding {
+    profile: OutfitProfile,
+    build_cache_key: String,
+    icon_bytes: Vec<u8>,
+    icon_path: PathBuf,
+    icon_format: BuildIconFormat,
+    icon_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct PayloadManifest {
     schema_version: u32,
     product: String,
@@ -175,6 +237,8 @@ struct PayloadManifest {
     unsigned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signing: Option<SigningInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_flavor: Option<ReleaseClientFlavorInfo>,
     files: Vec<PayloadFile>,
 }
 
@@ -191,6 +255,36 @@ struct ArtifactManifest {
     artifact: ArtifactInfo,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct ClientFlavorCacheEntry {
+    schema_version: u32,
+    cache_key: String,
+    client_flavor: ReleaseClientFlavorInfo,
+    version: String,
+    target: String,
+    profile: String,
+    source_commit: String,
+    release_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing: Option<SigningInfo>,
+    artifact_file: String,
+    artifact_sha256: String,
+    manifest_file: String,
+    manifest_sha256: String,
+}
+
+#[derive(Serialize)]
+struct ClientFlavorCacheKeyMaterial<'a> {
+    client_flavor_id: &'a str,
+    build_cache_key: &'a str,
+    version: &'a str,
+    target: &'a str,
+    profile: &'a str,
+    source_commit: &'a str,
+    signing_mechanism: &'a str,
+    signing_identity: &'a str,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let repo = repo_root()?;
@@ -202,6 +296,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             no_build,
             allow_dirty,
             skip_smoke,
+            outfit_build,
         } => package(
             &repo,
             target,
@@ -210,6 +305,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             no_build,
             allow_dirty,
             skip_smoke,
+            outfit_build.as_deref(),
         )?,
         Task::SignPackage {
             manifest,
@@ -219,6 +315,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         Task::VerifyPackage { manifest, signtool } => {
             verify_package(&repo, &manifest, signtool.as_deref())?
         }
+        Task::CacheClientFlavor {
+            manifest,
+            cache_dir,
+            signtool,
+            allow_unsigned_rehearsal,
+        } => cache_client_flavor(
+            &repo,
+            &manifest,
+            &cache_dir,
+            signtool.as_deref(),
+            allow_unsigned_rehearsal,
+        )?,
     }
     Ok(())
 }
@@ -230,6 +338,354 @@ fn repo_root() -> Result<PathBuf, Box<dyn Error>> {
         .ok_or_else(|| "xtask manifest has no repository parent".into())
 }
 
+fn cache_client_flavor(
+    repo: &Path,
+    manifest: &Path,
+    cache_dir: &Path,
+    signtool: Option<&Path>,
+    allow_unsigned_rehearsal: bool,
+) -> Result<(), Box<dyn Error>> {
+    verify_package(repo, manifest, signtool)?;
+    let manifest_path = if manifest.is_absolute() {
+        manifest.to_path_buf()
+    } else {
+        repo.join(manifest)
+    };
+    let artifact_manifest = read_artifact_manifest(&manifest_path)?;
+    if artifact_manifest.payload.dirty {
+        return Err("dirty release artifacts are never cacheable ClientFlavors".into());
+    }
+    let client_flavor = artifact_manifest.payload.client_flavor.clone().ok_or(
+        "release artifact predates ClientFlavor provenance and cannot enter the V6c cache",
+    )?;
+    validate_release_client_flavor(Some(&client_flavor))?;
+    let platform = release_platform(&artifact_manifest.payload.target)?;
+    let release_ready = match platform {
+        ReleasePlatform::Linux => {
+            artifact_manifest.payload.schema_version == RELEASE_SCHEMA_VERSION
+                && artifact_manifest.payload.unsigned
+                && artifact_manifest.payload.signing.is_none()
+        }
+        ReleasePlatform::Windows | ReleasePlatform::Macos => {
+            artifact_manifest.payload.schema_version == SIGNED_RELEASE_SCHEMA_VERSION
+                && !artifact_manifest.payload.unsigned
+                && artifact_manifest.payload.signing.is_some()
+        }
+    };
+    if !release_ready && !allow_unsigned_rehearsal {
+        return Err("Windows/macOS ClientFlavor cache entries must be fully signed; pass --allow-unsigned-rehearsal only for pipeline rehearsal".into());
+    }
+    let (signing_mechanism, signing_identity) = artifact_manifest
+        .payload
+        .signing
+        .as_ref()
+        .map(|signing| (signing.mechanism.as_str(), signing.identity.as_str()))
+        .unwrap_or(("unsigned", "unsigned"));
+    let material = ClientFlavorCacheKeyMaterial {
+        client_flavor_id: &client_flavor.id,
+        build_cache_key: &client_flavor.build_cache_key,
+        version: &artifact_manifest.payload.version,
+        target: &artifact_manifest.payload.target,
+        profile: &artifact_manifest.payload.profile,
+        source_commit: &artifact_manifest.payload.source_commit,
+        signing_mechanism,
+        signing_identity,
+    };
+    let cache_key = format!(
+        "client-flavor-v1-{}",
+        sha256_bytes(&serde_json::to_vec(&material)?)
+    );
+    let manifest_file = manifest_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("release manifest filename must be UTF-8")?
+        .to_owned();
+    validate_release_filename(&artifact_manifest.artifact.file)?;
+    if manifest_file.contains('/')
+        || manifest_file.contains('\\')
+        || !manifest_file.ends_with(".release.json")
+    {
+        return Err("release manifest filename is unsafe for ClientFlavor cache".into());
+    }
+    let source_dir = manifest_path
+        .parent()
+        .ok_or("release manifest has no parent directory")?;
+    let source_archive = source_dir.join(&artifact_manifest.artifact.file);
+    let manifest_sha256 = sha256_file(&manifest_path)?;
+    let expected_entry = ClientFlavorCacheEntry {
+        schema_version: CLIENT_FLAVOR_CACHE_SCHEMA_VERSION,
+        cache_key: cache_key.clone(),
+        client_flavor,
+        version: artifact_manifest.payload.version.clone(),
+        target: artifact_manifest.payload.target.clone(),
+        profile: artifact_manifest.payload.profile.clone(),
+        source_commit: artifact_manifest.payload.source_commit.clone(),
+        release_ready,
+        signing: artifact_manifest.payload.signing.clone(),
+        artifact_file: artifact_manifest.artifact.file.clone(),
+        artifact_sha256: artifact_manifest.artifact.sha256.clone(),
+        manifest_file: manifest_file.clone(),
+        manifest_sha256,
+    };
+    let cache_root = if cache_dir.is_absolute() {
+        cache_dir.to_path_buf()
+    } else {
+        repo.join(cache_dir)
+    };
+    fs::create_dir_all(&cache_root)?;
+    let target = cache_root.join(&cache_key);
+    if target.exists() {
+        verify_client_flavor_cache_entry(&target, &expected_entry)?;
+        verify_package(repo, &target.join(&manifest_file), signtool)?;
+        println!("cache_hit=true");
+        println!("cache_key={cache_key}");
+        println!("cache_entry={}", target.display());
+        println!("release_ready={release_ready}");
+        return Ok(());
+    }
+    let mut staging = None;
+    for attempt in 0..32_u32 {
+        let candidate =
+            cache_root.join(format!(".{cache_key}.{}-{attempt}.tmp", std::process::id()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => {
+                staging = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let staging = staging.ok_or("could not allocate ClientFlavor cache staging directory")?;
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        copy_file_synced(
+            &source_archive,
+            &staging.join(&expected_entry.artifact_file),
+        )?;
+        copy_file_synced(&manifest_path, &staging.join(&manifest_file))?;
+        let entry_path = staging.join("cache-entry.json");
+        let mut file = File::create(&entry_path)?;
+        file.write_all(&json_bytes(&expected_entry)?)?;
+        file.sync_all()?;
+        verify_client_flavor_cache_entry(&staging, &expected_entry)?;
+        fs::rename(&staging, &target)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging);
+        if target.exists() {
+            verify_client_flavor_cache_entry(&target, &expected_entry)?;
+            verify_package(repo, &target.join(&manifest_file), signtool)?;
+            println!("cache_hit=true");
+            println!("cache_key={cache_key}");
+            println!("cache_entry={}", target.display());
+            println!("release_ready={release_ready}");
+            return Ok(());
+        }
+        return Err(error);
+    }
+    verify_package(repo, &target.join(&manifest_file), signtool)?;
+    println!("cache_hit=false");
+    println!("cache_key={cache_key}");
+    println!("cache_entry={}", target.display());
+    println!("release_ready={release_ready}");
+    Ok(())
+}
+
+fn copy_file_synced(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    let bytes = fs::read(source)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    let mut file = options.open(target)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn verify_client_flavor_cache_entry(
+    root: &Path,
+    expected: &ClientFlavorCacheEntry,
+) -> Result<(), Box<dyn Error>> {
+    let entry_path = root.join("cache-entry.json");
+    let metadata = fs::metadata(&entry_path)?;
+    if !metadata.is_file() || metadata.len() > MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES {
+        return Err("ClientFlavor cache metadata is not a bounded regular file".into());
+    }
+    let actual: ClientFlavorCacheEntry = serde_json::from_slice(&fs::read(&entry_path)?)?;
+    if &actual != expected {
+        return Err("existing ClientFlavor cache entry conflicts with requested artifact".into());
+    }
+    let actual_files = fs::read_dir(root)?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::other("non-UTF-8 ClientFlavor cache filename"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected_files = BTreeSet::from([
+        "cache-entry.json".to_owned(),
+        expected.artifact_file.clone(),
+        expected.manifest_file.clone(),
+    ]);
+    if actual_files != expected_files {
+        return Err("ClientFlavor cache entry file set is not exact".into());
+    }
+    if sha256_file(&root.join(&expected.artifact_file))? != expected.artifact_sha256
+        || sha256_file(&root.join(&expected.manifest_file))? != expected.manifest_sha256
+    {
+        return Err("ClientFlavor cache entry hash verification failed".into());
+    }
+    Ok(())
+}
+
+fn load_build_branding(
+    repo: &Path,
+    outfit_build: Option<&Path>,
+) -> Result<BuildBranding, Box<dyn Error>> {
+    let default_icon = repo.join("assets/icons/app.svg");
+    let Some(root) = outfit_build else {
+        let profile = OutfitProfile::preset(OutfitPreset::ClewOriginal);
+        return Ok(BuildBranding {
+            build_cache_key: profile.build_cache_key()?,
+            profile,
+            icon_bytes: fs::read(&default_icon)?,
+            icon_path: default_icon,
+            icon_format: BuildIconFormat::Svg,
+            icon_asset_id: None,
+        });
+    };
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        repo.join(root)
+    };
+    let spec_path = root.join("outfit-build.json");
+    let metadata = fs::metadata(&spec_path)?;
+    if !metadata.is_file() || metadata.len() > MAX_OUTFIT_BUILD_SPEC_BYTES as u64 {
+        return Err("Outfit build spec is not a bounded regular file".into());
+    }
+    let spec = OutfitBuildSpec::decode(&fs::read(&spec_path)?)?;
+    let mut expected_root = BTreeSet::from(["outfit-build.json".to_owned()]);
+    if !spec.assets.is_empty() {
+        expected_root.insert("assets".into());
+    }
+    let actual_root = fs::read_dir(&root)?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::other("non-UTF-8 Outfit build export entry"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if actual_root != expected_root {
+        return Err("Outfit build export contains undeclared top-level entries".into());
+    }
+    let expected_asset_paths = spec
+        .assets
+        .iter()
+        .map(|asset| asset.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    if !spec.assets.is_empty() {
+        let actual_asset_paths = fs::read_dir(root.join("assets"))?
+            .map(|entry| {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| std::io::Error::other("non-UTF-8 Outfit build asset name"))?;
+                Ok(format!("assets/{name}"))
+            })
+            .collect::<Result<BTreeSet<String>, std::io::Error>>()?;
+        if actual_asset_paths != expected_asset_paths {
+            return Err("Outfit build export asset files differ from the declared set".into());
+        }
+    }
+    for asset in &spec.assets {
+        let path = root.join(&asset.relative_path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != u64::from(asset.byte_len)
+        {
+            return Err(format!(
+                "Outfit build asset is not the declared regular file: {}",
+                asset.relative_path
+            )
+            .into());
+        }
+        verify_outfit_asset_bytes(&asset.asset_id, &fs::read(path)?)?;
+    }
+    let (icon_path, icon_bytes, icon_format, icon_asset_id) = match &spec.profile.visuals.app_icon {
+        OutfitAssetRef::BuiltIn { key } if key == "clew-original" => (
+            default_icon.clone(),
+            fs::read(&default_icon)?,
+            BuildIconFormat::Svg,
+            None,
+        ),
+        OutfitAssetRef::BuiltIn { key } => {
+            return Err(format!("unsupported built-in release app icon {key:?}").into());
+        }
+        OutfitAssetRef::Imported { asset_id } => {
+            let asset = spec
+                .assets
+                .iter()
+                .find(|asset| &asset.asset_id == asset_id)
+                .ok_or("Outfit app icon was not exported")?;
+            let format = if asset.relative_path.ends_with(".png") {
+                BuildIconFormat::Png
+            } else if asset.relative_path.ends_with(".svg") {
+                BuildIconFormat::Svg
+            } else {
+                return Err("Outfit app icon has an unsupported format".into());
+            };
+            let path = root.join(&asset.relative_path);
+            (
+                path.clone(),
+                fs::read(path)?,
+                format,
+                Some(asset_id.clone()),
+            )
+        }
+    };
+    Ok(BuildBranding {
+        profile: spec.profile,
+        build_cache_key: spec.build_cache_key,
+        icon_bytes,
+        icon_path,
+        icon_format,
+        icon_asset_id,
+    })
+}
+
+fn release_client_flavor_info(
+    branding: &BuildBranding,
+    platform: ReleasePlatform,
+    target: &str,
+) -> Result<ReleaseClientFlavorInfo, Box<dyn Error>> {
+    let arch = target
+        .split('-')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or("release target omitted architecture")?;
+    let target_platform = match platform {
+        ReleasePlatform::Windows => TargetPlatform::Windows,
+        ReleasePlatform::Macos => TargetPlatform::MacOs,
+        ReleasePlatform::Linux => TargetPlatform::Linux,
+    };
+    let flavor = ClientFlavor::from_outfit_target(&branding.profile, target_platform, arch)?;
+    Ok(ReleaseClientFlavorInfo {
+        id: flavor.id()?.path_component(),
+        outfit_id: branding.profile.outfit_id.clone(),
+        outfit_revision: branding.profile.revision,
+        build_cache_key: branding.build_cache_key.clone(),
+        app_display_name: branding.profile.identity.app_display_name.clone(),
+        publisher_label: branding.profile.identity.publisher_label.clone(),
+        icon_format: branding.icon_format.label().into(),
+        icon_asset_id: branding.icon_asset_id.clone(),
+    })
+}
+
 fn package(
     repo: &Path,
     target: Option<String>,
@@ -238,6 +694,7 @@ fn package(
     no_build: bool,
     allow_dirty: bool,
     skip_smoke: bool,
+    outfit_build: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     validate_profile(profile)?;
     let rustc = rustc_info(repo)?;
@@ -253,8 +710,19 @@ fn package(
     let cargo_lock_sha256 = sha256_file(&repo.join("Cargo.lock"))?;
 
     let platform = release_platform(&target)?;
+    let branding = load_build_branding(repo, outfit_build)?;
+    if no_build && outfit_build.is_some() {
+        return Err("--no-build cannot be used with --outfit-build; the native binary must be rebuilt with the selected Outfit".into());
+    }
     if !no_build {
-        run_cargo_build(repo, &target, profile, source_date_epoch, platform)?;
+        run_cargo_build(
+            repo,
+            &target,
+            profile,
+            source_date_epoch,
+            platform,
+            &branding,
+        )?;
     }
     let binary = built_named_binary_path(repo, &target, profile, PRODUCT);
     if !binary.is_file() {
@@ -285,16 +753,16 @@ fn package(
 
     let binary_bytes = fs::read(&binary)?;
     let readme_bytes = fs::read(repo.join("README.md"))?;
-    let app_svg = fs::read(repo.join("assets/icons/app.svg"))?;
     let layout = build_package_layout(
         platform,
         &target,
         &binary_bytes,
         macos_launcher.as_deref(),
         &readme_bytes,
-        &app_svg,
+        &branding,
         env!("CARGO_PKG_VERSION"),
     )?;
+    let client_flavor = release_client_flavor_info(&branding, platform, &target)?;
     let files = layout
         .files
         .iter()
@@ -318,6 +786,7 @@ fn package(
         dirty,
         unsigned: true,
         signing: None,
+        client_flavor: Some(client_flavor),
         files,
     };
     let payload_json = json_bytes(&payload)?;
@@ -629,6 +1098,7 @@ fn validate_unsigned_artifact(
         return Err("release sidecar is not an unsigned Clew schema-2 artifact".into());
     }
     let platform = validate_payload_layout(payload)?;
+    validate_release_client_flavor(payload.client_flavor.as_ref())?;
     validate_payload_shape(payload, platform, false)?;
     Ok(platform)
 }
@@ -662,6 +1132,7 @@ fn validate_signed_artifact(
         .as_ref()
         .ok_or("signed release sidecar omitted signing metadata")?;
     let platform = validate_payload_layout(payload)?;
+    validate_release_client_flavor(payload.client_flavor.as_ref())?;
     validate_payload_shape(payload, platform, true)?;
     match platform {
         ReleasePlatform::Windows => {
@@ -724,7 +1195,7 @@ fn validate_payload_shape(
     platform: ReleasePlatform,
     signed: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let expected_paths = expected_payload_paths(platform, signed)?;
+    let expected_paths = expected_payload_paths(payload, platform, signed)?;
     let actual_paths = payload
         .files
         .iter()
@@ -769,20 +1240,73 @@ fn validate_payload_shape(
     Ok(())
 }
 
+fn validate_release_client_flavor(
+    flavor: Option<&ReleaseClientFlavorInfo>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(flavor) = flavor else {
+        return Ok(());
+    };
+    if flavor.id.len() != 64
+        || !flavor
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !flavor.build_cache_key.starts_with("outfit-v1-")
+        || flavor.build_cache_key.len() != 74
+        || !flavor.build_cache_key[10..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || flavor.outfit_revision == 0
+        || flavor.outfit_id.is_empty()
+        || flavor.outfit_id.len() > 64
+        || flavor.app_display_name.trim().is_empty()
+        || flavor.app_display_name.len() > 96
+        || flavor.app_display_name.chars().any(char::is_control)
+        || !matches!(flavor.icon_format.as_str(), "svg" | "png")
+    {
+        return Err("release ClientFlavor metadata is invalid".into());
+    }
+    if let Some(publisher) = &flavor.publisher_label
+        && (publisher.trim().is_empty()
+            || publisher.len() > 96
+            || publisher.chars().any(char::is_control))
+    {
+        return Err("release ClientFlavor publisher label is invalid".into());
+    }
+    if let Some(asset_id) = &flavor.icon_asset_id {
+        let Some(hash) = asset_id.strip_prefix("sha256-") else {
+            return Err("release ClientFlavor icon asset id is invalid".into());
+        };
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("release ClientFlavor icon asset id is invalid".into());
+        }
+    }
+    Ok(())
+}
+
 fn expected_payload_paths(
+    payload: &PayloadManifest,
     platform: ReleasePlatform,
     signed: bool,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let paths: &[&str] = match (platform, signed) {
-        (ReleasePlatform::Windows, false | true) => &["README.md", "clew.exe"],
-        (ReleasePlatform::Macos, false) => &[
+    let linux_png = payload
+        .client_flavor
+        .as_ref()
+        .is_some_and(|flavor| flavor.icon_format == "png");
+    let paths: &[&str] = match (platform, signed, linux_png) {
+        (ReleasePlatform::Windows, false | true, _) => &["README.md", "clew.exe"],
+        (ReleasePlatform::Macos, false, _) => &[
             "Clew.app/Contents/Info.plist",
             "Clew.app/Contents/MacOS/Clew",
             "Clew.app/Contents/Resources/AppIcon.icns",
             "Clew.app/Contents/Resources/clew",
             "README.md",
         ],
-        (ReleasePlatform::Macos, true) => &[
+        (ReleasePlatform::Macos, true, _) => &[
             "Clew.app/Contents/Info.plist",
             "Clew.app/Contents/MacOS/Clew",
             "Clew.app/Contents/Resources/AppIcon.icns",
@@ -790,13 +1314,19 @@ fn expected_payload_paths(
             MACOS_CODE_RESOURCES,
             "README.md",
         ],
-        (ReleasePlatform::Linux, false) => &[
+        (ReleasePlatform::Linux, false, false) => &[
             "README.md",
             "bin/clew",
             "share/applications/io.clew.app.desktop",
             "share/icons/hicolor/scalable/apps/clew.svg",
         ],
-        (ReleasePlatform::Linux, true) => {
+        (ReleasePlatform::Linux, false, true) => &[
+            "README.md",
+            "bin/clew",
+            "share/applications/io.clew.app.desktop",
+            "share/icons/hicolor/256x256/apps/clew.png",
+        ],
+        (ReleasePlatform::Linux, true, _) => {
             return Err("Linux signed release layout is not defined in V6b-3".into());
         }
     };
@@ -1380,7 +1910,7 @@ fn build_package_layout(
     binary: &[u8],
     macos_launcher: Option<&[u8]>,
     readme: &[u8],
-    app_svg: &[u8],
+    branding: &BuildBranding,
     version: &str,
 ) -> Result<PackageLayout, Box<dyn Error>> {
     let mut layout = match platform {
@@ -1404,13 +1934,14 @@ fn build_package_layout(
                 files: vec![
                     archive_file(
                         "Clew.app/Contents/Info.plist",
-                        macos_info_plist(version).into_bytes(),
+                        macos_info_plist(version, &branding.profile.identity.app_display_name)
+                            .into_bytes(),
                         0o644,
                     ),
                     archive_file("Clew.app/Contents/MacOS/Clew", launcher.to_vec(), 0o755),
                     archive_file(
                         "Clew.app/Contents/Resources/AppIcon.icns",
-                        macos_icns(app_svg)?,
+                        macos_icns(&branding.icon_bytes)?,
                         0o644,
                     ),
                     archive_file("Clew.app/Contents/Resources/clew", binary.to_vec(), 0o755),
@@ -1418,26 +1949,35 @@ fn build_package_layout(
                 ],
             }
         }
-        ReleasePlatform::Linux => PackageLayout {
-            name: "linux-portable".into(),
-            app_id: APP_ID.into(),
-            entrypoint: "bin/clew".into(),
-            cli_binary: "bin/clew".into(),
-            files: vec![
-                archive_file("bin/clew", binary.to_vec(), 0o755),
-                archive_file(
-                    "share/applications/io.clew.app.desktop",
-                    linux_desktop_entry().into_bytes(),
-                    0o644,
-                ),
-                archive_file(
+        ReleasePlatform::Linux => {
+            let (icon_path, icon_bytes) = match branding.icon_format {
+                BuildIconFormat::Svg => (
                     "share/icons/hicolor/scalable/apps/clew.svg",
-                    app_svg.to_vec(),
-                    0o644,
+                    branding.icon_bytes.clone(),
                 ),
-                archive_file("README.md", readme.to_vec(), 0o644),
-            ],
-        },
+                BuildIconFormat::Png => (
+                    "share/icons/hicolor/256x256/apps/clew.png",
+                    render_icon_png(&branding.icon_bytes, 256)?,
+                ),
+            };
+            PackageLayout {
+                name: "linux-portable".into(),
+                app_id: APP_ID.into(),
+                entrypoint: "bin/clew".into(),
+                cli_binary: "bin/clew".into(),
+                files: vec![
+                    archive_file("bin/clew", binary.to_vec(), 0o755),
+                    archive_file(
+                        "share/applications/io.clew.app.desktop",
+                        linux_desktop_entry(&branding.profile.identity.app_display_name)
+                            .into_bytes(),
+                        0o644,
+                    ),
+                    archive_file(icon_path, icon_bytes, 0o644),
+                    archive_file("README.md", readme.to_vec(), 0o644),
+                ],
+            }
+        }
     };
     layout
         .files
@@ -1489,19 +2029,30 @@ fn validate_archive_relative_path(path: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn macos_info_plist(version: &str) -> String {
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn macos_info_plist(version: &str, app_name: &str) -> String {
+    let app_name = xml_escape(app_name);
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>CFBundleDevelopmentRegion</key><string>en</string>\n  <key>CFBundleDisplayName</key><string>{APP_NAME}</string>\n  <key>CFBundleExecutable</key><string>Clew</string>\n  <key>CFBundleIconFile</key><string>AppIcon</string>\n  <key>CFBundleIdentifier</key><string>{APP_ID}</string>\n  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n  <key>CFBundleName</key><string>{APP_NAME}</string>\n  <key>CFBundlePackageType</key><string>APPL</string>\n  <key>CFBundleShortVersionString</key><string>{version}</string>\n  <key>CFBundleVersion</key><string>{version}</string>\n  <key>NSHighResolutionCapable</key><true/>\n</dict>\n</plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>CFBundleDevelopmentRegion</key><string>en</string>\n  <key>CFBundleDisplayName</key><string>{app_name}</string>\n  <key>CFBundleExecutable</key><string>Clew</string>\n  <key>CFBundleIconFile</key><string>AppIcon</string>\n  <key>CFBundleIdentifier</key><string>{APP_ID}</string>\n  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n  <key>CFBundleName</key><string>{app_name}</string>\n  <key>CFBundlePackageType</key><string>APPL</string>\n  <key>CFBundleShortVersionString</key><string>{version}</string>\n  <key>CFBundleVersion</key><string>{version}</string>\n  <key>NSHighResolutionCapable</key><true/>\n</dict>\n</plist>\n"
     )
 }
 
-fn linux_desktop_entry() -> String {
+fn linux_desktop_entry(app_name: &str) -> String {
+    let app_name = app_name.replace('\\', "\\\\");
     format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={APP_NAME}\nComment=Agent-facing remote capability bridge\nTryExec=clew\nExec=clew gui\nIcon=clew\nTerminal=false\nCategories=Network;\nStartupNotify=true\n"
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={app_name}\nComment=Agent-facing remote capability bridge\nTryExec=clew\nExec=clew gui\nIcon=clew\nTerminal=false\nCategories=Network;\nStartupNotify=true\n"
     )
 }
 
-fn macos_icns(svg: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+fn macos_icns(source: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let specs = [
         (*b"icp4", 16_u32),
         (*b"icp5", 32_u32),
@@ -1514,7 +2065,7 @@ fn macos_icns(svg: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut chunks = Vec::with_capacity(specs.len());
     let mut total_len: u64 = 8;
     for (kind, size) in specs {
-        let png = render_svg_png(svg, size)?;
+        let png = render_icon_png(source, size)?;
         total_len = total_len
             .checked_add(8_u64 + png.len() as u64)
             .ok_or("ICNS size overflow")?;
@@ -1533,20 +2084,26 @@ fn macos_icns(svg: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(output)
 }
 
-fn render_svg_png(svg: &[u8], size: u32) -> Result<Vec<u8>, Box<dyn Error>> {
-    let options = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_data(svg, &options)?;
-    let source = tree.size();
-    let mut pixmap =
-        resvg::tiny_skia::Pixmap::new(size, size).ok_or("icon pixmap allocation failed")?;
-    let transform = resvg::tiny_skia::Transform::from_scale(
-        size as f32 / source.width(),
-        size as f32 / source.height(),
-    );
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
-    let mut rgba = pixmap.take();
-    unpremultiply_rgba(&mut rgba);
-    let image = RgbaImage::from_raw(size, size, rgba).ok_or("invalid rendered RGBA icon")?;
+fn render_icon_png(source: &[u8], size: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+    let image = if source.starts_with(b"\x89PNG\r\n\x1a\n") {
+        image::load_from_memory_with_format(source, ImageFormat::Png)?
+            .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+            .to_rgba8()
+    } else {
+        let options = resvg::usvg::Options::default();
+        let tree = resvg::usvg::Tree::from_data(source, &options)?;
+        let source_size = tree.size();
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(size, size).ok_or("icon pixmap allocation failed")?;
+        let transform = resvg::tiny_skia::Transform::from_scale(
+            size as f32 / source_size.width(),
+            size as f32 / source_size.height(),
+        );
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        let mut rgba = pixmap.take();
+        unpremultiply_rgba(&mut rgba);
+        RgbaImage::from_raw(size, size, rgba).ok_or("invalid rendered RGBA icon")?
+    };
     let mut cursor = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(image).write_to(&mut cursor, ImageFormat::Png)?;
     Ok(cursor.into_inner())
@@ -1571,6 +2128,7 @@ fn run_cargo_build(
     profile: &str,
     source_date_epoch: u64,
     platform: ReleasePlatform,
+    branding: &BuildBranding,
 ) -> Result<(), Box<dyn Error>> {
     let build = |binary: &str, feature: Option<&str>| -> Result<(), Box<dyn Error>> {
         let mut command = Command::new("cargo");
@@ -1578,12 +2136,22 @@ fn run_cargo_build(
         if let Some(feature) = feature {
             command.args(["--features", feature]);
         }
-        let status = command
+        command
             .args(["--target", target, "--profile", profile])
             .env("SOURCE_DATE_EPOCH", source_date_epoch.to_string())
             .env("CARGO_INCREMENTAL", "0")
-            .current_dir(repo)
-            .status()?;
+            .env(
+                "CLEW_BUILD_APP_NAME",
+                &branding.profile.identity.app_display_name,
+            )
+            .env("CLEW_BUILD_ICON_PATH", &branding.icon_path)
+            .env("CLEW_BUILD_OUTFIT_KEY", &branding.build_cache_key);
+        if let Some(publisher) = &branding.profile.identity.publisher_label {
+            command.env("CLEW_BUILD_PUBLISHER", publisher);
+        } else {
+            command.env_remove("CLEW_BUILD_PUBLISHER");
+        }
+        let status = command.current_dir(repo).status()?;
         if !status.success() {
             return Err(format!("cargo build for {binary} failed with {status}").into());
         }
@@ -2052,13 +2620,23 @@ mod tests {
     #[test]
     fn target_layouts_bind_native_identity_and_entrypoints() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect width="16" height="16" fill="#123456"/></svg>"##;
+        let mut profile = OutfitProfile::preset(OutfitPreset::ClewOriginal);
+        profile.identity.app_display_name = "Lab Connect".into();
+        let branding = BuildBranding {
+            build_cache_key: profile.build_cache_key().unwrap(),
+            profile,
+            icon_bytes: svg.to_vec(),
+            icon_path: PathBuf::from("app.svg"),
+            icon_format: BuildIconFormat::Svg,
+            icon_asset_id: None,
+        };
         let windows = build_package_layout(
             ReleasePlatform::Windows,
             "x86_64-pc-windows-msvc",
             b"win-binary",
             None,
             b"readme",
-            svg,
+            &branding,
             "1.2.3",
         )
         .unwrap();
@@ -2073,7 +2651,7 @@ mod tests {
             b"mac-cli",
             Some(b"mach-o-launcher"),
             b"readme",
-            svg,
+            &branding,
             "1.2.3",
         )
         .unwrap();
@@ -2088,6 +2666,7 @@ mod tests {
             .unwrap();
         let plist = std::str::from_utf8(&plist.bytes).unwrap();
         assert!(plist.contains("<string>io.clew.app</string>"));
+        assert!(plist.contains("<string>Lab Connect</string>"));
         assert!(plist.contains("<key>CFBundleExecutable</key><string>Clew</string>"));
         assert!(plist.contains("<string>1.2.3</string>"));
         let icns = macos
@@ -2112,7 +2691,7 @@ mod tests {
             b"linux-binary",
             None,
             b"readme",
-            svg,
+            &branding,
             "1.2.3",
         )
         .unwrap();
@@ -2124,7 +2703,7 @@ mod tests {
             .find(|file| file.path.ends_with("io.clew.app.desktop"))
             .unwrap();
         let desktop = std::str::from_utf8(&desktop.bytes).unwrap();
-        assert!(desktop.contains("Name=Clew\n"));
+        assert!(desktop.contains("Name=Lab Connect\n"));
         assert!(desktop.contains("TryExec=clew"));
         assert!(desktop.contains("Exec=clew gui"));
         assert!(desktop.contains("Terminal=false"));
@@ -2134,6 +2713,25 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "share/icons/hicolor/scalable/apps/clew.svg")
         );
+
+        let mut png_branding = branding.clone();
+        png_branding.icon_bytes = render_icon_png(svg, 32).unwrap();
+        png_branding.icon_format = BuildIconFormat::Png;
+        png_branding.icon_asset_id = Some(format!("sha256-{}", "a".repeat(64)));
+        let linux_png = build_package_layout(
+            ReleasePlatform::Linux,
+            "x86_64-unknown-linux-gnu",
+            b"linux-binary",
+            None,
+            b"readme",
+            &png_branding,
+            "1.2.3",
+        )
+        .unwrap();
+        assert!(linux_png.files.iter().any(|file| {
+            file.path == "share/icons/hicolor/256x256/apps/clew.png"
+                && file.bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        }));
     }
 
     #[test]
@@ -2257,6 +2855,7 @@ mod tests {
             dirty: false,
             unsigned: true,
             signing: None,
+            client_flavor: None,
             files,
         }
     }

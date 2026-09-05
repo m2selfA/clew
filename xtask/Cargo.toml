@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 clap.workspace = true
+clew-host = { path = "../crates/clew-host" }
 image.workspace = true
 resvg.workspace = true
 serde.workspace = true

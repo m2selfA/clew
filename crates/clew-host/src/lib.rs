@@ -39,9 +39,10 @@ pub use outfit::{
     KEY_AWAITING_ENROLLMENT, KEY_CHOOSE_INVITE, KEY_EXIT_AND_DISCONNECT, KEY_EXTRACT_FIRST,
     KEY_HELPER_READY, KEY_HIDE_TO_TRAY, KEY_MISSING_INVITE_BODY, KEY_MISSING_INVITE_TITLE,
     KEY_READY, KEY_TRAY_CONNECTED, KEY_TRAY_EXIT, KEY_TRAY_RECONNECTING, KEY_TRAY_SHOW,
-    MAX_OUTFIT_ASSET_BYTES, MAX_OUTFIT_ENCODED_BYTES, OUTFIT_SCHEMA_VERSION, OutfitAssetRef,
-    OutfitDistributionCopy, OutfitError, OutfitIdentity, OutfitPreset, OutfitProfile,
-    OutfitStrings, OutfitVisuals, SurfaceStyle, outfit_asset_id_for_bytes,
+    MAX_OUTFIT_ASSET_BYTES, MAX_OUTFIT_BUILD_SPEC_BYTES, MAX_OUTFIT_ENCODED_BYTES,
+    OUTFIT_BUILD_SPEC_SCHEMA_VERSION, OUTFIT_SCHEMA_VERSION, OutfitAssetRef, OutfitBuildAsset,
+    OutfitBuildSpec, OutfitDistributionCopy, OutfitError, OutfitIdentity, OutfitPreset,
+    OutfitProfile, OutfitStrings, OutfitVisuals, SurfaceStyle, outfit_asset_id_for_bytes,
     verify_outfit_asset_bytes,
 };
 pub use read::HostReadService;

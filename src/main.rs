@@ -12,14 +12,16 @@ mod service_gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clew_core::{
     DeviceId, ForwardId, InviteId, ProxyId, TaskId, TransferId, select_executable_device,
 };
 use clew_host::{
-    HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
-    TargetPlatform, acquire_host_instance, resolve_host_launch_with_mode,
-    serve_networked_membership_until_with_layout, wait_for_networked_activation_until,
+    HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitBuildAsset,
+    OutfitBuildSpec, OutfitPreset, TargetPlatform, acquire_host_instance,
+    resolve_host_launch_with_mode, serve_networked_membership_until_with_layout,
+    verify_outfit_asset_bytes, wait_for_networked_activation_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
@@ -28,11 +30,12 @@ use clew_runtime::ControllerLifecycleOwner;
 use clew_runtime::{
     BackupExportRequest, ControllerConfig, ControllerStart, FileConflictPolicy, ForwardAddRequest,
     FsWritePrecondition, HttpConnectAddRequest, InviteIssueRequest, LocalApiClient,
-    OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest, OutfitSetAssetRequest,
-    OutfitSetFieldRequest, RemoteDirectoryGetRequest, RemoteDirectoryPutRequest, RemoteEditRequest,
-    RemoteFileGetRequest, RemoteFilePutRequest, RemoteGlobRequest, RemoteGrepRequest,
-    RemotePathInfoRequest, RemoteReadRequest, RemoteShellAttachRequest, RemoteShellStartRequest,
-    RemoteWriteRequest, Socks5AddRequest, restore_controller_backup, start_controller,
+    OutfitAssetFormat, OutfitAssetImportRequest, OutfitCloneRequest, OutfitCreateRequest,
+    OutfitSetAssetRequest, OutfitSetFieldRequest, RemoteDirectoryGetRequest,
+    RemoteDirectoryPutRequest, RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest,
+    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
+    RemoteShellAttachRequest, RemoteShellStartRequest, RemoteWriteRequest, Socks5AddRequest,
+    restore_controller_backup, start_controller,
 };
 
 #[derive(Debug, Parser)]
@@ -63,6 +66,19 @@ struct ServiceCli {
     /// Signed Site Kit sidecar copied into a Windows machine service. Machine-scope install only.
     #[arg(long, value_name = "FILE")]
     site: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "clew outfit export-build",
+    about = "Export one secret-free Outfit build spec plus content-addressed visual assets"
+)]
+struct OutfitBuildExportCli {
+    outfit_id: String,
+    #[arg(long, value_name = "DIR")]
+    out_dir: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -649,6 +665,19 @@ fn service_cli_from_process_args() -> Option<ServiceCli> {
     ))
 }
 
+fn outfit_build_export_cli_from_process_args() -> Option<OutfitBuildExportCli> {
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    if !args.next().is_some_and(|arg| arg == "outfit")
+        || !args.next().is_some_and(|arg| arg == "export-build")
+    {
+        return None;
+    }
+    Some(OutfitBuildExportCli::parse_from(
+        std::iter::once(std::ffi::OsString::from("clew outfit export-build")).chain(args),
+    ))
+}
+
 async fn run_service(cli: ServiceCli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.action == service::ServiceAction::Gui {
         if cli.scope != service::ServiceScope::Machine {
@@ -682,7 +711,10 @@ async fn main() -> ExitCode {
     } else {
         match service_cli_from_process_args() {
             Some(cli) => run_service(cli).await,
-            None => run(Cli::parse()).await,
+            None => match outfit_build_export_cli_from_process_args() {
+                Some(cli) => Box::pin(run_outfit_build_export(cli)).await,
+                None => run(Cli::parse()).await,
+            },
         }
     };
     match result {
@@ -1497,6 +1529,113 @@ async fn run_outfit_command(command: OutfitCommand) -> Result<(), Box<dyn std::e
         }
     }
     Ok(())
+}
+
+async fn run_outfit_build_export(
+    cli: OutfitBuildExportCli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = LocalApiClient::new(controller_config(cli.state_dir)?);
+    let profile = client.outfit_show(cli.outfit_id).await?;
+    let mut exported_assets = Vec::new();
+    let mut asset_payloads = Vec::new();
+    for asset_id in profile.imported_asset_ids() {
+        let asset = client.outfit_asset_get(asset_id.clone()).await?;
+        if asset.info.asset_id != asset_id {
+            return Err("controller returned a different Outfit asset id".into());
+        }
+        let bytes = BASE64_STANDARD.decode(asset.data_base64.as_bytes())?;
+        if usize::try_from(asset.info.byte_len).ok() != Some(bytes.len()) {
+            return Err("controller returned inconsistent Outfit asset length".into());
+        }
+        verify_outfit_asset_bytes(&asset_id, &bytes)?;
+        let extension = match asset.info.format {
+            OutfitAssetFormat::Png => "png",
+            OutfitAssetFormat::Svg => "svg",
+        };
+        let relative_path = format!("assets/{asset_id}.{extension}");
+        exported_assets.push(OutfitBuildAsset {
+            asset_id,
+            relative_path: relative_path.clone(),
+            byte_len: u32::try_from(bytes.len())?,
+        });
+        asset_payloads.push((relative_path, bytes));
+    }
+    let spec = OutfitBuildSpec::new(profile, exported_assets)?;
+    write_outfit_build_export(&cli.out_dir, &spec, &asset_payloads)?;
+    println!("{}", cli.out_dir.display());
+    Ok(())
+}
+
+fn write_outfit_build_export(
+    out_dir: &std::path::Path,
+    spec: &OutfitBuildSpec,
+    assets: &[(String, Vec<u8>)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    spec.validate()?;
+    if out_dir.exists() {
+        return Err(format!("Outfit build export already exists: {}", out_dir.display()).into());
+    }
+    let parent = out_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = out_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("Outfit build export directory must have a UTF-8 final component")?;
+    let mut temp = None;
+    for attempt in 0..32_u32 {
+        let candidate = parent.join(format!(
+            ".{name}.clew-outfit-build-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                temp = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let temp = temp.ok_or("could not allocate private Outfit build export staging directory")?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let assets_root = temp.join("assets");
+        if !assets.is_empty() {
+            std::fs::create_dir(&assets_root)?;
+        }
+        for (relative_path, bytes) in assets {
+            let expected = spec
+                .assets
+                .iter()
+                .find(|asset| asset.relative_path == *relative_path)
+                .ok_or("export payload was not declared by Outfit build spec")?;
+            if expected.byte_len as usize != bytes.len() {
+                return Err("export payload length differs from Outfit build spec".into());
+            }
+            verify_outfit_asset_bytes(&expected.asset_id, bytes)?;
+            let path = temp.join(relative_path);
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            let mut file = options.open(&path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        let spec_path = temp.join("outfit-build.json");
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        let mut file = options.open(&spec_path)?;
+        file.write_all(&spec.encode()?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, out_dir)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+    result
 }
 
 fn parse_outfit_preset(value: &str) -> Result<OutfitPreset, Box<dyn std::error::Error>> {

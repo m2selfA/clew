@@ -461,6 +461,7 @@ fn top_level_help_surfaces_remain_bounded() {
         &["--help"][..],
         &["controller", "--help"][..],
         &["service", "--help"][..],
+        &["outfit", "export-build", "--help"][..],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_clew"))
             .args(args)
