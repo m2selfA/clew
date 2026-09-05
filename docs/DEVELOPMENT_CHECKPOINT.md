@@ -1415,7 +1415,13 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6c-3 — Friend-facing Site Kit assembly + dual role launchers
 
-**Status：IN PROGRESS** — final gap audit确认V1.5已经冻结同一runtime/同一`site.clew`的普通Host与helper-only双启动intent，但V6发布物尚未真正提供可双击的物理入口与Site-specific组装。当前块将把通用role launcher作为ClientFlavor的一部分一次构建/签名，再从immutable cached runtime + signed `site.clew` + Outfit assets组装Windows/macOS/Linux Site Kit；不同Site不得触发runtime重签。
+**Status：IN PROGRESS（implementation complete；exact-clean Site Kit closeout pending）**
+
+- 新增feature-gated `clew-role-launcher`，不扩张已经接近Windows主线程栈上限的root Clap tree。launcher只接受固定`role-hint.clew`两种canonical marker，普通入口只执行`host --site <root/site.clew>`，helper入口只额外追加`--connector-only`；site/runtime/marker都要求regular non-symlink file。Windows/macOS launcher只spawn后返回，Linux保持可观察foreground wait；
+- `xtask package`现在把通用role launcher作为ClientFlavor runtime的一部分一次构建：Windows `clew-role-launcher.exe`，macOS独立`Clew Role.app`，Linux `bin/clew-role-launcher`；release manifest增加可选`site_kit_launcher` provenance且旧manifest仍可验证。Windows签名路径覆盖主exe+role launcher；macOS inside-out签主CLI/main app + role executable/role app，同一次notary submission后分别staple并验证；
+- 新增`cargo xtask assemble-site-kit`：输入immutable ClientFlavor cache entry、human site label与Controller-signed `site.clew`，重新验证cache exact file set/hash、release shape、clean provenance、ClientFlavor/build key、semantic cache key与cache目录identity；Windows/macOS release-ready kit强制在对应native OS组装。每个Site只加入signed sidecar、精确referenced Outfit assets、`Start Here.html`/消息文案与两个friend-facing role目录，不触发runtime rebuild/re-sign；Linux输出deterministic `.tar.gz`；
+- macOS正式Site Kit不使用普通ZIP库假装保真：release-ready路径用`ditto`从已notarize release ZIP展开并复制主app/role app，再用`ditto --keepParent`生成最终ZIP；最终ZIP再次展开，对`.clew-runtime/Clew.app`和两个role app逐一重复codesign + stapler + Gatekeeper验证。Windows正式Site Kit也从最终ZIP重新抽取主exe+两个role launcher跑SignTool；unsigned rehearsal可跨平台组装但不能冒充release-ready；
+- Windows dirty package smoke：ZIP SHA=`bebaeeddc423eea19cb38871160c48421a62e3d1adcc10343f5e4f558d7df2e6`，manifest exact shape=`README 0644 + clew-role-launcher.exe 0755 + clew.exe 0755`，role PE ProductName/FileDescription=`Clew`且associated icon可提取。首次独立verify暴露validator仍把新launcher误判为0644，统一按`site_kit_launcher.executable_path`识别后同一artifact verify PASS；dirty cache negative control仍明确拒绝。pre-commit gates：fmt PASS；workspace locked check 0 warning；workspace tests **274 passed / 0 failed / 7 ignored**；xtask **13/13**；git diff check PASS。下一步固定implementation SHA，从clean SHA完成真实Controller mint→release/cache→Site Kit assembly与三平台native rehearsal后再标DONE。
 
 #### V6c-4 — Release docs/checkpoint cleanup
 
@@ -1501,6 +1507,8 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据；V6c-1 ClientFlavor cache与V6c-2 protected release workflow已封板。final gap audit又确认friend-facing Site Kit的双role物理入口尚未由V6真正组装，因此当前无凭据可推进块转为V6c-3；完成后再做V6c-4纯文档一致性收口。V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c-3 Site Kit assembly implementation complete / exact-clean closeout pending：新增一次签名可复用role launcher、release `site_kit_launcher` provenance、Win/mac双launcher签名/最终分发包native verify、immutable cache + signed site.clew assembler与deterministic Linux tar。dirty Windows release ZIP=`bebaeedd...df2e6`独立verify PASS，role PE metadata/icon反读通过，dirty cache negative control PASS；workspace **274/0/7**、check 0 warning。下一步固定SHA后从clean artifact做真实Site Kit闭环。
 
 - **2026-09-05** — V6c-2 protected release workflow **DONE**：implementation `968b8ef`；actionlint 1.7.7与权限/secret静态审计通过。exact-clean workflow等价rehearsal三平台完成：Windows ZIP=`355c1f31...9e684` / cache `release_ready=false`，macOS ZIP=`ef566378...072c8` / cache miss→hit / `release_ready=false`，Linux ZIP=`ffa9f06c...05778` / cache `release_ready=true`；三边均source_commit=`968b8ef...`且独立verify PASS。final gap audit把下一块改为V6c-3 Site Kit physical assembly，而非直接做文档粉饰。
 

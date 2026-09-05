@@ -7485,6 +7485,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "clew-host",
+ "flate2",
  "image",
  "resvg",
  "serde",

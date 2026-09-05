@@ -44,6 +44,7 @@ edition.workspace = true
 [features]
 default = []
 macos-app-launcher = []
+site-kit-role-launcher = []
 
 [[bin]]
 name = "clew"
@@ -53,6 +54,11 @@ path = "src/main.rs"
 name = "clew-app"
 path = "src/bin/clew-app.rs"
 required-features = ["macos-app-launcher"]
+
+[[bin]]
+name = "clew-role-launcher"
+path = "src/bin/clew-role-launcher.rs"
+required-features = ["site-kit-role-launcher"]
 
 [dependencies]
 axum.workspace = true

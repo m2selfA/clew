@@ -11,8 +11,9 @@ use std::{
 use clap::{Parser, Subcommand};
 use clew_host::{
     ClientFlavor, MAX_OUTFIT_BUILD_SPEC_BYTES, OutfitAssetRef, OutfitBuildSpec, OutfitPreset,
-    OutfitProfile, TargetPlatform, verify_outfit_asset_bytes,
+    OutfitProfile, SignedSiteClew, SiteKitContract, TargetPlatform, verify_outfit_asset_bytes,
 };
+use flate2::{Compression, write::GzEncoder};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,9 @@ const MAX_SIGNED_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MACOS_CODE_RESOURCES: &str = "Clew.app/Contents/_CodeSignature/CodeResources";
 const CLIENT_FLAVOR_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES: u64 = 64 * 1024;
+const SITE_KIT_LAUNCHER_SCHEMA_VERSION: u32 = 1;
+const MACOS_ROLE_APP: &str = "Clew Role.app";
+const MACOS_ROLE_CODE_RESOURCES: &str = "Clew Role.app/Contents/_CodeSignature/CodeResources";
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask", about = "Clew repository maintenance tasks")]
@@ -95,6 +99,24 @@ enum Task {
         #[arg(long)]
         signtool: Option<PathBuf>,
         /// Permit clean unsigned Windows/macOS artifacts for release-pipeline rehearsal only.
+        #[arg(long)]
+        allow_unsigned_rehearsal: bool,
+    },
+    /// Assemble one friend-facing Site Kit from an immutable ClientFlavor cache entry and signed site.clew.
+    AssembleSiteKit {
+        /// Immutable ClientFlavor cache entry created by `cache-client-flavor`.
+        #[arg(long, value_name = "DIR")]
+        cache_entry: PathBuf,
+        /// Human-readable Site label used only for the outer archive filename.
+        #[arg(long, value_name = "NAME")]
+        site_label: String,
+        /// Signed site.clew plus any sibling outfit-assets/ exported by the Controller.
+        #[arg(long, value_name = "FILE")]
+        site: PathBuf,
+        /// Output directory for the Site Kit archive and sidecar manifest.
+        #[arg(long, default_value = "dist-site-kits")]
+        out_dir: PathBuf,
+        /// Permit an unsigned Windows/macOS cache entry for rehearsal only.
         #[arg(long)]
         allow_unsigned_rehearsal: bool,
     },
@@ -192,6 +214,14 @@ struct ReleaseClientFlavorInfo {
     icon_asset_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct SiteKitLauncherInfo {
+    schema_version: u32,
+    executable_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle_root: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BuildIconFormat {
     Svg,
@@ -239,6 +269,8 @@ struct PayloadManifest {
     signing: Option<SigningInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_flavor: Option<ReleaseClientFlavorInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    site_kit_launcher: Option<SiteKitLauncherInfo>,
     files: Vec<PayloadFile>,
 }
 
@@ -285,6 +317,54 @@ struct ClientFlavorCacheKeyMaterial<'a> {
     signing_identity: &'a str,
 }
 
+fn client_flavor_cache_key(
+    client_flavor: &ReleaseClientFlavorInfo,
+    payload: &PayloadManifest,
+) -> Result<String, Box<dyn Error>> {
+    let (signing_mechanism, signing_identity) = payload
+        .signing
+        .as_ref()
+        .map(|signing| (signing.mechanism.as_str(), signing.identity.as_str()))
+        .unwrap_or(("unsigned", "unsigned"));
+    let material = ClientFlavorCacheKeyMaterial {
+        client_flavor_id: &client_flavor.id,
+        build_cache_key: &client_flavor.build_cache_key,
+        version: &payload.version,
+        target: &payload.target,
+        profile: &payload.profile,
+        source_commit: &payload.source_commit,
+        signing_mechanism,
+        signing_identity,
+    };
+    Ok(format!(
+        "client-flavor-v1-{}",
+        sha256_bytes(&serde_json::to_vec(&material)?)
+    ))
+}
+
+const SITE_KIT_SCHEMA_VERSION: u32 = 1;
+const USE_ROLE_DIR: &str = "1 Use this computer";
+const HELPER_ROLE_DIR: &str = "2 Help nearby computers";
+const ROLE_HINT_FILE: &str = "role-hint.clew";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct SiteKitPayloadManifest {
+    schema_version: u32,
+    source_cache_key: String,
+    client_flavor: ReleaseClientFlavorInfo,
+    target: String,
+    source_release_sha256: String,
+    site_sha256: String,
+    runtime_release_ready: bool,
+    files: Vec<PayloadFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct SiteKitArtifactManifest {
+    payload: SiteKitPayloadManifest,
+    artifact: ArtifactInfo,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let repo = repo_root()?;
@@ -327,6 +407,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             signtool.as_deref(),
             allow_unsigned_rehearsal,
         )?,
+        Task::AssembleSiteKit {
+            cache_entry,
+            site_label,
+            site,
+            out_dir,
+            allow_unsigned_rehearsal,
+        } => assemble_site_kit(
+            &repo,
+            &cache_entry,
+            &site_label,
+            &site,
+            &out_dir,
+            allow_unsigned_rehearsal,
+        )?,
     }
     Ok(())
 }
@@ -336,6 +430,493 @@ fn repo_root() -> Result<PathBuf, Box<dyn Error>> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "xtask manifest has no repository parent".into())
+}
+
+fn assemble_site_kit(
+    repo: &Path,
+    cache_entry: &Path,
+    site_label: &str,
+    site: &Path,
+    out_dir: &Path,
+    allow_unsigned_rehearsal: bool,
+) -> Result<(), Box<dyn Error>> {
+    let cache_root = project_path(repo, cache_entry);
+    let entry_path = cache_root.join("cache-entry.json");
+    let metadata = fs::metadata(&entry_path)?;
+    if !metadata.is_file() || metadata.len() > MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES {
+        return Err("Site Kit ClientFlavor cache entry is not bounded metadata".into());
+    }
+    let cache: ClientFlavorCacheEntry = serde_json::from_slice(&fs::read(&entry_path)?)?;
+    if cache.schema_version != CLIENT_FLAVOR_CACHE_SCHEMA_VERSION {
+        return Err("unsupported ClientFlavor cache schema for Site Kit assembly".into());
+    }
+    verify_client_flavor_cache_entry(&cache_root, &cache)?;
+    if !cache.release_ready && !allow_unsigned_rehearsal {
+        return Err("Site Kit assembly requires a release-ready ClientFlavor; unsigned Windows/macOS is rehearsal-only".into());
+    }
+
+    let release_manifest_path = cache_root.join(&cache.manifest_file);
+    let release = read_artifact_manifest(&release_manifest_path)?;
+    if release.payload.dirty {
+        return Err("dirty release artifacts cannot be assembled into Site Kits".into());
+    }
+    let signed = !release.payload.unsigned;
+    let platform = if signed {
+        validate_signed_artifact(&release)?
+    } else {
+        validate_unsigned_artifact(&release)?
+    };
+    let expected_release_ready = match platform {
+        ReleasePlatform::Linux => !signed,
+        ReleasePlatform::Windows | ReleasePlatform::Macos => signed,
+    };
+    if cache.release_ready != expected_release_ready
+        || release.payload.client_flavor.as_ref() != Some(&cache.client_flavor)
+        || release.payload.version != cache.version
+        || release.payload.target != cache.target
+        || release.payload.profile != cache.profile
+        || release.payload.source_commit != cache.source_commit
+        || release.payload.signing != cache.signing
+        || release.artifact.file != cache.artifact_file
+        || release.artifact.sha256 != cache.artifact_sha256
+    {
+        return Err("ClientFlavor cache metadata does not match its release artifact".into());
+    }
+    let semantic_cache_key = client_flavor_cache_key(&cache.client_flavor, &release.payload)?;
+    let cache_dir_name = cache_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("ClientFlavor cache directory name must be UTF-8")?;
+    if cache.cache_key != semantic_cache_key || cache_dir_name != semantic_cache_key {
+        return Err(
+            "ClientFlavor cache key does not match release semantics or directory identity".into(),
+        );
+    }
+    if cache.release_ready && matches!(platform, ReleasePlatform::Windows | ReleasePlatform::Macos)
+    {
+        let host_platform = release_platform(&rustc_info(repo)?.host)?;
+        if host_platform != platform {
+            return Err("release-ready Windows/macOS Site Kits must be assembled and natively verified on the target operating system".into());
+        }
+    }
+    let launcher = release
+        .payload
+        .site_kit_launcher
+        .as_ref()
+        .ok_or("ClientFlavor release artifact does not contain the V6c Site Kit launcher")?;
+    validate_site_kit_launcher(Some(launcher), platform)?;
+
+    let site_path = project_path(repo, site);
+    let site_file = SignedSiteClew::read(&site_path)?;
+    site_file.verify()?;
+    if site_file.payload.client_flavor_id.path_component() != cache.client_flavor.id {
+        return Err("site.clew ClientFlavorId does not match the cached runtime".into());
+    }
+    let target_platform = target_platform_for_release(platform);
+    let arch = release
+        .payload
+        .target
+        .split('-')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or("release target omitted architecture")?;
+    let runtime_flavor = ClientFlavor {
+        runtime_version: release.payload.version.clone(),
+        platform: target_platform,
+        arch: arch.to_owned(),
+        outfit_id: cache.client_flavor.outfit_id.clone(),
+        outfit_revision: cache.client_flavor.outfit_revision,
+    };
+    site_file.verify_for_flavor(&runtime_flavor)?;
+    if let Some(profile) = &site_file.payload.outfit_profile
+        && profile.build_cache_key()? != cache.client_flavor.build_cache_key
+    {
+        return Err("site.clew Outfit build key does not match the cached ClientFlavor".into());
+    }
+
+    let release_archive = cache_root.join(&cache.artifact_file);
+    if fs::metadata(&release_archive)?.len() != release.artifact.size
+        || sha256_file(&release_archive)? != release.artifact.sha256
+    {
+        return Err("cached release archive size/hash changed before Site Kit assembly".into());
+    }
+    let release_stem = release_package_stem(&release.payload);
+    let site_bytes = fs::read(&site_path)?;
+    let mut files = build_site_kit_files(
+        &release_archive,
+        &release_stem,
+        &release.payload,
+        platform,
+        &site_file,
+        &site_path,
+        &site_bytes,
+    )?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    validate_archive_files(&files)?;
+    let file_records = files
+        .iter()
+        .map(payload_file)
+        .collect::<Result<Vec<_>, _>>()?;
+    let payload = SiteKitPayloadManifest {
+        schema_version: SITE_KIT_SCHEMA_VERSION,
+        source_cache_key: cache.cache_key.clone(),
+        client_flavor: cache.client_flavor.clone(),
+        target: cache.target.clone(),
+        source_release_sha256: cache.artifact_sha256.clone(),
+        site_sha256: sha256_bytes(&site_bytes),
+        runtime_release_ready: cache.release_ready,
+        files: file_records,
+    };
+    let payload_json = json_bytes(&payload)?;
+
+    let cleaned_label = sanitize_site_label(site_label)?;
+    let contract = SiteKitContract::for_platform(target_platform);
+    let archive_name = contract.archive_name(&cleaned_label);
+    let stem = site_kit_archive_stem(&archive_name)?;
+    let out_root = project_path(repo, out_dir);
+    fs::create_dir_all(&out_root)?;
+    let archive_path = out_root.join(&archive_name);
+    if platform == ReleasePlatform::Macos && cache.release_ready {
+        write_release_ready_macos_site_kit(
+            &release_archive,
+            &release_stem,
+            &archive_path,
+            &stem,
+            &files,
+            &payload,
+            &payload_json,
+        )?;
+    } else {
+        write_site_kit_archive(platform, &archive_path, &stem, &files, &payload_json)?;
+        if matches!(platform, ReleasePlatform::Windows | ReleasePlatform::Macos) {
+            verify_zip_site_kit(&archive_path, &stem, &payload)?;
+        }
+        if platform == ReleasePlatform::Windows && cache.release_ready {
+            verify_release_ready_windows_site_kit(&archive_path, &stem, &payload)?;
+        }
+    }
+    let artifact = ArtifactInfo {
+        file: archive_name.clone(),
+        size: fs::metadata(&archive_path)?.len(),
+        sha256: sha256_file(&archive_path)?,
+    };
+    let sidecar = SiteKitArtifactManifest { payload, artifact };
+    let sidecar_name = format!("{stem}.site-kit.json");
+    let sidecar_path = out_root.join(&sidecar_name);
+    fs::write(&sidecar_path, json_bytes(&sidecar)?)?;
+    write_site_kit_checksums(&out_root, &archive_name, &sidecar_name)?;
+
+    println!("site_kit={}", archive_path.display());
+    println!("sha256={}", sidecar.artifact.sha256);
+    println!("manifest={}", sidecar_path.display());
+    println!("client_flavor={}", cache.client_flavor.id);
+    println!("release_ready={}", cache.release_ready);
+    Ok(())
+}
+
+fn project_path(repo: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo.join(path)
+    }
+}
+
+fn target_platform_for_release(platform: ReleasePlatform) -> TargetPlatform {
+    match platform {
+        ReleasePlatform::Windows => TargetPlatform::Windows,
+        ReleasePlatform::Macos => TargetPlatform::MacOs,
+        ReleasePlatform::Linux => TargetPlatform::Linux,
+    }
+}
+
+fn release_package_stem(payload: &PayloadManifest) -> String {
+    if payload.unsigned {
+        format!("clew-v{}-{}", payload.version, payload.target)
+    } else {
+        format!("clew-v{}-{}-signed", payload.version, payload.target)
+    }
+}
+
+fn sanitize_site_label(value: &str) -> Result<String, Box<dyn Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 160 {
+        return Err("Site Kit label must be 1..160 UTF-8 bytes".into());
+    }
+    let mut output = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            output.push('-');
+        } else {
+            output.push(ch);
+        }
+    }
+    let cleaned = output.trim_matches([' ', '.', '-']).to_owned();
+    if cleaned.is_empty() {
+        return Err("Site Kit label contains no usable filename characters".into());
+    }
+    Ok(cleaned)
+}
+
+fn site_kit_archive_stem(name: &str) -> Result<String, Box<dyn Error>> {
+    name.strip_suffix(".zip")
+        .or_else(|| name.strip_suffix(".tar.gz"))
+        .map(str::to_owned)
+        .ok_or_else(|| "Site Kit archive name has unsupported extension".into())
+}
+
+fn build_site_kit_files(
+    release_archive: &Path,
+    release_stem: &str,
+    release: &PayloadManifest,
+    platform: ReleasePlatform,
+    site: &SignedSiteClew,
+    site_path: &Path,
+    site_bytes: &[u8],
+) -> Result<Vec<ArchiveFile>, Box<dyn Error>> {
+    let profile = site
+        .payload
+        .outfit_profile
+        .clone()
+        .unwrap_or_else(|| OutfitProfile::preset(OutfitPreset::ClewOriginal));
+    let contract = SiteKitContract::for_platform(target_platform_for_release(platform));
+    let mut files = vec![
+        archive_file("site.clew", site_bytes.to_vec(), 0o600),
+        archive_file(
+            contract.start_here_name,
+            site_kit_start_html(&profile).into_bytes(),
+            0o644,
+        ),
+        archive_file(
+            "Message to collaborator.txt",
+            format!("{}\n", profile.distribution_copy.chat_message_template).into_bytes(),
+            0o644,
+        ),
+    ];
+    append_site_outfit_assets(&mut files, site_path, &profile)?;
+
+    let mut archive = ZipArchive::new(File::open(release_archive)?)?;
+    match platform {
+        ReleasePlatform::Windows => {
+            let runtime =
+                read_release_payload_file(&mut archive, release_stem, release, "clew.exe")?;
+            files.push(archive_file(".clew-runtime/clew.exe", runtime, 0o755));
+            let launcher_path = release
+                .site_kit_launcher
+                .as_ref()
+                .ok_or("Windows release omitted Site Kit launcher metadata")?
+                .executable_path
+                .as_str();
+            let launcher =
+                read_release_payload_file(&mut archive, release_stem, release, launcher_path)?;
+            for (role_dir, marker) in [
+                (USE_ROLE_DIR, b"use-this-machine\n".as_slice()),
+                (HELPER_ROLE_DIR, b"connector-only\n".as_slice()),
+            ] {
+                files.push(archive_file(
+                    format!("{role_dir}/Clew.exe"),
+                    launcher.clone(),
+                    0o755,
+                ));
+                files.push(archive_file(
+                    format!("{role_dir}/{ROLE_HINT_FILE}"),
+                    marker.to_vec(),
+                    0o644,
+                ));
+            }
+        }
+        ReleasePlatform::Macos => {
+            append_release_prefix(
+                &mut files,
+                &mut archive,
+                release_stem,
+                release,
+                "Clew.app/",
+                ".clew-runtime/Clew.app/",
+            )?;
+            for (role_dir, marker) in [
+                (USE_ROLE_DIR, b"use-this-machine\n".as_slice()),
+                (HELPER_ROLE_DIR, b"connector-only\n".as_slice()),
+            ] {
+                append_release_prefix(
+                    &mut files,
+                    &mut archive,
+                    release_stem,
+                    release,
+                    "Clew Role.app/",
+                    &format!("{role_dir}/Clew.app/"),
+                )?;
+                files.push(archive_file(
+                    format!("{role_dir}/{ROLE_HINT_FILE}"),
+                    marker.to_vec(),
+                    0o644,
+                ));
+            }
+        }
+        ReleasePlatform::Linux => {
+            let runtime =
+                read_release_payload_file(&mut archive, release_stem, release, "bin/clew")?;
+            files.push(archive_file(".clew-runtime/clew", runtime, 0o755));
+            let launcher_path = release
+                .site_kit_launcher
+                .as_ref()
+                .ok_or("Linux release omitted Site Kit launcher metadata")?
+                .executable_path
+                .as_str();
+            let launcher =
+                read_release_payload_file(&mut archive, release_stem, release, launcher_path)?;
+            for (role_dir, marker) in [
+                (USE_ROLE_DIR, b"use-this-machine\n".as_slice()),
+                (HELPER_ROLE_DIR, b"connector-only\n".as_slice()),
+            ] {
+                files.push(archive_file(
+                    format!("{role_dir}/Clew"),
+                    launcher.clone(),
+                    0o755,
+                ));
+                files.push(archive_file(
+                    format!("{role_dir}/{ROLE_HINT_FILE}"),
+                    marker.to_vec(),
+                    0o644,
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn append_site_outfit_assets(
+    files: &mut Vec<ArchiveFile>,
+    site_path: &Path,
+    profile: &OutfitProfile,
+) -> Result<(), Box<dyn Error>> {
+    let Some(site_root) = site_path.parent() else {
+        return Err("site.clew has no parent directory".into());
+    };
+    let assets_root = site_root.join("outfit-assets");
+    for asset_id in profile.imported_asset_ids() {
+        let mut found = None;
+        for extension in ["png", "svg"] {
+            let candidate = assets_root.join(format!("{asset_id}.{extension}"));
+            if candidate.is_file() {
+                if found.is_some() {
+                    return Err(format!("multiple Site Kit assets found for {asset_id}").into());
+                }
+                found = Some((extension, candidate));
+            }
+        }
+        let (extension, path) =
+            found.ok_or_else(|| format!("missing Site Kit asset {asset_id}"))?;
+        let bytes = fs::read(path)?;
+        verify_outfit_asset_bytes(&asset_id, &bytes)?;
+        files.push(archive_file(
+            format!("outfit-assets/{asset_id}.{extension}"),
+            bytes,
+            0o644,
+        ));
+    }
+    Ok(())
+}
+
+fn read_release_payload_file(
+    archive: &mut ZipArchive<File>,
+    release_stem: &str,
+    payload: &PayloadManifest,
+    path: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let record = payload
+        .files
+        .iter()
+        .find(|record| record.path == path)
+        .ok_or_else(|| format!("release payload omitted required Site Kit path {path}"))?;
+    let name = format!("{release_stem}/{path}");
+    let bytes = read_zip_entry_bounded(archive, &name, record.size, Some(record.size))?;
+    if sha256_bytes(&bytes) != record.sha256 {
+        return Err(format!("release payload hash differs for Site Kit path {path}").into());
+    }
+    Ok(bytes)
+}
+
+fn append_release_prefix(
+    files: &mut Vec<ArchiveFile>,
+    archive: &mut ZipArchive<File>,
+    release_stem: &str,
+    payload: &PayloadManifest,
+    source_prefix: &str,
+    target_prefix: &str,
+) -> Result<(), Box<dyn Error>> {
+    let records = payload
+        .files
+        .iter()
+        .filter(|record| record.path.starts_with(source_prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Err(format!("release payload omitted required prefix {source_prefix}").into());
+    }
+    for record in records {
+        let suffix = record
+            .path
+            .strip_prefix(source_prefix)
+            .ok_or("release prefix mapping failed")?;
+        let bytes = read_release_payload_file(archive, release_stem, payload, &record.path)?;
+        let mode = u32::from_str_radix(&record.mode, 8)?;
+        files.push(archive_file(
+            format!("{target_prefix}{suffix}"),
+            bytes,
+            mode,
+        ));
+    }
+    Ok(())
+}
+
+fn site_kit_start_html(profile: &OutfitProfile) -> String {
+    let title = html_escape(&profile.distribution_copy.start_here_title);
+    let body = html_escape(&profile.distribution_copy.start_here_body);
+    let support = profile
+        .distribution_copy
+        .support_contact
+        .as_ref()
+        .map(|value| format!("<p>Support: {}</p>", html_escape(value)))
+        .unwrap_or_default();
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p><ol><li>On the computer you want to use remotely, open <b>{USE_ROLE_DIR}</b> and start Clew.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer, open <b>{HELPER_ROLE_DIR}</b>, and start Clew there.</li></ol><p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn validate_archive_files(files: &[ArchiveFile]) -> Result<(), Box<dyn Error>> {
+    let mut previous: Option<&str> = None;
+    for file in files {
+        validate_archive_relative_path(&file.path)?;
+        if previous.is_some_and(|path| path >= file.path.as_str()) {
+            return Err("Site Kit paths must be unique and strictly sorted".into());
+        }
+        previous = Some(&file.path);
+    }
+    Ok(())
+}
+
+fn write_site_kit_checksums(
+    root: &Path,
+    archive_name: &str,
+    sidecar_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let archive_sha = sha256_file(&root.join(archive_name))?;
+    let sidecar_sha = sha256_file(&root.join(sidecar_name))?;
+    fs::write(
+        root.join("SHA256SUMS"),
+        format!("{archive_sha}  {archive_name}\n{sidecar_sha}  {sidecar_name}\n"),
+    )?;
+    Ok(())
 }
 
 fn cache_client_flavor(
@@ -375,26 +956,7 @@ fn cache_client_flavor(
     if !release_ready && !allow_unsigned_rehearsal {
         return Err("Windows/macOS ClientFlavor cache entries must be fully signed; pass --allow-unsigned-rehearsal only for pipeline rehearsal".into());
     }
-    let (signing_mechanism, signing_identity) = artifact_manifest
-        .payload
-        .signing
-        .as_ref()
-        .map(|signing| (signing.mechanism.as_str(), signing.identity.as_str()))
-        .unwrap_or(("unsigned", "unsigned"));
-    let material = ClientFlavorCacheKeyMaterial {
-        client_flavor_id: &client_flavor.id,
-        build_cache_key: &client_flavor.build_cache_key,
-        version: &artifact_manifest.payload.version,
-        target: &artifact_manifest.payload.target,
-        profile: &artifact_manifest.payload.profile,
-        source_commit: &artifact_manifest.payload.source_commit,
-        signing_mechanism,
-        signing_identity,
-    };
-    let cache_key = format!(
-        "client-flavor-v1-{}",
-        sha256_bytes(&serde_json::to_vec(&material)?)
-    );
+    let cache_key = client_flavor_cache_key(&client_flavor, &artifact_manifest.payload)?;
     let manifest_file = manifest_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -687,6 +1249,22 @@ fn release_client_flavor_info(
     })
 }
 
+fn site_kit_launcher_info(platform: ReleasePlatform) -> SiteKitLauncherInfo {
+    let (executable_path, bundle_root) = match platform {
+        ReleasePlatform::Windows => ("clew-role-launcher.exe".into(), None),
+        ReleasePlatform::Macos => (
+            format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role"),
+            Some(MACOS_ROLE_APP.into()),
+        ),
+        ReleasePlatform::Linux => ("bin/clew-role-launcher".into(), None),
+    };
+    SiteKitLauncherInfo {
+        schema_version: SITE_KIT_LAUNCHER_SCHEMA_VERSION,
+        executable_path,
+        bundle_root,
+    }
+}
+
 fn package(
     repo: &Path,
     target: Option<String>,
@@ -738,6 +1316,15 @@ fn package(
     } else {
         None
     };
+    let role_launcher_path = built_named_binary_path(repo, &target, profile, "clew-role-launcher");
+    if !role_launcher_path.is_file() {
+        return Err(format!(
+            "Clew Site Kit role launcher does not exist: {}",
+            role_launcher_path.display()
+        )
+        .into());
+    }
+    let role_launcher = fs::read(&role_launcher_path)?;
 
     let out_dir = if out_dir.is_absolute() {
         out_dir.to_path_buf()
@@ -759,11 +1346,13 @@ fn package(
         &target,
         &binary_bytes,
         macos_launcher.as_deref(),
+        &role_launcher,
         &readme_bytes,
         &branding,
         env!("CARGO_PKG_VERSION"),
     )?;
     let client_flavor = release_client_flavor_info(&branding, platform, &target)?;
+    let site_kit_launcher = site_kit_launcher_info(platform);
     let files = layout
         .files
         .iter()
@@ -788,6 +1377,7 @@ fn package(
         unsigned: true,
         signing: None,
         client_flavor: Some(client_flavor),
+        site_kit_launcher: Some(site_kit_launcher),
         files,
     };
     let payload_json = json_bytes(&payload)?;
@@ -1100,6 +1690,7 @@ fn validate_unsigned_artifact(
     }
     let platform = validate_payload_layout(payload)?;
     validate_release_client_flavor(payload.client_flavor.as_ref())?;
+    validate_site_kit_launcher(payload.site_kit_launcher.as_ref(), platform)?;
     validate_payload_shape(payload, platform, false)?;
     Ok(platform)
 }
@@ -1134,6 +1725,7 @@ fn validate_signed_artifact(
         .ok_or("signed release sidecar omitted signing metadata")?;
     let platform = validate_payload_layout(payload)?;
     validate_release_client_flavor(payload.client_flavor.as_ref())?;
+    validate_site_kit_launcher(payload.site_kit_launcher.as_ref(), platform)?;
     validate_payload_shape(payload, platform, true)?;
     match platform {
         ReleasePlatform::Windows => {
@@ -1225,7 +1817,14 @@ fn validate_payload_shape(
         if total > MAX_SIGNED_PAYLOAD_BYTES {
             return Err("release payload exceeds signing total size bound".into());
         }
-        let expected_mode = if file.path == payload.entrypoint || file.path == payload.cli_binary {
+        let launcher_executable = payload
+            .site_kit_launcher
+            .as_ref()
+            .map(|launcher| launcher.executable_path.as_str());
+        let expected_mode = if file.path == payload.entrypoint
+            || file.path == payload.cli_binary
+            || launcher_executable == Some(file.path.as_str())
+        {
             "0755"
         } else {
             "0644"
@@ -1289,6 +1888,43 @@ fn validate_release_client_flavor(
     Ok(())
 }
 
+fn validate_site_kit_launcher(
+    launcher: Option<&SiteKitLauncherInfo>,
+    platform: ReleasePlatform,
+) -> Result<(), Box<dyn Error>> {
+    let Some(launcher) = launcher else {
+        return Ok(());
+    };
+    if launcher.schema_version != SITE_KIT_LAUNCHER_SCHEMA_VERSION {
+        return Err("unsupported Site Kit launcher metadata schema".into());
+    }
+    validate_archive_relative_path(&launcher.executable_path)?;
+    match platform {
+        ReleasePlatform::Windows => {
+            if launcher.executable_path != "clew-role-launcher.exe"
+                || launcher.bundle_root.is_some()
+            {
+                return Err("Windows Site Kit launcher metadata is invalid".into());
+            }
+        }
+        ReleasePlatform::Macos => {
+            if launcher.executable_path != format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role")
+                || launcher.bundle_root.as_deref() != Some(MACOS_ROLE_APP)
+            {
+                return Err("macOS Site Kit launcher metadata is invalid".into());
+            }
+        }
+        ReleasePlatform::Linux => {
+            if launcher.executable_path != "bin/clew-role-launcher"
+                || launcher.bundle_root.is_some()
+            {
+                return Err("Linux Site Kit launcher metadata is invalid".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn expected_payload_paths(
     payload: &PayloadManifest,
     platform: ReleasePlatform,
@@ -1298,40 +1934,56 @@ fn expected_payload_paths(
         .client_flavor
         .as_ref()
         .is_some_and(|flavor| flavor.icon_format == "png");
-    let paths: &[&str] = match (platform, signed, linux_png) {
-        (ReleasePlatform::Windows, false | true, _) => &["README.md", "clew.exe"],
-        (ReleasePlatform::Macos, false, _) => &[
-            "Clew.app/Contents/Info.plist",
-            "Clew.app/Contents/MacOS/Clew",
-            "Clew.app/Contents/Resources/AppIcon.icns",
-            "Clew.app/Contents/Resources/clew",
-            "README.md",
-        ],
-        (ReleasePlatform::Macos, true, _) => &[
-            "Clew.app/Contents/Info.plist",
-            "Clew.app/Contents/MacOS/Clew",
-            "Clew.app/Contents/Resources/AppIcon.icns",
-            "Clew.app/Contents/Resources/clew",
-            MACOS_CODE_RESOURCES,
-            "README.md",
-        ],
-        (ReleasePlatform::Linux, false, false) => &[
-            "README.md",
-            "bin/clew",
-            "share/applications/io.clew.app.desktop",
-            "share/icons/hicolor/scalable/apps/clew.svg",
-        ],
-        (ReleasePlatform::Linux, false, true) => &[
-            "README.md",
-            "bin/clew",
-            "share/applications/io.clew.app.desktop",
-            "share/icons/hicolor/256x256/apps/clew.png",
-        ],
-        (ReleasePlatform::Linux, true, _) => {
-            return Err("Linux signed release layout is not defined in V6b-3".into());
+    let has_role_launcher = payload.site_kit_launcher.is_some();
+    let mut paths = match platform {
+        ReleasePlatform::Windows => vec!["README.md".into(), "clew.exe".into()],
+        ReleasePlatform::Macos => {
+            let mut paths = vec![
+                "Clew.app/Contents/Info.plist".into(),
+                "Clew.app/Contents/MacOS/Clew".into(),
+                "Clew.app/Contents/Resources/AppIcon.icns".into(),
+                "Clew.app/Contents/Resources/clew".into(),
+                "README.md".into(),
+            ];
+            if signed {
+                paths.push(MACOS_CODE_RESOURCES.into());
+            }
+            paths
+        }
+        ReleasePlatform::Linux => {
+            if signed {
+                return Err("Linux signed release layout is not defined in V6b-3".into());
+            }
+            vec![
+                "README.md".into(),
+                "bin/clew".into(),
+                "share/applications/io.clew.app.desktop".into(),
+                if linux_png {
+                    "share/icons/hicolor/256x256/apps/clew.png".into()
+                } else {
+                    "share/icons/hicolor/scalable/apps/clew.svg".into()
+                },
+            ]
         }
     };
-    Ok(paths.iter().map(|path| (*path).to_owned()).collect())
+    if has_role_launcher {
+        match platform {
+            ReleasePlatform::Windows => paths.push("clew-role-launcher.exe".into()),
+            ReleasePlatform::Macos => {
+                paths.extend([
+                    format!("{MACOS_ROLE_APP}/Contents/Info.plist"),
+                    format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role"),
+                    format!("{MACOS_ROLE_APP}/Contents/Resources/AppIcon.icns"),
+                ]);
+                if signed {
+                    paths.push(MACOS_ROLE_CODE_RESOURCES.into());
+                }
+            }
+            ReleasePlatform::Linux => paths.push("bin/clew-role-launcher".into()),
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn materialize_payload(
@@ -1396,7 +2048,16 @@ fn collect_signed_files(
     }
     let allowed_extra = match platform {
         ReleasePlatform::Windows => BTreeSet::new(),
-        ReleasePlatform::Macos => BTreeSet::from([MACOS_CODE_RESOURCES]),
+        ReleasePlatform::Macos => {
+            let mut allowed = BTreeSet::from([MACOS_CODE_RESOURCES]);
+            if unsigned_paths
+                .iter()
+                .any(|path| path.starts_with("Clew Role.app/"))
+            {
+                allowed.insert(MACOS_ROLE_CODE_RESOURCES);
+            }
+            allowed
+        }
         ReleasePlatform::Linux => return Err("Linux signed payload is unsupported".into()),
     };
     let actual_extra = signed_paths
@@ -1423,7 +2084,12 @@ fn collect_signed_files(
         }
         let mode = if let Some(record) = unsigned_files.iter().find(|record| record.path == path) {
             u32::from_str_radix(&record.mode, 8)?
-        } else if platform == ReleasePlatform::Macos && path == MACOS_CODE_RESOURCES {
+        } else if platform == ReleasePlatform::Macos
+            && matches!(
+                path.as_str(),
+                MACOS_CODE_RESOURCES | MACOS_ROLE_CODE_RESOURCES
+            )
+        {
             0o644
         } else {
             return Err(format!("signed payload mode is undefined for {path}").into());
@@ -1590,25 +2256,45 @@ fn sign_windows_payload(
     if !cfg!(windows) {
         return Err("Windows Authenticode signing must run on Windows".into());
     }
-    let binary = root.join(&payload.entrypoint);
-    let mut sign = Command::new(signtool);
-    sign.arg("sign");
-    if machine_store {
-        sign.arg("/sm");
+    for relative in windows_signable_paths(payload)? {
+        let binary = root.join(relative);
+        let mut sign = Command::new(signtool);
+        sign.arg("sign");
+        if machine_store {
+            sign.arg("/sm");
+        }
+        sign.args([
+            "/sha1",
+            cert_sha1,
+            "/fd",
+            "SHA256",
+            "/tr",
+            timestamp_url,
+            "/td",
+            "SHA256",
+        ])
+        .arg(&binary);
+        command_output_combined(&mut sign)?;
+        verify_windows_signature(signtool, &binary)?;
     }
-    sign.args([
-        "/sha1",
-        cert_sha1,
-        "/fd",
-        "SHA256",
-        "/tr",
-        timestamp_url,
-        "/td",
-        "SHA256",
-    ])
-    .arg(&binary);
-    command_output_combined(&mut sign)?;
-    verify_windows_signature(signtool, &binary)
+    Ok(())
+}
+
+fn windows_signable_paths(payload: &PayloadManifest) -> Result<Vec<&str>, Box<dyn Error>> {
+    let mut paths = vec![payload.entrypoint.as_str()];
+    if let Some(launcher) = &payload.site_kit_launcher {
+        paths.push(launcher.executable_path.as_str());
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    for path in &paths {
+        if !path.to_ascii_lowercase().ends_with(".exe")
+            || !payload.files.iter().any(|record| record.path == *path)
+        {
+            return Err("Windows signable executable is absent from release payload".into());
+        }
+    }
+    Ok(paths)
 }
 
 fn verify_windows_signature(signtool: &Path, binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -1625,17 +2311,20 @@ fn verify_windows_archive_signature(
     payload: &PayloadManifest,
 ) -> Result<(), Box<dyn Error>> {
     let mut archive = ZipArchive::new(File::open(archive_path)?)?;
-    let entry = format!("{package_stem}/{}", payload.entrypoint);
-    let record = payload
-        .files
-        .iter()
-        .find(|record| record.path == payload.entrypoint)
-        .ok_or("signed Windows entrypoint is missing from manifest")?;
-    let bytes = read_zip_entry_bounded(&mut archive, &entry, record.size, Some(record.size))?;
     let temp = tempfile::tempdir()?;
-    let binary = temp.path().join("clew.exe");
-    fs::write(&binary, bytes)?;
-    verify_windows_signature(signtool, &binary)
+    for (index, relative) in windows_signable_paths(payload)?.into_iter().enumerate() {
+        let entry = format!("{package_stem}/{relative}");
+        let record = payload
+            .files
+            .iter()
+            .find(|record| record.path == relative)
+            .ok_or("signed Windows executable is missing from manifest")?;
+        let bytes = read_zip_entry_bounded(&mut archive, &entry, record.size, Some(record.size))?;
+        let binary = temp.path().join(format!("signed-{index}.exe"));
+        fs::write(&binary, bytes)?;
+        verify_windows_signature(signtool, &binary)?;
+    }
+    Ok(())
 }
 
 fn sign_macos_payload(
@@ -1667,6 +2356,47 @@ fn sign_macos_payload(
     command_output_combined(&mut sign_cli)?;
     verify_macos_signed_code(&cli)?;
 
+    let role_app = if let Some(launcher) = &payload.site_kit_launcher {
+        let bundle = launcher
+            .bundle_root
+            .as_deref()
+            .ok_or("macOS Site Kit launcher metadata omitted bundle root")?;
+        let role_app = root.join(bundle);
+        let role_executable = root.join(&launcher.executable_path);
+        let mut sign_role_executable = Command::new("codesign");
+        sign_role_executable
+            .args([
+                "--force",
+                "--sign",
+                identity,
+                "--timestamp",
+                "--options",
+                "runtime",
+                "--identifier",
+            ])
+            .arg(format!("{APP_ID}.role.launcher"))
+            .arg(&role_executable);
+        command_output_combined(&mut sign_role_executable)?;
+        verify_macos_signed_code(&role_executable)?;
+
+        let mut sign_role_app = Command::new("codesign");
+        sign_role_app
+            .args([
+                "--force",
+                "--sign",
+                identity,
+                "--timestamp",
+                "--options",
+                "runtime",
+            ])
+            .arg(&role_app);
+        command_output_combined(&mut sign_role_app)?;
+        verify_macos_signed_code(&role_app)?;
+        Some(role_app)
+    } else {
+        None
+    };
+
     let mut sign_app = Command::new("codesign");
     sign_app
         .args([
@@ -1685,7 +2415,7 @@ fn sign_macos_payload(
         .parent()
         .ok_or("signed staging root has no parent")?
         .join("notary-submit.zip");
-    write_macos_distribution_zip(&app, &submission)?;
+    write_macos_distribution_zip(root, &submission)?;
     let mut notary = Command::new("xcrun");
     notary
         .args(["notarytool", "submit"])
@@ -1714,6 +2444,11 @@ fn sign_macos_payload(
     let mut staple = Command::new("xcrun");
     staple.args(["stapler", "staple"]).arg(&app);
     command_output_combined(&mut staple)?;
+    if let Some(role_app) = &role_app {
+        let mut staple_role = Command::new("xcrun");
+        staple_role.args(["stapler", "staple"]).arg(role_app);
+        command_output_combined(&mut staple_role)?;
+    }
     verify_macos_distribution(root, payload)?;
     Ok(SigningInfo {
         mechanism: "macos-developer-id-notarized".into(),
@@ -1753,6 +2488,24 @@ fn verify_macos_distribution(root: &Path, payload: &PayloadManifest) -> Result<(
     let app = root.join("Clew.app");
     verify_macos_signed_code(&root.join(&payload.cli_binary))?;
     verify_macos_signed_code(&app)?;
+    if let Some(launcher) = &payload.site_kit_launcher {
+        let role_app = root.join(
+            launcher
+                .bundle_root
+                .as_deref()
+                .ok_or("macOS Site Kit launcher metadata omitted bundle root")?,
+        );
+        verify_macos_signed_code(&root.join(&launcher.executable_path))?;
+        verify_macos_signed_code(&role_app)?;
+        let mut staple_role = Command::new("xcrun");
+        staple_role.args(["stapler", "validate"]).arg(&role_app);
+        command_output_combined(&mut staple_role)?;
+        let mut assess_role = Command::new("spctl");
+        assess_role
+            .args(["--assess", "--type", "exec", "--verbose=4"])
+            .arg(&role_app);
+        command_output_combined(&mut assess_role)?;
+    }
     let mut staple = Command::new("xcrun");
     staple.args(["stapler", "validate"]).arg(&app);
     command_output_combined(&mut staple)?;
@@ -1799,7 +2552,7 @@ fn smoke_macos_signed_archive(
     let unsigned_files = expected_payload
         .files
         .iter()
-        .filter(|file| file.path != MACOS_CODE_RESOURCES)
+        .filter(|file| file.path != MACOS_CODE_RESOURCES && file.path != MACOS_ROLE_CODE_RESOURCES)
         .cloned()
         .collect::<Vec<_>>();
     let files = collect_signed_files(&root, ReleasePlatform::Macos, &unsigned_files)?;
@@ -1910,6 +2663,7 @@ fn build_package_layout(
     _target: &str,
     binary: &[u8],
     macos_launcher: Option<&[u8]>,
+    role_launcher: &[u8],
     readme: &[u8],
     branding: &BuildBranding,
     version: &str,
@@ -1922,6 +2676,7 @@ fn build_package_layout(
             cli_binary: "clew.exe".into(),
             files: vec![
                 archive_file("clew.exe", binary.to_vec(), 0o755),
+                archive_file("clew-role-launcher.exe", role_launcher.to_vec(), 0o755),
                 archive_file("README.md", readme.to_vec(), 0o644),
             ],
         },
@@ -1946,6 +2701,22 @@ fn build_package_layout(
                         0o644,
                     ),
                     archive_file("Clew.app/Contents/Resources/clew", binary.to_vec(), 0o755),
+                    archive_file(
+                        format!("{MACOS_ROLE_APP}/Contents/Info.plist"),
+                        macos_role_info_plist(version, &branding.profile.identity.app_display_name)
+                            .into_bytes(),
+                        0o644,
+                    ),
+                    archive_file(
+                        format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role"),
+                        role_launcher.to_vec(),
+                        0o755,
+                    ),
+                    archive_file(
+                        format!("{MACOS_ROLE_APP}/Contents/Resources/AppIcon.icns"),
+                        macos_icns(&branding.icon_bytes)?,
+                        0o644,
+                    ),
                     archive_file("README.md", readme.to_vec(), 0o644),
                 ],
             }
@@ -1968,6 +2739,7 @@ fn build_package_layout(
                 cli_binary: "bin/clew".into(),
                 files: vec![
                     archive_file("bin/clew", binary.to_vec(), 0o755),
+                    archive_file("bin/clew-role-launcher", role_launcher.to_vec(), 0o755),
                     archive_file(
                         "share/applications/io.clew.app.desktop",
                         linux_desktop_entry(&branding.profile.identity.app_display_name)
@@ -2043,6 +2815,13 @@ fn macos_info_plist(version: &str, app_name: &str) -> String {
     let app_name = xml_escape(app_name);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>CFBundleDevelopmentRegion</key><string>en</string>\n  <key>CFBundleDisplayName</key><string>{app_name}</string>\n  <key>CFBundleExecutable</key><string>Clew</string>\n  <key>CFBundleIconFile</key><string>AppIcon</string>\n  <key>CFBundleIdentifier</key><string>{APP_ID}</string>\n  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n  <key>CFBundleName</key><string>{app_name}</string>\n  <key>CFBundlePackageType</key><string>APPL</string>\n  <key>CFBundleShortVersionString</key><string>{version}</string>\n  <key>CFBundleVersion</key><string>{version}</string>\n  <key>NSHighResolutionCapable</key><true/>\n</dict>\n</plist>\n"
+    )
+}
+
+fn macos_role_info_plist(version: &str, app_name: &str) -> String {
+    let app_name = xml_escape(app_name);
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>CFBundleDevelopmentRegion</key><string>en</string>\n  <key>CFBundleDisplayName</key><string>{app_name}</string>\n  <key>CFBundleExecutable</key><string>Clew Role</string>\n  <key>CFBundleIconFile</key><string>AppIcon</string>\n  <key>CFBundleIdentifier</key><string>{APP_ID}.role</string>\n  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n  <key>CFBundleName</key><string>{app_name}</string>\n  <key>CFBundlePackageType</key><string>APPL</string>\n  <key>CFBundleShortVersionString</key><string>{version}</string>\n  <key>CFBundleVersion</key><string>{version}</string>\n  <key>NSHighResolutionCapable</key><true/>\n</dict>\n</plist>\n"
     )
 }
 
@@ -2160,6 +2939,7 @@ fn run_cargo_build(
     };
 
     build(PRODUCT, None)?;
+    build("clew-role-launcher", Some("site-kit-role-launcher"))?;
     if platform == ReleasePlatform::Macos {
         build("clew-app", Some("macos-app-launcher"))?;
     }
@@ -2292,6 +3072,291 @@ fn write_zip(
     files: &[ArchiveFile],
     payload_manifest: &[u8],
 ) -> Result<(), Box<dyn Error>> {
+    write_named_zip(
+        path,
+        package_stem,
+        files,
+        "release-manifest.json",
+        payload_manifest,
+    )
+}
+
+fn write_site_kit_archive(
+    platform: ReleasePlatform,
+    path: &Path,
+    package_stem: &str,
+    files: &[ArchiveFile],
+    payload_manifest: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    match platform {
+        ReleasePlatform::Windows | ReleasePlatform::Macos => write_named_zip(
+            path,
+            package_stem,
+            files,
+            "site-kit-manifest.json",
+            payload_manifest,
+        ),
+        ReleasePlatform::Linux => {
+            write_site_kit_tar_gz(path, package_stem, files, payload_manifest)
+        }
+    }
+}
+
+fn verify_zip_site_kit(
+    archive_path: &Path,
+    package_stem: &str,
+    expected: &SiteKitPayloadManifest,
+) -> Result<(), Box<dyn Error>> {
+    let mut archive = ZipArchive::new(File::open(archive_path)?)?;
+    let mut expected_names = expected
+        .files
+        .iter()
+        .map(|file| format!("{package_stem}/{}", file.path))
+        .collect::<Vec<_>>();
+    expected_names.push(format!("{package_stem}/site-kit-manifest.json"));
+    expected_names.sort();
+    let mut actual_names = (0..archive.len())
+        .map(|index| archive.by_index(index).map(|entry| entry.name().to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    actual_names.sort();
+    if actual_names != expected_names {
+        return Err("Site Kit ZIP contains an unexpected entry set".into());
+    }
+    for record in &expected.files {
+        let name = format!("{package_stem}/{}", record.path);
+        let bytes = read_zip_entry_bounded(&mut archive, &name, record.size, Some(record.size))?;
+        if sha256_bytes(&bytes) != record.sha256 {
+            return Err(format!("Site Kit ZIP payload hash differs for {}", record.path).into());
+        }
+    }
+    let manifest_name = format!("{package_stem}/site-kit-manifest.json");
+    let manifest = read_zip_entry_bounded(
+        &mut archive,
+        &manifest_name,
+        MAX_EMBEDDED_MANIFEST_BYTES,
+        None,
+    )?;
+    let embedded: SiteKitPayloadManifest = serde_json::from_slice(&manifest)?;
+    if &embedded != expected {
+        return Err("embedded Site Kit manifest differs from sidecar payload".into());
+    }
+    Ok(())
+}
+
+fn verify_release_ready_windows_site_kit(
+    archive_path: &Path,
+    package_stem: &str,
+    payload: &SiteKitPayloadManifest,
+) -> Result<(), Box<dyn Error>> {
+    if !cfg!(windows) {
+        return Err("release-ready Windows Site Kit verification must run on Windows".into());
+    }
+    let signtool = resolve_windows_signtool(None)?;
+    let mut archive = ZipArchive::new(File::open(archive_path)?)?;
+    let temp = tempfile::tempdir()?;
+    let signed_paths = [
+        ".clew-runtime/clew.exe",
+        "1 Use this computer/Clew.exe",
+        "2 Help nearby computers/Clew.exe",
+    ];
+    for (index, path) in signed_paths.iter().enumerate() {
+        let record = payload
+            .files
+            .iter()
+            .find(|record| record.path == *path)
+            .ok_or_else(|| format!("release-ready Windows Site Kit omitted {path}"))?;
+        let name = format!("{package_stem}/{path}");
+        let bytes = read_zip_entry_bounded(&mut archive, &name, record.size, Some(record.size))?;
+        if sha256_bytes(&bytes) != record.sha256 {
+            return Err(format!("release-ready Windows Site Kit hash differs for {path}").into());
+        }
+        let executable = temp.path().join(format!("site-kit-{index}.exe"));
+        fs::write(&executable, bytes)?;
+        verify_windows_signature(&signtool, &executable)?;
+    }
+    Ok(())
+}
+
+fn write_release_ready_macos_site_kit(
+    release_archive: &Path,
+    release_stem: &str,
+    archive_path: &Path,
+    package_stem: &str,
+    files: &[ArchiveFile],
+    payload: &SiteKitPayloadManifest,
+    payload_manifest: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Err("release-ready macOS Site Kit assembly must run on macOS".into());
+    }
+    let temp = tempfile::tempdir()?;
+    let release_extract = temp.path().join("release");
+    fs::create_dir_all(&release_extract)?;
+    let mut extract = Command::new("/usr/bin/ditto");
+    extract
+        .args(["-x", "-k"])
+        .arg(release_archive)
+        .arg(&release_extract);
+    command_output_combined(&mut extract)?;
+    let release_root = release_extract.join(release_stem);
+    if !release_root.is_dir() {
+        return Err("signed macOS release ZIP did not contain its expected root directory".into());
+    }
+
+    let kit_parent = temp.path().join("site-kit");
+    let kit_root = kit_parent.join(package_stem);
+    fs::create_dir_all(&kit_root)?;
+    for file in files {
+        if is_macos_site_kit_app_path(&file.path) {
+            continue;
+        }
+        let target = kit_root.join(&file.path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, &file.bytes)?;
+        set_recorded_mode(&target, &format!("{:04o}", file.mode))?;
+    }
+    copy_with_ditto(
+        &release_root.join("Clew.app"),
+        &kit_root.join(".clew-runtime").join("Clew.app"),
+    )?;
+    for role_dir in [USE_ROLE_DIR, HELPER_ROLE_DIR] {
+        copy_with_ditto(
+            &release_root.join(MACOS_ROLE_APP),
+            &kit_root.join(role_dir).join("Clew.app"),
+        )?;
+    }
+    let embedded_manifest = kit_root.join("site-kit-manifest.json");
+    fs::write(&embedded_manifest, payload_manifest)?;
+    set_recorded_mode(&embedded_manifest, "0644")?;
+    verify_site_kit_staging_tree(&kit_root, files, payload_manifest)?;
+    verify_macos_site_kit_apps(&kit_root)?;
+
+    let mut package = Command::new("/usr/bin/ditto");
+    package
+        .args(["-c", "-k", "--keepParent"])
+        .arg(&kit_root)
+        .arg(archive_path);
+    command_output_combined(&mut package)?;
+
+    let final_extract = temp.path().join("final");
+    fs::create_dir_all(&final_extract)?;
+    let mut final_unpack = Command::new("/usr/bin/ditto");
+    final_unpack
+        .args(["-x", "-k"])
+        .arg(archive_path)
+        .arg(&final_extract);
+    command_output_combined(&mut final_unpack)?;
+    let final_root = final_extract.join(package_stem);
+    verify_site_kit_staging_tree(&final_root, files, payload_manifest)?;
+    verify_macos_site_kit_apps(&final_root)?;
+    let final_manifest: SiteKitPayloadManifest =
+        serde_json::from_slice(&fs::read(final_root.join("site-kit-manifest.json"))?)?;
+    if &final_manifest != payload {
+        return Err("final macOS Site Kit manifest changed during ditto packaging".into());
+    }
+    Ok(())
+}
+
+fn is_macos_site_kit_app_path(path: &str) -> bool {
+    path.starts_with(".clew-runtime/Clew.app/")
+        || path.starts_with("1 Use this computer/Clew.app/")
+        || path.starts_with("2 Help nearby computers/Clew.app/")
+}
+
+fn copy_with_ditto(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut command = Command::new("/usr/bin/ditto");
+    command.arg(source).arg(target);
+    command_output_combined(&mut command)?;
+    Ok(())
+}
+
+fn verify_site_kit_staging_tree(
+    root: &Path,
+    expected_files: &[ArchiveFile],
+    expected_manifest: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let mut actual_paths = Vec::new();
+    collect_regular_paths(root, root, &mut actual_paths)?;
+    actual_paths.sort();
+    let mut expected_paths = expected_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    expected_paths.push("site-kit-manifest.json".into());
+    expected_paths.sort();
+    if actual_paths != expected_paths {
+        return Err("macOS Site Kit staging tree has an unexpected regular-file set".into());
+    }
+    for expected in expected_files {
+        let path = root.join(&expected.path);
+        let bytes = fs::read(&path)?;
+        if bytes.len() != expected.bytes.len()
+            || sha256_bytes(&bytes) != sha256_bytes(&expected.bytes)
+        {
+            return Err(
+                format!("macOS Site Kit staging hash differs for {}", expected.path).into(),
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+            if mode != expected.mode {
+                return Err(format!(
+                    "macOS Site Kit staging mode differs for {}: {mode:04o} != {:04o}",
+                    expected.path, expected.mode
+                )
+                .into());
+            }
+        }
+    }
+    if fs::read(root.join("site-kit-manifest.json"))? != expected_manifest {
+        return Err("macOS Site Kit staging embedded manifest changed".into());
+    }
+    Ok(())
+}
+
+fn verify_macos_site_kit_apps(root: &Path) -> Result<(), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Err("macOS Site Kit native verification must run on macOS".into());
+    }
+    let main = root.join(".clew-runtime").join("Clew.app");
+    verify_macos_signed_code(&main.join("Contents").join("Resources").join("clew"))?;
+    verify_macos_stapled_app(&main)?;
+    for role_dir in [USE_ROLE_DIR, HELPER_ROLE_DIR] {
+        let app = root.join(role_dir).join("Clew.app");
+        verify_macos_signed_code(&app.join("Contents").join("MacOS").join("Clew Role"))?;
+        verify_macos_stapled_app(&app)?;
+    }
+    Ok(())
+}
+
+fn verify_macos_stapled_app(app: &Path) -> Result<(), Box<dyn Error>> {
+    verify_macos_signed_code(app)?;
+    let mut staple = Command::new("xcrun");
+    staple.args(["stapler", "validate"]).arg(app);
+    command_output_combined(&mut staple)?;
+    let mut assess = Command::new("spctl");
+    assess
+        .args(["--assess", "--type", "exec", "--verbose=4"])
+        .arg(app);
+    command_output_combined(&mut assess)?;
+    Ok(())
+}
+
+fn write_named_zip(
+    path: &Path,
+    package_stem: &str,
+    files: &[ArchiveFile],
+    manifest_name: &str,
+    payload_manifest: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    validate_archive_relative_path(manifest_name)?;
     let file = File::create(path)?;
     let mut zip = ZipWriter::new(file);
     let timestamp = DateTime::default();
@@ -2308,9 +3373,112 @@ fn write_zip(
         .compression_method(CompressionMethod::Deflated)
         .last_modified_time(timestamp)
         .unix_permissions(0o644);
-    zip.start_file(format!("{package_stem}/release-manifest.json"), regular)?;
+    zip.start_file(format!("{package_stem}/{manifest_name}"), regular)?;
     zip.write_all(payload_manifest)?;
-    zip.finish()?;
+    let file = zip.finish()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_site_kit_tar_gz(
+    path: &Path,
+    package_stem: &str,
+    files: &[ArchiveFile],
+    payload_manifest: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(path)?;
+    let mut encoder = GzEncoder::new(file, Compression::best());
+    for payload in files {
+        validate_archive_relative_path(&payload.path)?;
+        write_tar_entry(
+            &mut encoder,
+            &format!("{package_stem}/{}", payload.path),
+            &payload.bytes,
+            payload.mode,
+        )?;
+    }
+    write_tar_entry(
+        &mut encoder,
+        &format!("{package_stem}/site-kit-manifest.json"),
+        payload_manifest,
+        0o644,
+    )?;
+    encoder.write_all(&[0_u8; 1024])?;
+    let file = encoder.finish()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn write_tar_entry(
+    writer: &mut impl Write,
+    path: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), Box<dyn Error>> {
+    let (prefix, name) = split_ustar_path(path)?;
+    let mut header = [0_u8; 512];
+    copy_tar_field(&mut header[0..100], name.as_bytes())?;
+    write_tar_octal(&mut header[100..108], u64::from(mode))?;
+    write_tar_octal(&mut header[108..116], 0)?;
+    write_tar_octal(&mut header[116..124], 0)?;
+    write_tar_octal(&mut header[124..136], bytes.len() as u64)?;
+    write_tar_octal(&mut header[136..148], 0)?;
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    if !prefix.is_empty() {
+        copy_tar_field(&mut header[345..500], prefix.as_bytes())?;
+    }
+    let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+    let checksum_text = format!("{checksum:06o}\0 ");
+    if checksum_text.len() != 8 {
+        return Err("tar checksum overflow".into());
+    }
+    header[148..156].copy_from_slice(checksum_text.as_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(bytes)?;
+    let padding = (512 - (bytes.len() % 512)) % 512;
+    if padding != 0 {
+        writer.write_all(&vec![0_u8; padding])?;
+    }
+    Ok(())
+}
+
+fn split_ustar_path(path: &str) -> Result<(&str, &str), Box<dyn Error>> {
+    if path.as_bytes().len() <= 100 {
+        return Ok(("", path));
+    }
+    for (index, _) in path.match_indices('/').rev() {
+        let prefix = &path[..index];
+        let name = &path[index + 1..];
+        if prefix.as_bytes().len() <= 155 && name.as_bytes().len() <= 100 {
+            return Ok((prefix, name));
+        }
+    }
+    Err(format!("Site Kit path exceeds ustar bounds: {path}").into())
+}
+
+fn copy_tar_field(target: &mut [u8], value: &[u8]) -> Result<(), Box<dyn Error>> {
+    if value.len() > target.len() {
+        return Err("tar field exceeds fixed width".into());
+    }
+    target[..value.len()].copy_from_slice(value);
+    Ok(())
+}
+
+fn write_tar_octal(target: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
+    if target.len() < 2 {
+        return Err("tar octal field is too short".into());
+    }
+    let digits = format!("{value:o}");
+    if digits.len() + 1 > target.len() {
+        return Err("tar octal value exceeds fixed width".into());
+    }
+    let start = target.len() - digits.len() - 1;
+    target[..start].fill(b'0');
+    target[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+    target[target.len() - 1] = 0;
     Ok(())
 }
 
@@ -2412,6 +3580,65 @@ mod tests {
         assert!(validate_target("../escape").is_err());
         assert!(validate_profile("release").is_ok());
         assert!(validate_profile("release/dev").is_err());
+    }
+
+    #[test]
+    fn site_kit_labels_and_linux_tar_are_bounded_and_deterministic() {
+        assert_eq!(sanitize_site_label(" Alice/Lab:*? ").unwrap(), "Alice-Lab");
+        assert!(sanitize_site_label("   ").is_err());
+        let temp = tempfile::tempdir().unwrap();
+        let files = vec![
+            archive_file("1 Use this computer/Clew", b"launcher".to_vec(), 0o755),
+            archive_file("site.clew", b"signed-site".to_vec(), 0o600),
+        ];
+        let first = temp.path().join("first.tar.gz");
+        let second = temp.path().join("second.tar.gz");
+        write_site_kit_tar_gz(&first, "Lab-Clew-Linux", &files, b"{}\n").unwrap();
+        write_site_kit_tar_gz(&second, "Lab-Clew-Linux", &files, b"{}\n").unwrap();
+        assert_eq!(sha256_file(&first).unwrap(), sha256_file(&second).unwrap());
+
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(File::open(&first).unwrap())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert!(decoded.ends_with(&[0_u8; 1024]));
+        let mut names = Vec::new();
+        let mut offset = 0_usize;
+        while offset + 512 <= decoded.len() {
+            let header = &decoded[offset..offset + 512];
+            if header.iter().all(|byte| *byte == 0) {
+                break;
+            }
+            let field = |range: std::ops::Range<usize>| {
+                let bytes = &header[range];
+                let end = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(bytes.len());
+                String::from_utf8(bytes[..end].to_vec()).unwrap()
+            };
+            let name = field(0..100);
+            let prefix = field(345..500);
+            names.push(if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            });
+            let size_text = std::str::from_utf8(&header[124..136])
+                .unwrap()
+                .trim_matches(char::from(0))
+                .trim();
+            let size = usize::from_str_radix(size_text, 8).unwrap_or(0);
+            offset += 512 + size.div_ceil(512) * 512;
+        }
+        assert_eq!(
+            names,
+            vec![
+                "Lab-Clew-Linux/1 Use this computer/Clew",
+                "Lab-Clew-Linux/site.clew",
+                "Lab-Clew-Linux/site-kit-manifest.json",
+            ]
+        );
     }
 
     #[test]
@@ -2636,6 +3863,7 @@ mod tests {
             "x86_64-pc-windows-msvc",
             b"win-binary",
             None,
+            b"role-launcher",
             b"readme",
             &branding,
             "1.2.3",
@@ -2644,13 +3872,20 @@ mod tests {
         assert_eq!(windows.name, "windows-portable");
         assert_eq!(windows.entrypoint, "clew.exe");
         assert_eq!(windows.cli_binary, "clew.exe");
-        assert_eq!(windows.files.len(), 2);
+        assert_eq!(windows.files.len(), 3);
+        assert!(
+            windows
+                .files
+                .iter()
+                .any(|file| file.path == "clew-role-launcher.exe" && file.mode == 0o755)
+        );
 
         let macos = build_package_layout(
             ReleasePlatform::Macos,
             "aarch64-apple-darwin",
             b"mac-cli",
             Some(b"mach-o-launcher"),
+            b"role-launcher",
             b"readme",
             &branding,
             "1.2.3",
@@ -2663,13 +3898,26 @@ mod tests {
         let plist = macos
             .files
             .iter()
-            .find(|file| file.path.ends_with("Info.plist"))
+            .find(|file| file.path == "Clew.app/Contents/Info.plist")
             .unwrap();
         let plist = std::str::from_utf8(&plist.bytes).unwrap();
         assert!(plist.contains("<string>io.clew.app</string>"));
         assert!(plist.contains("<string>Lab Connect</string>"));
         assert!(plist.contains("<key>CFBundleExecutable</key><string>Clew</string>"));
         assert!(plist.contains("<string>1.2.3</string>"));
+        let role_plist = macos
+            .files
+            .iter()
+            .find(|file| file.path == format!("{MACOS_ROLE_APP}/Contents/Info.plist"))
+            .unwrap();
+        let role_plist = std::str::from_utf8(&role_plist.bytes).unwrap();
+        assert!(role_plist.contains("<string>io.clew.app.role</string>"));
+        assert!(role_plist.contains("<key>CFBundleExecutable</key><string>Clew Role</string>"));
+        assert!(macos.files.iter().any(|file| {
+            file.path == format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role")
+                && file.mode == 0o755
+                && file.bytes == b"role-launcher"
+        }));
         let icns = macos
             .files
             .iter()
@@ -2691,6 +3939,7 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             b"linux-binary",
             None,
+            b"role-launcher",
             b"readme",
             &branding,
             "1.2.3",
@@ -2714,6 +3963,12 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "share/icons/hicolor/scalable/apps/clew.svg")
         );
+        assert!(
+            linux
+                .files
+                .iter()
+                .any(|file| file.path == "bin/clew-role-launcher" && file.mode == 0o755)
+        );
 
         let mut png_branding = branding.clone();
         png_branding.icon_bytes = render_icon_png(svg, 32).unwrap();
@@ -2724,6 +3979,7 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             b"linux-binary",
             None,
+            b"role-launcher",
             b"readme",
             &png_branding,
             "1.2.3",
@@ -2857,6 +4113,7 @@ mod tests {
             unsigned: true,
             signing: None,
             client_flavor: None,
+            site_kit_launcher: None,
             files,
         }
     }

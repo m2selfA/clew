@@ -436,7 +436,7 @@ impl SiteKitContract {
                 platform,
                 runtime_entry: "Clew.exe",
                 sidecar_name: "site.clew",
-                start_here_name: "开始这里.html",
+                start_here_name: "Start Here.html",
                 use_this_machine_args: &["host"],
                 help_nearby_args: &["host", "--connector-only"],
             },
@@ -444,7 +444,7 @@ impl SiteKitContract {
                 platform,
                 runtime_entry: "Clew.app",
                 sidecar_name: "site.clew",
-                start_here_name: "开始这里.html",
+                start_here_name: "Start Here.html",
                 use_this_machine_args: &["host"],
                 help_nearby_args: &["host", "--connector-only"],
             },
@@ -452,7 +452,7 @@ impl SiteKitContract {
                 platform,
                 runtime_entry: "Clew",
                 sidecar_name: "site.clew",
-                start_here_name: "开始这里.html",
+                start_here_name: "Start Here.html",
                 use_this_machine_args: &["host"],
                 help_nearby_args: &["host", "--connector-only"],
             },
@@ -781,6 +781,9 @@ mod tests {
         assert_eq!(windows.runtime_entry, "Clew.exe");
         assert_eq!(mac.runtime_entry, "Clew.app");
         assert_eq!(linux.runtime_entry, "Clew");
+        assert_eq!(windows.start_here_name, "Start Here.html");
+        assert_eq!(mac.start_here_name, windows.start_here_name);
+        assert_eq!(linux.start_here_name, windows.start_here_name);
         assert_eq!(windows.use_this_machine_args, &["host"]);
         assert_eq!(windows.help_nearby_args, &["host", "--connector-only"]);
         assert_eq!(mac.help_nearby_args, windows.help_nearby_args);
