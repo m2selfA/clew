@@ -80,7 +80,6 @@ jobs:
         os:
           - windows-2022
           - macos-14
-          - ubuntu-22.04
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -124,6 +123,37 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: unsigned-${{ matrix.os }}
+          path: |
+            dist/*.zip
+            dist/*.release.json
+            dist/SHA256SUMS
+            dist-client-flavors/**/cache-entry.json
+          if-no-files-found: error
+
+  unsigned-linux:
+    name: Unsigned Linux x86_64 / glibc 2.17
+    needs: metadata
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and verify inside manylinux2014
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash .github/scripts/linux-glibc217.sh package
+
+      - name: Upload verified Linux release input
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-linux-glibc217
           path: |
             dist/*.zip
             dist/*.release.json
@@ -263,6 +293,7 @@ jobs:
     needs:
       - metadata
       - unsigned
+      - unsigned-linux
       - sign-windows
       - sign-macos
     runs-on: ubuntu-22.04
@@ -285,7 +316,7 @@ jobs:
       - name: Download verified Linux
         uses: actions/download-artifact@v4
         with:
-          name: unsigned-ubuntu-22.04
+          name: unsigned-linux-glibc217
           path: inputs/linux
 
       - name: Assemble exact release file set

@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  test-and-package:
+  native-test-and-package:
     name: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -17,7 +17,6 @@ jobs:
         os:
           - windows-2022
           - macos-14
-          - ubuntu-22.04
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -48,6 +47,35 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: clew-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/*.zip
+            dist/*.release.json
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  linux-glibc217:
+    name: Linux x86_64 / glibc 2.17
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build, test, package, and verify inside manylinux2014
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            quay.io/pypa/manylinux2014_x86_64:latest \
+            bash .github/scripts/linux-glibc217.sh full
+
+      - name: Upload glibc 2.17 unsigned package
+        uses: actions/upload-artifact@v4
+        with:
+          name: clew-Linux-X64-glibc217
           path: |
             dist/*.zip
             dist/*.release.json
