@@ -1405,17 +1405,21 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6c-2 — Protected release workflow / dry-run
 
-**Status：IN PROGRESS（implementation complete；exact-clean three-platform rehearsal pending）**
+**Status：DONE（2026-09-05）**
 
 - 新增`.github/workflows/release.yml`：`workflow_dispatch` rehearsal与`v*`/显式publish共用一份workflow；metadata job要求publish ref精确等于`v<Cargo version>`，普通rehearsal只跑GitHub-hosted Windows/macOS/Linux clean package→verify→unsigned cache rehearsal，不触达签名机；
 - Windows/macOS publish jobs只运行于`release` environment保护的`self-hosted + clew-release-windows|macos` runner，workflow只接收公开证书thumbprint/timestamp URL/Developer ID identity/notary profile名称，私钥与认证材料继续只存在OS credential store/Keychain；签后再次独立verify，并要求正式`cache-client-flavor`（无rehearsal flag）进入release-ready缓存；
 - 最终publish job是唯一拥有`contents: write`的job，只汇聚signed Windows、signed/notarized macOS、verified Linux三平台exact 6-file release set，重新生成统一`SHA256SUMS`并`gh release create --verify-tag`；PR/普通CI保持现有secret-free unsigned路径；
 - 新增`.github/actionlint.yaml`登记两个custom runner label与4个允许的公开配置变量。固定`actionlint v1.7.7`对release workflow **0 error**；静态扫描确认workflow没有PFX/P12/password/private-key参数，`contents: write`只出现在最终publish job。下载artifact后的manifest查找使用递归且exact-one校验，避免`upload-artifact`多路径层级差异；
-- implementation commit固定后仍需在clean SHA上按workflow等价命令完成Windows/macOS/Linux native `package → verify-package → cache-client-flavor rehearsal`，再标DONE。真实Windows/macOS签名仍由V6b-3b外部凭据gate收口。
+- implementation commit=`968b8ef011576fb944bd7d9ca1635bf3f3893c30`。exact-clean三平台workflow等价rehearsal全部PASS：Windows ZIP SHA=`355c1f311d9be5c02a9af5349e41e5ecf231b066b56ed79732c18265bc39e684`，verify PASS，cache key=`client-flavor-v1-5eb02c58...5645815`且`release_ready=false`；macOS ZIP SHA=`ef566378d83a198982049d7470d78896ffc3df58b308e2bbba0798222b0072c8`，verify PASS，cache key=`client-flavor-v1-bcb4c0de...659682`完成miss→hit且`release_ready=false`；Linux ZIP SHA=`ffa9f06c9120afaa769ab23c96cbbdea3590973688d07ab677acb69a4dd05778`，verify PASS，cache key=`client-flavor-v1-013b3ba5...99efa7`且按当前Linux发布策略`release_ready=true`。三边均`dirty=false/source_commit=968b8ef...`；真实Windows/macOS签名仍只由V6b-3b外部凭据gate收口。V6c-2封板。
 
-#### V6c-3 — Release docs/checkpoint cleanup
+#### V6c-3 — Friend-facing Site Kit assembly + dual role launchers
 
-**Status：TODO** — README/checkpoint/Distribution Studio文档与最终生产链对齐，清理V1.5/V5等陈旧状态。
+**Status：IN PROGRESS** — final gap audit确认V1.5已经冻结同一runtime/同一`site.clew`的普通Host与helper-only双启动intent，但V6发布物尚未真正提供可双击的物理入口与Site-specific组装。当前块将把通用role launcher作为ClientFlavor的一部分一次构建/签名，再从immutable cached runtime + signed `site.clew` + Outfit assets组装Windows/macOS/Linux Site Kit；不同Site不得触发runtime重签。
+
+#### V6c-4 — Release docs/checkpoint cleanup
+
+**Status：TODO** — README/checkpoint/Distribution Studio/Site Kit文档与最终生产链对齐，清理V1.5/V5/V6中已经失效的“后续V6再做launcher”陈述。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1492,11 +1496,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel unblocked implementation block：V6c-2 — protected release workflow / dry-run**
+**Parallel unblocked implementation block：V6c-3 — friend-facing Site Kit assembly + dual role launchers**
 
-V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据，但不再等待凭据才建设发布生产系统：V6c先完成Outfit build contract、ClientFlavor cache、protected release workflow与文档收口；V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
+V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据；V6c-1 ClientFlavor cache与V6c-2 protected release workflow已封板。final gap audit又确认friend-facing Site Kit的双role物理入口尚未由V6真正组装，因此当前无凭据可推进块转为V6c-3；完成后再做V6c-4纯文档一致性收口。V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c-2 protected release workflow **DONE**：implementation `968b8ef`；actionlint 1.7.7与权限/secret静态审计通过。exact-clean workflow等价rehearsal三平台完成：Windows ZIP=`355c1f31...9e684` / cache `release_ready=false`，macOS ZIP=`ef566378...072c8` / cache miss→hit / `release_ready=false`，Linux ZIP=`ffa9f06c...05778` / cache `release_ready=true`；三边均source_commit=`968b8ef...`且独立verify PASS。final gap audit把下一块改为V6c-3 Site Kit physical assembly，而非直接做文档粉饰。
 
 - **2026-09-05** — V6c-2 protected release workflow implementation complete / native rehearsal pending：新增tag/manual dual-mode workflow、protected self-hosted Windows/macOS signing jobs、独立verify/cache与唯一contents-write GitHub Release汇聚；actionlint 1.7.7零错误，public selector/permission边界静态审计通过。下一步固定SHA后做三平台clean rehearsal。
 
