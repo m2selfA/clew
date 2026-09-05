@@ -1446,6 +1446,18 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 **Status：DONE（2026-09-05）** — README、GUI、Site Connector UX、Distribution Studio、gaps/checkpoint 已与最终生产链对齐：删除“V6以后再做双launcher”的未来时陈述，明确一次构建/签名ClientFlavor runtime + 通用role launcher、Controller-owned release-ready artifact store、native-platform复合`SiteKitCreate`以及Windows/macOS仍受外部签名凭据gate约束。
 
+#### V6d — Zero-terminal desktop distribution UX
+
+**Status：IMPLEMENTATION DONE / exact-clean 0.2.0 closeout pending（2026-09-05）**
+
+用户实测 `v0.1.0` 暴露出最后一公里产品问题：Controller 生成分发包仍隐含 terminal/xtask ClientFlavor 准备步骤，Windows Site Kit 需要理解两个 role 目录，而且 `clew gui` 的 GUI 后面仍挂着 console 窗口。V6d 统一把这些入口收口为 GUI-first：
+
+- workspace 版本升到 `0.2.0`；Windows Release 的人类 entrypoint 改为 GUI-subsystem `Clew Launcher.exe`，后台/CLI 继续保留 `clew.exe`；packaged `clew.exe gui` 会转交 launcher，launcher 再用 `CLEW_GUI_RUNTIME=1` + `CREATE_NO_WINDOW` 启动真正 GUI，避免递归并消除 Clew 自己的 console 尾窗；GUI/MCP 自动拉起 Controller、launcher 拉起 Host/Controller 的 Windows child 同样统一 hidden stdio + `CREATE_NO_WINDOW`；
+- Windows Site Kit launcher contract 升到 schema v2，根目录只放一个 `Clew.exe`，启动后 GUI 选择 `Use this computer` 或 `Help nearby computers connect`；helper 仍只传 `--connector-only`，没有文件/shell authority。旧 schema v1 Windows role launcher 继续允许历史 release/cache 验真，但 Local API 与 assembler 都在 invite 签发前拒绝拿它生成新的单-launcher Site Kit；macOS/Linux 暂保留 schema v1 原生 role-launcher 布局；
+- Controller GUI 的 `Create package for someone else` 直接收集 site 名、远端 absolute root、Write/Shell/TCP capability，并自动尝试验证当前解压 Release 根目录；不再要求普通用户先跑 `cache-client-flavor`。artifact store 对 extracted unsigned release 逐文件验证 manifest size/hash 后重建 immutable cache；Windows/macOS unsigned `0.x` 可作为诚实标记的 verified unsigned runtime 使用，unsigned `1.x+` 在 import、GUI readiness、Local API preflight、assembler 四层 fail closed。未来 signed Windows/macOS 不信任“解压目录里的 JSON 自称已签名”，该路径直接 fail closed，仍要求经过 native Authenticode/notary verification 的 ClientFlavor cache；
+- Controller GUI 新增 MCP HTTP Start/Stop、Running/Stopped 状态与一键复制 `http://127.0.0.1:4877/mcp`；仍只允许 loopback。Controller 冷启动从一次立即探测改为 8 秒有界 poll，子进程提前退出/超时均回显 GUI 错误；
+- Windows dirty packaging smoke 已确认新 payload 为 `Clew Launcher.exe, README.md, clew.exe`，PE header 反读 `launcher_subsystem=2`（Windows GUI）而后台 runtime `subsystem=3`（Console/CLI）。该检查已下沉为 `xtask verify-package` 的硬门禁：Windows human entrypoint 必须 subsystem=2，CLI/runtime 必须 subsystem=3；launcher schema 在过渡混合产物上也被 strict verifier 正确拒绝，证明 v1/v2 隔离生效。focused distribution/xtask/root 与多轮 workspace locked test 均已通过；最终 exact-clean `0.2.0` package/Site Kit/CI/release 证据在本块 implementation commit 后补录。
+
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
 ## 14. V7 — Advanced Service Runtime
@@ -1521,11 +1533,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current signed-major release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel unblocked implementation block：none — V6c productization / Site Kit / docs blocks are closed**
+**Parallel unblocked implementation block：V6d zero-terminal desktop distribution UX — implementation complete, exact-clean 0.2.0 closeout pending**
 
-V7 Advanced Service Runtime 已全线封板。V6c-1 ClientFlavor cache、V6c-2 protected release workflow、V6c-3双launcher Site Kit assembly、V6c-4产品侧artifact store/Local API/GUI完整输出以及V6c-5文档一致性均已封板；Linux已有release-ready exact-clean完整Site Kit native证据。仓库现已公开发布到 `https://github.com/m2selfA/clew`，`main` 跟踪 `origin/main`；public CI 对 Windows 2022 与 Linux glibc 2.17 基线均有真实 GitHub-hosted gate，macOS 14继续作为额外native覆盖。首个普通 Release `v0.1.0` 已实际发布到 `https://github.com/m2selfA/clew/releases/tag/v0.1.0`。发布策略冻结为：`0.x` 的 Windows/macOS unsigned + Linux verified 产物照常作为**普通 GitHub Release**发布，并在 release notes 明确平台签名状态；未来 Windows Code Signing + macOS Developer ID/notary 凭据齐备后，不覆盖或重标现有 unsigned asset，而是升到新的 major version（`1.x+`）走 signed release gate。当前唯一 signed-major blocker 是 V6b-3b 外部凭据 acceptance；除该 gate 外没有已知未完成的 V6/V7 实现块。V8+保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
+V7 Advanced Service Runtime 已全线封板；V6d 正在对 v0.1.0 实际分发反馈做最后一公里零终端收口。Windows 0.2.x 产品形态已从“双 role 目录 + CLI/GUI console 尾窗”改为 Release 根 GUI launcher、Site Kit 根单一角色选择 EXE、Controller GUI 内建分发向导与 MCP lifecycle；旧 launcher v1 仅保留历史验真兼容。Linux 既有 release-ready exact-clean Site Kit 证据不受影响。仓库公开于 `https://github.com/m2selfA/clew`；public CI 继续以 Windows 2022、Linux glibc 2.17 与 macOS 14 为 gate。`v0.1.0` 仍是当前公开 Release；`0.2.0` 待本块 exact-clean/CI 完成后作为新的普通 unsigned 0.x Release 发布。发布策略保持：Windows/macOS unsigned `0.x` 可普通发布但必须明确 unsigned，未来 Code Signing + Developer ID/notary 齐备后升新的 `1.x+` major 走 signed gate。当前唯一 signed-major blocker 仍是 V6b-3b 外部凭据 acceptance；V8+保持 deferred。wmn02 n0 relay egress 仍是环境问题。
 
 ### Change log
+
+- **2026-09-05** — V6d zero-terminal UX implementation complete / exact-clean 0.2.0 pending：Windows 人类 entrypoint 分离为 GUI-subsystem `Clew Launcher.exe` 与后台 CLI/runtime `clew.exe`；Site Kit 根单 `Clew.exe` GUI 选择 target/helper，所有后台 child hidden console；Controller GUI 直接收集权限、验证 extracted Release、生成完整 Site Kit并管理loopback MCP。launcher contract 升 v2，legacy v1 只验真不组新包；unsigned 0.x 可用但 1.x+ 四层 fail closed。版本升 `0.2.0`；dirty package PE 反读 launcher subsystem=2/runtime=3，最终 frozen workspace locked run 为 **293 passed / 0 failed**（原有 6 个环境型 ignored 保持不变），`cargo fmt -- --check`、locked all-target check 与 `git diff --check` 均通过；exact-clean package/Site Kit证据待 implementation commit 后补录。
 
 - **2026-09-05** — GitHub Release policy + first public Release **DONE**：原 `release.yml` 同时存在两项会导致 Releases 为空的边界：tag push 被直接解释为“必须签名发布”，而当前外部签名凭据尚未就绪；metadata 还错误从 root `[package] version = ...` 读取版本，而实际 authority 是 `[workspace.package] version = "0.1.0"`。`7dacde3` 改为 semver-major 分流：`0.x` tag push 发布 normal unsigned Release，`1.x+` tag push 只能进入 signed chain；手动 dispatch 同样区分 `release` / `signed`，并硬拒绝 unsigned 1.x 或 signed 0.x；CI branch push 与 tag release 触发解耦。exact tag `v0.1.0` 指向 `7dacde33dd2180e7131956d5aa96dd170495672d`，Release run `33953504090` 的 metadata、Windows、macOS、Linux/glibc2.17 输入 job 全部 PASS；三份 manifest 均 `source_commit=7dacde33... / dirty=false / unsigned=true`，Linux cache `release_ready=true`、Windows/macOS rehearsal cache `release_ready=false`。首次 publish job 只因未 checkout 的 job 中 `gh release create --verify-tag` 缺显式 repo context 而失败；`b52c85c` 为 unsigned + future signed publish 均加入 `--repo "$GITHUB_REPOSITORY"`，actionlint 1.7.7 PASS。随后严格复用该失败 run 已验真的 6 个 exact artifacts 组装 `SHA256SUMS` 并创建 `v0.1.0` normal Release：`isDraft=false / isPrerelease=false`，7 assets 全部 uploaded；macOS ZIP SHA=`ae1627b23edb405fc02f09c4056ef23a37a41e1a7e5b90b6e37ab8932e5b553c`，Windows ZIP SHA=`dcf06fb42388025702380a2d77d430bd5cccc4a38ebba25a454a8b3c0b3e6ba8`，Linux ZIP SHA=`1c2cad0b99be819f41990be192b73aa052c1fb96c5d2e1676b8dff0d8f3795e6`，release-level `SHA256SUMS` asset SHA=`fed474510ad7ef397e28939c98abca86efc9720093b4d32494acef2f0fae0558`。本块本地门禁仍为 actionlint PASS、locked check PASS、workspace **285/0**、`git diff --check` PASS。
 

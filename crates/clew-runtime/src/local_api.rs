@@ -15,8 +15,8 @@ use clew_core::{
     TransferId,
 };
 use clew_distribution::{
-    ClientFlavorArtifactStore, ClientFlavorArtifactSummary, SiteKitAssemblyRequest, SiteKitAsset,
-    assemble_site_kit,
+    ClientFlavorArtifactStore, ClientFlavorArtifactSummary, SITE_KIT_LAUNCHER_SCHEMA_VERSION,
+    SiteKitAssemblyRequest, SiteKitAsset, assemble_site_kit,
 };
 use clew_host::{
     ClientFlavor, HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew,
@@ -974,10 +974,10 @@ async fn dispatch(
             {
                 local_error(
                     LocalApiErrorCode::InvalidRequest,
-                    "ClientFlavor import path must be a bounded absolute directory path",
+                    "runtime import path must be a bounded absolute directory path",
                 )
             } else {
-                with_client_flavors(state, |store| store.import_release_ready(Path::new(path)))
+                with_client_flavors(state, |store| store.import_runtime_source(Path::new(path)))
                     .map(LocalResponse::ClientFlavorArtifact)
                     .unwrap_or_else(LocalResponse::Error)
             };
@@ -1285,13 +1285,36 @@ async fn create_site_kit_response(
             return local_error(
                 LocalApiErrorCode::InvalidRequest,
                 format!(
-                    "no release-ready ClientFlavor is active for this Outfit/current runtime ({flavor_id})"
+                    "no verified ClientFlavor runtime is active for this Outfit/current runtime ({flavor_id})"
                 ),
             );
         }
         Err(error) => return LocalResponse::Error(error),
     };
+    let unsigned_zero_major = artifact.release.payload.unsigned
+        && artifact.release.payload.signing.is_none()
+        && artifact.entry.version.split('.').next() == Some("0");
+    if !artifact.entry.release_ready && !unsigned_zero_major {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            "the active runtime is not eligible for Site Kit distribution; unsigned runtimes are allowed only for 0.x releases",
+        );
+    }
+    if artifact.platform == clew_distribution::ReleasePlatform::Windows
+        && artifact
+            .release
+            .payload
+            .site_kit_launcher
+            .as_ref()
+            .is_none_or(|launcher| launcher.schema_version != SITE_KIT_LAUNCHER_SCHEMA_VERSION)
+    {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            "the active Windows runtime uses the legacy Site Kit launcher and cannot build a single-launcher package; use a current Clew release",
+        );
+    }
 
+    let site_label = request.invite.site_name.clone();
     let issued = match issue_invite_response(state, request.invite).await {
         LocalResponse::InviteIssued(result) => result,
         LocalResponse::Error(error) => return LocalResponse::Error(error),
@@ -1351,7 +1374,6 @@ async fn create_site_kit_response(
     let site_file = issued.site_file;
     let output_dir = Path::new(output_dir).to_path_buf();
     let client_flavor_id = artifact.entry.client_flavor.id.clone();
-    let site_label = profile.display_name.clone();
     let assembled = tokio::task::spawn_blocking(move || {
         assemble_site_kit(SiteKitAssemblyRequest {
             artifact: &artifact,
@@ -3707,7 +3729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn site_kit_create_preflights_release_ready_flavor_before_invite_issue() {
+    async fn site_kit_create_preflights_verified_flavor_before_invite_issue() {
         let state = test_state();
         let output = tempfile::tempdir().unwrap();
         let response = create_site_kit_response(
@@ -3723,7 +3745,7 @@ mod tests {
             LocalResponse::Error(LocalApiErrorBody {
                 code: LocalApiErrorCode::InvalidRequest,
                 message,
-            }) if message.contains("no release-ready ClientFlavor is active")
+            }) if message.contains("no verified ClientFlavor runtime is active")
         ));
         let snapshot = state.control.lock().unwrap().snapshot().clone();
         assert!(snapshot.catalog.sites.is_empty());
@@ -3821,6 +3843,7 @@ mod tests {
             platform: clew_distribution::ReleasePlatform::Linux,
             arch: "x86_64".into(),
             source_commit: "c".repeat(40),
+            site_kit_launcher_schema: SITE_KIT_LAUNCHER_SCHEMA_VERSION,
             release_ready: true,
             active: false,
         };

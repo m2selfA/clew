@@ -769,7 +769,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clew"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "clew-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "clew-distribution"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clew-core",
  "clew-host",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "clew-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clew-core",
  "clew-identity",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "clew-identity"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "chacha20poly1305 0.11.0",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "clew-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clew-core",
  "prost",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "clew-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "clew-core",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "clew-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "clew-core",
@@ -7498,7 +7498,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "clew-distribution",

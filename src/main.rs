@@ -1,5 +1,14 @@
 use std::{collections::BTreeMap, io::Write, net::SocketAddr, path::PathBuf, process::ExitCode};
 
+#[cfg(windows)]
+use std::{
+    os::windows::process::CommandExt,
+    process::{Command as ProcessCommand, Stdio},
+};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[cfg(any(windows, target_os = "macos"))]
 mod gui;
 #[cfg(any(windows, target_os = "macos"))]
@@ -726,6 +735,28 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(windows)]
+fn relaunch_packaged_gui() -> Result<bool, Box<dyn std::error::Error>> {
+    if std::env::var_os("CLEW_GUI_RUNTIME").is_some() {
+        return Ok(false);
+    }
+    let executable = std::env::current_exe()?;
+    let Some(root) = executable.parent() else {
+        return Ok(false);
+    };
+    let launcher = root.join("Clew Launcher.exe");
+    if !launcher.is_file() {
+        return Ok(false);
+    }
+    ProcessCommand::new(launcher)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(true)
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Host {
@@ -779,6 +810,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Gui { state_dir } => {
+            #[cfg(windows)]
+            if state_dir.is_none() && relaunch_packaged_gui()? {
+                return Ok(());
+            }
             #[cfg(any(windows, target_os = "macos"))]
             {
                 let config = controller_config(state_dir)?;

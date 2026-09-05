@@ -1,10 +1,13 @@
 use std::{
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use clew_core::ActivityResult;
 use clew_host::OutfitProfile;
@@ -14,7 +17,7 @@ use clew_runtime::{
     LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
     OutfitAssetPreviewResponse, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
     OutfitSetAssetRequest, OutfitUpdateRequest, RecoveryStatus, ReleasePlatform,
-    SiteKitCreateRequest, SiteKitCreateResult,
+    SITE_KIT_LAUNCHER_SCHEMA_VERSION, SiteKitCreateRequest, SiteKitCreateResult,
 };
 
 use crate::{
@@ -33,6 +36,23 @@ const INVITE_VALID_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const INVITE_DEPLOYMENT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const INVITE_MAX_RESULT_BYTES: u32 = 49_152;
 const INVITE_READ_TIMEOUT_MS: u32 = 5_000;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+const MCP_HTTP_LISTEN: &str = "127.0.0.1:4877";
+const MCP_HTTP_URL: &str = "http://127.0.0.1:4877/mcp";
+const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(8);
+const CONTROLLER_START_POLL: Duration = Duration::from_millis(100);
+
+fn configure_background_command(command: &mut Command) {
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
 
 pub async fn run(config: ControllerConfig) -> Result<(), Box<dyn std::error::Error>> {
     ensure_controller(&config).await?;
@@ -64,16 +84,25 @@ async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn std:
     command
         .arg("controller")
         .arg("--state-dir")
-        .arg(config.state_root())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _child = command.spawn()?;
-
-    LocalApiClient::new(config.clone())
-        .controller_status()
-        .await?;
-    Ok(())
+        .arg(config.state_root());
+    configure_background_command(&mut command);
+    let mut child = command.spawn()?;
+    let client = LocalApiClient::new(config.clone());
+    let started = Instant::now();
+    loop {
+        if client.controller_status().await.is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("Controller exited before becoming ready: {status}").into());
+        }
+        if started.elapsed() >= CONTROLLER_START_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Controller did not become ready within 8 seconds".into());
+        }
+        tokio::time::sleep(CONTROLLER_START_POLL).await;
+    }
 }
 
 enum BackendCommand {
@@ -514,6 +543,7 @@ fn clew_icon() -> Result<Icon, tray_icon::BadIcon> {
 
 struct ControllerApp {
     backend: Backend,
+    controller_config: ControllerConfig,
     tray: Tray,
     status: Option<ControllerStatus>,
     devices: DeviceList,
@@ -525,8 +555,13 @@ struct ControllerApp {
     invite_open: bool,
     invite_site_name: String,
     invite_read_root: String,
+    invite_allow_write: bool,
+    invite_allow_shell: bool,
+    invite_allow_tcp_egress: bool,
     invite_in_flight: bool,
     client_flavor_import_in_flight: bool,
+    mcp_http: Option<Child>,
+    mcp_last_error: Option<String>,
     error: Option<String>,
     notice: Option<String>,
     backup_passphrase: String,
@@ -543,11 +578,12 @@ impl ControllerApp {
         cc: &eframe::CreationContext<'_>,
         config: ControllerConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = Backend::start(config, cc.egui_ctx.clone());
+        let backend = Backend::start(config.clone(), cc.egui_ctx.clone());
         let tray = Tray::new(&cc.egui_ctx)?;
         backend.refresh();
         Ok(Self {
             backend,
+            controller_config: config,
             tray,
             status: None,
             devices: DeviceList {
@@ -567,8 +603,13 @@ impl ControllerApp {
             invite_open: false,
             invite_site_name: "Collaborator".into(),
             invite_read_root: String::new(),
+            invite_allow_write: false,
+            invite_allow_shell: false,
+            invite_allow_tcp_egress: false,
             invite_in_flight: false,
             client_flavor_import_in_flight: false,
+            mcp_http: None,
+            mcp_last_error: None,
             error: None,
             notice: None,
             backup_passphrase: String::new(),
@@ -620,7 +661,7 @@ impl ControllerApp {
                 BackendEvent::ClientFlavorImported(summary) => {
                     self.client_flavor_import_in_flight = false;
                     self.notice = Some(format!(
-                        "Release-ready ClientFlavor imported and activated: {} {} ({}/{})",
+                        "Verified runtime imported and activated: {} {} ({}/{})",
                         summary.app_display_name,
                         summary.version,
                         release_platform_label(summary.platform),
@@ -739,77 +780,182 @@ impl ControllerApp {
         }
     }
 
+    fn poll_mcp_http(&mut self) {
+        let Some(child) = self.mcp_http.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                self.mcp_http = None;
+                self.mcp_last_error = Some(format!("MCP server stopped: {status}"));
+            }
+            Err(error) => {
+                self.mcp_http = None;
+                self.mcp_last_error = Some(format!("Could not query MCP server: {error}"));
+            }
+        }
+    }
+
+    fn start_mcp_http(&mut self) {
+        self.poll_mcp_http();
+        if self.mcp_http.is_some() {
+            return;
+        }
+        let result = (|| -> Result<Child, Box<dyn std::error::Error>> {
+            let executable = std::env::current_exe()?;
+            let mut command = Command::new(executable);
+            command
+                .arg("mcp")
+                .arg("http")
+                .arg("--listen")
+                .arg(MCP_HTTP_LISTEN)
+                .arg("--state-dir")
+                .arg(self.controller_config.state_root());
+            configure_background_command(&mut command);
+            Ok(command.spawn()?)
+        })();
+        match result {
+            Ok(child) => {
+                self.mcp_http = Some(child);
+                self.mcp_last_error = None;
+            }
+            Err(error) => self.mcp_last_error = Some(error.to_string()),
+        }
+    }
+
+    fn stop_mcp_http(&mut self) {
+        if let Some(mut child) = self.mcp_http.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.mcp_last_error = None;
+    }
+
+    fn import_current_runtime_if_available(&mut self) {
+        if self.active_native_client_flavor().is_some()
+            || self.client_flavor_import_in_flight
+            || self.invite_in_flight
+        {
+            return;
+        }
+        let Ok(executable) = std::env::current_exe() else {
+            return;
+        };
+        let Some(root) = executable.parent() else {
+            return;
+        };
+        if !root.join("release-manifest.json").is_file() {
+            return;
+        }
+        self.backend.client_flavor_import(root.to_path_buf());
+        self.client_flavor_import_in_flight = true;
+        self.error = None;
+    }
+
+    fn render_mcp(&mut self, ui: &mut egui::Ui) {
+        self.poll_mcp_http();
+        ui.group(|ui| {
+            ui.strong("Agent access (MCP)");
+            ui.label("Local Streamable HTTP endpoint");
+            ui.horizontal(|ui| {
+                ui.monospace(MCP_HTTP_URL);
+                if ui.button("Copy URL").clicked() {
+                    ui.ctx().copy_text(MCP_HTTP_URL.to_owned());
+                }
+            });
+            ui.small("The listener remains loopback-only. Remote clients should reach it through a secure tunnel rather than exposing it directly to the internet.");
+            ui.horizontal(|ui| {
+                if self.mcp_http.is_some() {
+                    ui.label("Status: Running");
+                    if ui.button("Stop MCP").clicked() {
+                        self.stop_mcp_http();
+                    }
+                } else {
+                    ui.label("Status: Stopped");
+                    if ui.button("Start MCP").clicked() {
+                        self.start_mcp_http();
+                    }
+                }
+            });
+            if let Some(error) = &self.mcp_last_error {
+                ui.label(format!("MCP: {error}"));
+            }
+        });
+    }
+
     fn render_invite(&mut self, ui: &mut egui::Ui) {
         if !self.invite_open {
             return;
         }
         ui.group(|ui| {
-            ui.heading("Invite collaborator");
-            ui.label("Create one complete Site Kit for this Controller's platform. The collaborator gets the signed runtime, site.clew, Start Here page, and two clear launch choices in one archive.");
+            ui.heading("Create a package to send");
+            ui.label("Fill in what the other computer should be allowed to do. Clew signs the invitation and builds the complete Site Kit for you.");
             ui.horizontal(|ui| {
-                ui.label("Site name");
+                ui.label("Name for this collaborator/site");
                 ui.text_edit_singleline(&mut self.invite_site_name);
             });
-            ui.label("Allowed read folder on the collaborator computer (absolute path)");
+            ui.label("Folder on the other computer that Clew may access (absolute path)");
             ui.text_edit_singleline(&mut self.invite_read_root);
-            ui.small("This is a remote Host path, not a folder on the Controller computer.");
-            ui.small("The current default Outfit is used. Files and commands outside the signed policy are not opened.");
+            ui.small("Example: D:\\research. This path is on the collaborator's computer, not on this Controller.");
+
+            ui.add_space(8.0);
+            ui.strong("Capabilities");
+            ui.checkbox(&mut self.invite_allow_write, "Allow changing files inside the approved folder");
+            ui.checkbox(&mut self.invite_allow_shell, "Allow running commands on that computer");
+            ui.checkbox(&mut self.invite_allow_tcp_egress, "Allow TCP forwarding/proxy from that computer");
+            if self.invite_allow_shell || self.invite_allow_tcp_egress {
+                ui.small("These are powerful permissions. Only enable them when the collaborator expects this access.");
+            }
 
             ui.separator();
-            ui.strong("ClientFlavor runtime");
+            ui.strong("Runtime to include");
             if let Some(default) = self.default_outfit_entry() {
-                ui.label(format!(
-                    "Default Outfit: {} · revision {}",
-                    default.display_name, default.revision
-                ));
+                ui.label(format!("Appearance: {} · revision {}", default.display_name, default.revision));
             }
             if let Some(artifact) = self.active_native_client_flavor() {
                 ui.label(format!(
-                    "Ready: {} {} · {} · {}",
+                    "{} {} · {} · {} · {}",
                     artifact.app_display_name,
                     artifact.version,
                     release_platform_label(artifact.platform),
-                    artifact.arch
+                    artifact.arch,
+                    if artifact.release_ready { "signed/release-ready" } else { "verified unsigned 0.x" }
                 ));
-            } else {
-                ui.label("No matching active release-ready ClientFlavor is installed for the current default Outfit/runtime.");
-            }
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.client_flavor_import_in_flight && !self.invite_in_flight,
-                        egui::Button::new("Import release-ready ClientFlavor..."),
-                    )
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.backend.client_flavor_import(path);
-                    self.client_flavor_import_in_flight = true;
-                    self.error = None;
+                if !artifact.release_ready {
+                    ui.small("This 0.x Windows/macOS runtime is unsigned. The recipient may see an operating-system trust warning; a future 1.x signed release will remove that warning.");
                 }
-                if self.client_flavor_import_in_flight {
+            } else if self.client_flavor_import_in_flight {
+                ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Verifying and importing runtime...");
+                    ui.label("Verifying this Clew installation...");
+                });
+            } else {
+                ui.label("No matching runtime has been verified yet.");
+                if ui.button("Use this Clew installation").clicked() {
+                    self.import_current_runtime_if_available();
+                    if !self.client_flavor_import_in_flight {
+                        self.error = Some("This copy is not an extracted release package. Choose an extracted Clew release folder below.".into());
+                    }
                 }
-            });
-            if !self.client_flavors.entries.is_empty() {
-                egui::CollapsingHeader::new("Imported ClientFlavors")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        for artifact in &self.client_flavors.entries {
-                            ui.label(format!(
-                                "{} r{} · {} {} · {} · {}{}",
-                                artifact.outfit_id,
-                                artifact.outfit_revision,
-                                artifact.version,
-                                artifact.arch,
-                                release_platform_label(artifact.platform),
-                                if artifact.release_ready { "release-ready" } else { "not release-ready" },
-                                if artifact.active { " · active" } else { "" }
-                            ));
-                        }
-                    });
             }
+            egui::CollapsingHeader::new("Choose another runtime package")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.small("Select the root folder of an extracted Clew release. Clew verifies release-manifest.json and every payload hash before using it.");
+                    if ui
+                        .add_enabled(
+                            !self.client_flavor_import_in_flight && !self.invite_in_flight,
+                            egui::Button::new("Choose extracted Clew release folder..."),
+                        )
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.backend.client_flavor_import(path);
+                        self.client_flavor_import_in_flight = true;
+                        self.error = None;
+                    }
+                });
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -876,9 +1022,9 @@ impl ControllerApp {
             deployment_window_ms: INVITE_DEPLOYMENT_WINDOW_MS,
             max_result_bytes: INVITE_MAX_RESULT_BYTES,
             read_timeout_ms: INVITE_READ_TIMEOUT_MS,
-            allow_write: false,
-            allow_shell: false,
-            allow_tcp_egress: false,
+            allow_write: self.invite_allow_write,
+            allow_shell: self.invite_allow_shell,
+            allow_tcp_egress: self.invite_allow_tcp_egress,
         }
     }
 
@@ -936,7 +1082,9 @@ fn matching_active_client_flavor<'a>(
         .find(|entry| entry.outfit_id == outfits.default_outfit_id)?;
     client_flavors.entries.iter().find(|artifact| {
         artifact.active
-            && artifact.release_ready
+            && (artifact.release_ready || artifact.version.split('.').next() == Some("0"))
+            && (platform != ReleasePlatform::Windows
+                || artifact.site_kit_launcher_schema == SITE_KIT_LAUNCHER_SCHEMA_VERSION)
             && artifact.outfit_id == default.outfit_id
             && artifact.outfit_revision == default.revision
             && artifact.version == version
@@ -978,6 +1126,7 @@ mod tests {
             platform: ReleasePlatform::Windows,
             arch: "x86_64".into(),
             source_commit: "c".repeat(40),
+            site_kit_launcher_schema: SITE_KIT_LAUNCHER_SCHEMA_VERSION,
             release_ready: true,
             active: true,
         }
@@ -1001,6 +1150,38 @@ mod tests {
             Some(&exact)
         );
 
+        let mut unsigned_zero = exact.clone();
+        unsigned_zero.release_ready = false;
+        let unsigned_list = ClientFlavorArtifactList {
+            entries: vec![unsigned_zero.clone()],
+        };
+        assert_eq!(
+            matching_active_client_flavor(
+                &outfits,
+                &unsigned_list,
+                "0.1.0",
+                ReleasePlatform::Windows,
+                "x86_64",
+            ),
+            Some(&unsigned_zero)
+        );
+
+        let mut unsigned_major = unsigned_zero.clone();
+        unsigned_major.version = "1.0.0".into();
+        let unsigned_major_list = ClientFlavorArtifactList {
+            entries: vec![unsigned_major],
+        };
+        assert!(
+            matching_active_client_flavor(
+                &outfits,
+                &unsigned_major_list,
+                "1.0.0",
+                ReleasePlatform::Windows,
+                "x86_64",
+            )
+            .is_none()
+        );
+
         for mismatched in [
             {
                 let mut value = exact.clone();
@@ -1009,7 +1190,7 @@ mod tests {
             },
             {
                 let mut value = exact.clone();
-                value.release_ready = false;
+                value.site_kit_launcher_schema = 1;
                 value
             },
             {
@@ -1052,6 +1233,7 @@ mod tests {
 
 impl Drop for ControllerApp {
     fn drop(&mut self) {
+        self.stop_mcp_http();
         MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
         TrayIconEvent::set_event_handler::<fn(TrayIconEvent)>(None);
     }
@@ -1085,10 +1267,14 @@ impl eframe::App for ControllerApp {
             ui.label(notice);
         }
 
-        if ui.button("Invite collaborator").clicked() {
+        if ui.button("Create package for someone else").clicked() {
             self.invite_open = true;
+            self.import_current_runtime_if_available();
         }
         self.render_invite(ui);
+
+        ui.separator();
+        self.render_mcp(ui);
 
         if let Some(review) = self.recovery.review
             && review.remote_access_paused

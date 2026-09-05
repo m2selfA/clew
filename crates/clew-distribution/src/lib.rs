@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use zip::ZipArchive;
+use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 mod site_kit;
 pub use site_kit::{
@@ -19,7 +19,8 @@ pub use site_kit::{
 pub const RELEASE_SCHEMA_VERSION: u32 = 2;
 pub const SIGNED_RELEASE_SCHEMA_VERSION: u32 = 3;
 pub const CLIENT_FLAVOR_CACHE_SCHEMA_VERSION: u32 = 1;
-pub const SITE_KIT_LAUNCHER_SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION: u32 = 1;
+pub const SITE_KIT_LAUNCHER_SCHEMA_VERSION: u32 = 2;
 pub const SITE_KIT_SCHEMA_VERSION: u32 = 1;
 pub const USE_ROLE_DIR: &str = "1 Use this computer";
 pub const HELPER_ROLE_DIR: &str = "2 Help nearby computers";
@@ -227,6 +228,8 @@ pub struct ClientFlavorArtifactSummary {
     pub platform: ReleasePlatform,
     pub arch: String,
     pub source_commit: String,
+    #[serde(default)]
+    pub site_kit_launcher_schema: u32,
     pub release_ready: bool,
     pub active: bool,
 }
@@ -255,6 +258,12 @@ impl ValidatedClientFlavorArtifact {
             platform: self.platform,
             arch: self.arch.clone(),
             source_commit: self.entry.source_commit.clone(),
+            site_kit_launcher_schema: self
+                .release
+                .payload
+                .site_kit_launcher
+                .as_ref()
+                .map_or(0, |launcher| launcher.schema_version),
             release_ready: self.entry.release_ready,
             active,
         }
@@ -352,7 +361,10 @@ fn validate_release_shape(
         return Err(DistributionError::ReleaseMetadataMismatch);
     }
     let launcher = payload.site_kit_launcher.as_ref().expect("checked above");
-    if launcher.schema_version != SITE_KIT_LAUNCHER_SCHEMA_VERSION {
+    if !matches!(
+        launcher.schema_version,
+        LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION | SITE_KIT_LAUNCHER_SCHEMA_VERSION
+    ) {
         return Err(DistributionError::UnsupportedLauncherSchema(
             launcher.schema_version,
         ));
@@ -405,6 +417,7 @@ fn validate_release_shape(
                 && signing.notarized
                 && signing.stapled => {}
         (ReleasePlatform::Linux, None) => {}
+        (ReleasePlatform::Windows | ReleasePlatform::Macos, None) if payload.unsigned => {}
         (_, _) => return Err(DistributionError::InvalidPlatformSigningEvidence),
     }
     if payload.files.is_empty() || payload.files.len() > MAX_RELEASE_PAYLOAD_FILES {
@@ -528,12 +541,37 @@ impl ClientFlavorArtifactStore {
         &self,
         source: &Path,
     ) -> Result<ClientFlavorArtifactSummary, DistributionError> {
+        self.import_cache_entry(source, true)
+    }
+
+    pub fn import_runtime_source(
+        &self,
+        source: &Path,
+    ) -> Result<ClientFlavorArtifactSummary, DistributionError> {
         self.ensure_roots()?;
-        let validated = validate_cache_entry_dir(source, true)?;
+        if source.join("cache-entry.json").is_file() {
+            return self.import_cache_entry(source, false);
+        }
+        if source.join("release-manifest.json").is_file() {
+            return self.import_release_directory(source);
+        }
+        Err(DistributionError::UnsupportedRuntimeSource)
+    }
+
+    fn import_cache_entry(
+        &self,
+        source: &Path,
+        require_release_ready: bool,
+    ) -> Result<ClientFlavorArtifactSummary, DistributionError> {
+        self.ensure_roots()?;
+        let validated = validate_cache_entry_dir(source, require_release_ready)?;
+        if !require_release_ready && !site_kit_distribution_eligible(&validated) {
+            return Err(DistributionError::RuntimeNotDistributionEligible);
+        }
         validate_flavor_id(&validated.entry.client_flavor.id)?;
         let destination = self.root.join("entries").join(&validated.entry.cache_key);
         if destination.exists() {
-            let existing = validate_cache_entry_dir(&destination, true)?;
+            let existing = validate_cache_entry_dir(&destination, false)?;
             if existing.entry != validated.entry || existing.release != validated.release {
                 return Err(DistributionError::ImmutableCacheConflict);
             }
@@ -544,6 +582,119 @@ impl ClientFlavorArtifactStore {
             &validated.entry.client_flavor.id,
             &validated.entry.cache_key,
         )?;
+        Ok(validated.summary(true))
+    }
+
+    fn import_release_directory(
+        &self,
+        source: &Path,
+    ) -> Result<ClientFlavorArtifactSummary, DistributionError> {
+        require_directory(source, "release directory")?;
+        let payload_bytes = read_bounded_regular(
+            &source.join("release-manifest.json"),
+            MAX_RELEASE_MANIFEST_BYTES,
+        )?;
+        let payload: PayloadManifest = serde_json::from_slice(&payload_bytes)?;
+        if !payload.unsigned {
+            return Err(DistributionError::SignedReleaseDirectoryRequiresNativeVerification);
+        }
+        let client_flavor = payload
+            .client_flavor
+            .clone()
+            .ok_or(DistributionError::ReleaseClientFlavorMissing)?;
+        let cache_key = client_flavor_cache_key(&client_flavor, &payload)?;
+        validate_cache_key(&cache_key)?;
+        validate_flavor_id(&client_flavor.id)?;
+        let platform = ReleasePlatform::from_target(&payload.target)?;
+        let release_ready = match platform {
+            ReleasePlatform::Linux => payload.unsigned,
+            ReleasePlatform::Windows | ReleasePlatform::Macos => !payload.unsigned,
+        };
+        let unsigned_zero_major = payload.unsigned
+            && payload.signing.is_none()
+            && payload.version.split('.').next() == Some("0");
+        if !release_ready && !unsigned_zero_major {
+            return Err(DistributionError::RuntimeNotDistributionEligible);
+        }
+        let destination = self.root.join("entries").join(&cache_key);
+        if destination.exists() {
+            let existing = validate_cache_entry_dir(&destination, false)?;
+            if existing.release.payload != payload {
+                return Err(DistributionError::ImmutableCacheConflict);
+            }
+            self.write_active_pointer(&client_flavor.id, &cache_key)?;
+            return Ok(existing.summary(true));
+        }
+
+        let stem = if payload.unsigned {
+            format!("clew-v{}-{}", payload.version, payload.target)
+        } else {
+            format!("clew-v{}-{}-signed", payload.version, payload.target)
+        };
+        let artifact_file = format!("{stem}.zip");
+        let manifest_file = format!("{stem}.release.json");
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let staging_parent = self.root.join("entries").join(format!(
+            ".staging.{}.{}.tmp",
+            std::process::id(),
+            nonce
+        ));
+        fs::create_dir(&staging_parent)?;
+        let staging = staging_parent.join(&cache_key);
+        fs::create_dir(&staging)?;
+        let artifact_path = staging.join(&artifact_file);
+        let result = (|| {
+            write_release_archive_from_directory(
+                source,
+                &artifact_path,
+                &stem,
+                &payload,
+                &payload_bytes,
+            )?;
+            let artifact = ArtifactInfo {
+                file: artifact_file.clone(),
+                size: fs::metadata(&artifact_path)?.len(),
+                sha256: sha256_file(&artifact_path)?,
+            };
+            let release = ArtifactManifest {
+                payload: payload.clone(),
+                artifact,
+            };
+            let release_bytes = serde_json::to_vec_pretty(&release)?;
+            fs::write(staging.join(&manifest_file), &release_bytes)?;
+            let entry = ClientFlavorCacheEntry {
+                schema_version: CLIENT_FLAVOR_CACHE_SCHEMA_VERSION,
+                cache_key: cache_key.clone(),
+                client_flavor: client_flavor.clone(),
+                version: payload.version.clone(),
+                target: payload.target.clone(),
+                profile: payload.profile.clone(),
+                source_commit: payload.source_commit.clone(),
+                release_ready,
+                signing: payload.signing.clone(),
+                artifact_file: artifact_file.clone(),
+                artifact_sha256: release.artifact.sha256.clone(),
+                manifest_file: manifest_file.clone(),
+                manifest_sha256: sha256_bytes(&release_bytes),
+            };
+            fs::write(
+                staging.join("cache-entry.json"),
+                serde_json::to_vec_pretty(&entry)?,
+            )?;
+            let validated = validate_cache_entry_dir(&staging, false)?;
+            if validated.entry != entry || validated.release != release {
+                return Err(DistributionError::CopyVerificationFailed);
+            }
+            fs::rename(&staging, &destination).map_err(DistributionError::PublishCacheEntry)?;
+            Ok(validated)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging_parent);
+        } else {
+            let _ = fs::remove_dir(&staging_parent);
+        }
+        let validated = result?;
+        self.write_active_pointer(&client_flavor.id, &cache_key)?;
         Ok(validated.summary(true))
     }
 
@@ -561,7 +712,7 @@ impl ClientFlavorArtifactStore {
             if !metadata.is_dir() || metadata.is_symlink() {
                 return Err(DistributionError::UnsafeStoreEntry);
             }
-            let validated = validate_cache_entry_dir(&entry.path(), true)?;
+            let validated = validate_cache_entry_dir(&entry.path(), false)?;
             let active = self
                 .read_active_key(&validated.entry.client_flavor.id)?
                 .as_deref()
@@ -580,7 +731,7 @@ impl ClientFlavorArtifactStore {
         let Some(key) = self.read_active_key(client_flavor_id)? else {
             return Ok(None);
         };
-        let artifact = validate_cache_entry_dir(&self.root.join("entries").join(&key), true)?;
+        let artifact = validate_cache_entry_dir(&self.root.join("entries").join(&key), false)?;
         if artifact.entry.client_flavor.id != client_flavor_id {
             return Err(DistributionError::ActivePointerFlavorMismatch);
         }
@@ -620,7 +771,7 @@ impl ClientFlavorArtifactStore {
             let file = fs::OpenOptions::new().write(true).open(&output)?;
             file.sync_all()?;
         }
-        let copied = validate_cache_entry_dir(&staging, true)?;
+        let copied = validate_cache_entry_dir(&staging, false)?;
         if copied.entry != source.entry || copied.release != source.release {
             let _ = fs::remove_dir_all(&staging_parent);
             return Err(DistributionError::CopyVerificationFailed);
@@ -871,6 +1022,49 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
+fn site_kit_distribution_eligible(artifact: &ValidatedClientFlavorArtifact) -> bool {
+    artifact.entry.release_ready
+        || (artifact.release.payload.unsigned
+            && artifact.release.payload.signing.is_none()
+            && artifact.entry.version.split('.').next() == Some("0"))
+}
+
+fn write_release_archive_from_directory(
+    source: &Path,
+    output: &Path,
+    stem: &str,
+    payload: &PayloadManifest,
+    payload_bytes: &[u8],
+) -> Result<(), DistributionError> {
+    let file = File::create(output)?;
+    let mut archive = ZipWriter::new(file);
+    for record in &payload.files {
+        validate_relative_path(&record.path)?;
+        let source_path = source.join(&record.path);
+        let bytes = read_bounded_regular(&source_path, record.size)?;
+        if bytes.len() as u64 != record.size || sha256_bytes(&bytes) != record.sha256 {
+            return Err(DistributionError::PayloadHashMismatch(record.path.clone()));
+        }
+        let mode = u32::from_str_radix(&record.mode, 8)
+            .map_err(|_| DistributionError::InvalidPayloadFileSet)?;
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(DateTime::default())
+            .unix_permissions(mode);
+        archive.start_file(format!("{stem}/{}", record.path), options)?;
+        archive.write_all(&bytes)?;
+    }
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .last_modified_time(DateTime::default())
+        .unix_permissions(0o644);
+    archive.start_file(format!("{stem}/release-manifest.json"), options)?;
+    archive.write_all(payload_bytes)?;
+    let file = archive.finish()?;
+    file.sync_all()?;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum DistributionError {
     #[error("Site Kit assembly failed: {0}")]
@@ -902,6 +1096,18 @@ pub enum DistributionError {
     InvalidBoundedText(&'static str),
     #[error("invalid release target")]
     InvalidTarget,
+    #[error(
+        "runtime is not eligible for Site Kit distribution; unsigned runtimes are allowed only for 0.x releases"
+    )]
+    RuntimeNotDistributionEligible,
+    #[error(
+        "signed extracted release directories require the native-verified ClientFlavor cache path"
+    )]
+    SignedReleaseDirectoryRequiresNativeVerification,
+    #[error("runtime source is neither a ClientFlavor cache entry nor an extracted Clew release")]
+    UnsupportedRuntimeSource,
+    #[error("release does not contain ClientFlavor metadata")]
+    ReleaseClientFlavorMissing,
     #[error("ClientFlavor cache directory name is invalid")]
     InvalidCacheDirectoryName,
     #[error("unsupported ClientFlavor cache schema {0}")]
@@ -1103,6 +1309,92 @@ mod tests {
             entry
         );
         assert_eq!(store.import_release_ready(&entry_root).unwrap(), imported);
+    }
+
+    #[test]
+    fn site_kit_runtime_policy_allows_release_ready_or_unsigned_zero_major_only() {
+        let source = tempfile::tempdir().unwrap();
+        let (entry_root, _) = linux_cache_fixture(source.path());
+        let mut artifact = validate_cache_entry_dir(&entry_root, true).unwrap();
+        assert!(site_kit_distribution_eligible(&artifact));
+
+        artifact.entry.release_ready = false;
+        artifact.entry.version = "0.2.0".into();
+        artifact.release.payload.version = "0.2.0".into();
+        artifact.release.payload.unsigned = true;
+        artifact.release.payload.signing = None;
+        assert!(site_kit_distribution_eligible(&artifact));
+
+        artifact.entry.version = "1.0.0".into();
+        artifact.release.payload.version = "1.0.0".into();
+        assert!(!site_kit_distribution_eligible(&artifact));
+    }
+
+    #[test]
+    fn client_flavor_summary_defaults_legacy_launcher_schema_to_zero() {
+        let source = tempfile::tempdir().unwrap();
+        let (entry_root, _) = linux_cache_fixture(source.path());
+        let artifact = validate_cache_entry_dir(&entry_root, true).unwrap();
+        let summary = artifact.summary(true);
+        let mut value = serde_json::to_value(&summary).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("site_kit_launcher_schema");
+        let decoded: ClientFlavorArtifactSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.site_kit_launcher_schema, 0);
+    }
+
+    #[test]
+    fn extracted_signed_release_requires_native_verified_cache_path() {
+        let source = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        let (entry_root, entry) = linux_cache_fixture(source.path());
+        let mut release: ArtifactManifest =
+            serde_json::from_slice(&fs::read(entry_root.join(&entry.manifest_file)).unwrap())
+                .unwrap();
+        release.payload.unsigned = false;
+        fs::write(
+            extracted.path().join("release-manifest.json"),
+            serde_json::to_vec_pretty(&release.payload).unwrap(),
+        )
+        .unwrap();
+        let store = ClientFlavorArtifactStore::new(store_root.path()).unwrap();
+        assert!(matches!(
+            store.import_runtime_source(extracted.path()),
+            Err(DistributionError::SignedReleaseDirectoryRequiresNativeVerification)
+        ));
+    }
+
+    #[test]
+    fn extracted_release_import_is_verified_cached_and_active() {
+        let source = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        let (entry_root, entry) = linux_cache_fixture(source.path());
+        let release: ArtifactManifest =
+            serde_json::from_slice(&fs::read(entry_root.join(&entry.manifest_file)).unwrap())
+                .unwrap();
+        fs::create_dir_all(extracted.path().join("bin")).unwrap();
+        fs::write(extracted.path().join("bin/clew"), b"elf").unwrap();
+        fs::write(
+            extracted.path().join("release-manifest.json"),
+            serde_json::to_vec_pretty(&release.payload).unwrap(),
+        )
+        .unwrap();
+
+        let store = ClientFlavorArtifactStore::new(store_root.path()).unwrap();
+        let imported = store.import_runtime_source(extracted.path()).unwrap();
+        assert_eq!(imported.cache_key, entry.cache_key);
+        assert!(imported.active);
+        assert_eq!(imported.client_flavor_id, entry.client_flavor.id);
+        let active = store
+            .active_for_flavor(&entry.client_flavor.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.release.payload, release.payload);
+        assert_eq!(store.list().unwrap(), vec![imported]);
     }
 
     #[test]

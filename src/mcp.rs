@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clew_core::{DeviceId, TaskId, select_executable_device};
 use clew_runtime::{
@@ -39,6 +42,9 @@ const MCP_DEFAULT_SHELL_ATTACH_BYTES: u32 = 12_288;
 const MCP_ERROR_TEXT_BYTES: usize = 2_048;
 const MCP_CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_HTTP_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug)]
 struct ClewMcpServer {
@@ -574,14 +580,17 @@ async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn Erro
     }
 
     let executable = std::env::current_exe()?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("controller")
         .arg("--state-dir")
         .arg(config.state_root())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn()?;
     let deadline = tokio::time::Instant::now() + MCP_CONTROLLER_START_TIMEOUT;
     loop {
         if client.controller_status().await.is_ok() {

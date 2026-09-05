@@ -11,10 +11,11 @@ use std::{
 use clap::{Parser, Subcommand};
 use clew_distribution::{
     ArtifactInfo, ArtifactManifest, CLIENT_FLAVOR_CACHE_SCHEMA_VERSION, ClientFlavorCacheEntry,
-    MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES, PayloadFile, PayloadManifest, RELEASE_SCHEMA_VERSION,
-    ReleaseClientFlavorInfo, ReleasePlatform, SIGNED_RELEASE_SCHEMA_VERSION,
-    SITE_KIT_LAUNCHER_SCHEMA_VERSION, SigningInfo, SiteKitArtifactManifest, SiteKitLauncherInfo,
-    SiteKitPayloadManifest, ToolchainInfo, client_flavor_cache_key,
+    LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION, MAX_CLIENT_FLAVOR_CACHE_ENTRY_BYTES, PayloadFile,
+    PayloadManifest, RELEASE_SCHEMA_VERSION, ReleaseClientFlavorInfo, ReleasePlatform,
+    SIGNED_RELEASE_SCHEMA_VERSION, SITE_KIT_LAUNCHER_SCHEMA_VERSION, SigningInfo,
+    SiteKitArtifactManifest, SiteKitLauncherInfo, SiteKitPayloadManifest, ToolchainInfo,
+    client_flavor_cache_key,
 };
 use clew_host::{
     ClientFlavor, MAX_OUTFIT_BUILD_SPEC_BYTES, OutfitAssetRef, OutfitBuildSpec, OutfitPreset,
@@ -284,12 +285,17 @@ fn assemble_site_kit(
         return Err("unsupported ClientFlavor cache schema for Site Kit assembly".into());
     }
     verify_client_flavor_cache_entry(&cache_root, &cache)?;
-    if !cache.release_ready && !allow_unsigned_rehearsal {
-        return Err("Site Kit assembly requires a release-ready ClientFlavor; unsigned Windows/macOS is rehearsal-only".into());
-    }
-
     let release_manifest_path = cache_root.join(&cache.manifest_file);
     let release = read_artifact_manifest(&release_manifest_path)?;
+    let unsigned_zero_major = !cache.release_ready
+        && release.payload.unsigned
+        && release.payload.version.split('.').next() == Some("0");
+    if !cache.release_ready && !unsigned_zero_major && !allow_unsigned_rehearsal {
+        return Err(
+            "Site Kit assembly requires a release-ready runtime or a verified unsigned 0.x runtime"
+                .into(),
+        );
+    }
     if release.payload.dirty {
         return Err("dirty release artifacts cannot be assembled into Site Kits".into());
     }
@@ -517,7 +523,7 @@ fn build_site_kit_files(
         archive_file("site.clew", site_bytes.to_vec(), 0o600),
         archive_file(
             contract.start_here_name,
-            site_kit_start_html(&profile).into_bytes(),
+            site_kit_start_html(&profile, platform).into_bytes(),
             0o644,
         ),
         archive_file(
@@ -542,21 +548,7 @@ fn build_site_kit_files(
                 .as_str();
             let launcher =
                 read_release_payload_file(&mut archive, release_stem, release, launcher_path)?;
-            for (role_dir, marker) in [
-                (USE_ROLE_DIR, b"use-this-machine\n".as_slice()),
-                (HELPER_ROLE_DIR, b"connector-only\n".as_slice()),
-            ] {
-                files.push(archive_file(
-                    format!("{role_dir}/Clew.exe"),
-                    launcher.clone(),
-                    0o755,
-                ));
-                files.push(archive_file(
-                    format!("{role_dir}/{ROLE_HINT_FILE}"),
-                    marker.to_vec(),
-                    0o644,
-                ));
-            }
+            files.push(archive_file("Clew.exe", launcher, 0o755));
         }
         ReleasePlatform::Macos => {
             append_release_prefix(
@@ -703,7 +695,7 @@ fn append_release_prefix(
     Ok(())
 }
 
-fn site_kit_start_html(profile: &OutfitProfile) -> String {
+fn site_kit_start_html(profile: &OutfitProfile, platform: ReleasePlatform) -> String {
     let title = html_escape(&profile.distribution_copy.start_here_title);
     let body = html_escape(&profile.distribution_copy.start_here_body);
     let support = profile
@@ -712,8 +704,13 @@ fn site_kit_start_html(profile: &OutfitProfile) -> String {
         .as_ref()
         .map(|value| format!("<p>Support: {}</p>", html_escape(value)))
         .unwrap_or_default();
+    let steps = if platform == ReleasePlatform::Windows {
+        "<ol><li>Double-click <b>Clew.exe</b> in this folder.</li><li>Choose <b>Use this computer</b> on the computer you want to access.</li><li>If it needs a nearby online helper, copy the same Site Kit there, open <b>Clew.exe</b>, and choose <b>Help nearby computers connect</b>.</li></ol>"
+    } else {
+        "<ol><li>On the computer you want to use remotely, open the <b>1 Use this computer</b> launcher.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer and open the <b>2 Help nearby computers</b> launcher.</li></ol>"
+    };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p><ol><li>On the computer you want to use remotely, open <b>{USE_ROLE_DIR}</b> and start Clew.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer, open <b>{HELPER_ROLE_DIR}</b>, and start Clew there.</li></ol><p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p>{steps}<p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
     )
 }
 
@@ -1084,7 +1081,7 @@ fn release_client_flavor_info(
 
 fn site_kit_launcher_info(platform: ReleasePlatform) -> SiteKitLauncherInfo {
     let (executable_path, bundle_root) = match platform {
-        ReleasePlatform::Windows => ("clew-role-launcher.exe".into(), None),
+        ReleasePlatform::Windows => ("Clew Launcher.exe".into(), None),
         ReleasePlatform::Macos => (
             format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role"),
             Some(MACOS_ROLE_APP.into()),
@@ -1092,7 +1089,11 @@ fn site_kit_launcher_info(platform: ReleasePlatform) -> SiteKitLauncherInfo {
         ReleasePlatform::Linux => ("bin/clew-role-launcher".into(), None),
     };
     SiteKitLauncherInfo {
-        schema_version: SITE_KIT_LAUNCHER_SCHEMA_VERSION,
+        schema_version: if platform == ReleasePlatform::Windows {
+            SITE_KIT_LAUNCHER_SCHEMA_VERSION
+        } else {
+            LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION
+        },
         executable_path,
         bundle_root,
     }
@@ -1601,7 +1602,7 @@ fn validate_payload_layout(payload: &PayloadManifest) -> Result<ReleasePlatform,
     match platform {
         ReleasePlatform::Windows
             if payload.layout == "windows-portable"
-                && payload.entrypoint == "clew.exe"
+                && payload.entrypoint == "Clew Launcher.exe"
                 && payload.cli_binary == "clew.exe" => {}
         ReleasePlatform::Macos
             if payload.layout == "macos-app"
@@ -1728,27 +1729,37 @@ fn validate_site_kit_launcher(
     let Some(launcher) = launcher else {
         return Ok(());
     };
-    if launcher.schema_version != SITE_KIT_LAUNCHER_SCHEMA_VERSION {
+    if !matches!(
+        launcher.schema_version,
+        LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION | SITE_KIT_LAUNCHER_SCHEMA_VERSION
+    ) {
         return Err("unsupported Site Kit launcher metadata schema".into());
     }
     validate_archive_relative_path(&launcher.executable_path)?;
     match platform {
         ReleasePlatform::Windows => {
-            if launcher.executable_path != "clew-role-launcher.exe"
-                || launcher.bundle_root.is_some()
-            {
+            let valid_path = match launcher.schema_version {
+                SITE_KIT_LAUNCHER_SCHEMA_VERSION => launcher.executable_path == "Clew Launcher.exe",
+                LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION => {
+                    launcher.executable_path == "clew-role-launcher.exe"
+                }
+                _ => false,
+            };
+            if !valid_path || launcher.bundle_root.is_some() {
                 return Err("Windows Site Kit launcher metadata is invalid".into());
             }
         }
         ReleasePlatform::Macos => {
-            if launcher.executable_path != format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role")
+            if launcher.schema_version != LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION
+                || launcher.executable_path != format!("{MACOS_ROLE_APP}/Contents/MacOS/Clew Role")
                 || launcher.bundle_root.as_deref() != Some(MACOS_ROLE_APP)
             {
                 return Err("macOS Site Kit launcher metadata is invalid".into());
             }
         }
         ReleasePlatform::Linux => {
-            if launcher.executable_path != "bin/clew-role-launcher"
+            if launcher.schema_version != LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION
+                || launcher.executable_path != "bin/clew-role-launcher"
                 || launcher.bundle_root.is_some()
             {
                 return Err("Linux Site Kit launcher metadata is invalid".into());
@@ -1801,7 +1812,14 @@ fn expected_payload_paths(
     };
     if has_role_launcher {
         match platform {
-            ReleasePlatform::Windows => paths.push("clew-role-launcher.exe".into()),
+            ReleasePlatform::Windows => paths.push(
+                payload
+                    .site_kit_launcher
+                    .as_ref()
+                    .expect("checked by has_role_launcher")
+                    .executable_path
+                    .clone(),
+            ),
             ReleasePlatform::Macos => {
                 paths.extend([
                     format!("{MACOS_ROLE_APP}/Contents/Info.plist"),
@@ -2114,7 +2132,7 @@ fn sign_windows_payload(
 }
 
 fn windows_signable_paths(payload: &PayloadManifest) -> Result<Vec<&str>, Box<dyn Error>> {
-    let mut paths = vec![payload.entrypoint.as_str()];
+    let mut paths = vec![payload.entrypoint.as_str(), payload.cli_binary.as_str()];
     if let Some(launcher) = &payload.site_kit_launcher {
         paths.push(launcher.executable_path.as_str());
     }
@@ -2505,11 +2523,11 @@ fn build_package_layout(
         ReleasePlatform::Windows => PackageLayout {
             name: "windows-portable".into(),
             app_id: APP_ID.into(),
-            entrypoint: "clew.exe".into(),
+            entrypoint: "Clew Launcher.exe".into(),
             cli_binary: "clew.exe".into(),
             files: vec![
                 archive_file("clew.exe", binary.to_vec(), 0o755),
-                archive_file("clew-role-launcher.exe", role_launcher.to_vec(), 0o755),
+                archive_file("Clew Launcher.exe", role_launcher.to_vec(), 0o755),
                 archive_file("README.md", readme.to_vec(), 0o644),
             ],
         },
@@ -2809,6 +2827,52 @@ fn smoke_binary(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn pe_subsystem(bytes: &[u8]) -> Result<u16, Box<dyn Error>> {
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        return Err("Windows executable is not a bounded PE image".into());
+    }
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into()?) as usize;
+    let optional_header = pe_offset
+        .checked_add(24)
+        .ok_or("PE optional-header offset overflow")?;
+    let subsystem_offset = optional_header
+        .checked_add(68)
+        .ok_or("PE subsystem offset overflow")?;
+    if pe_offset.checked_add(4).is_none_or(|end| end > bytes.len())
+        || &bytes[pe_offset..pe_offset + 4] != b"PE\0\0"
+        || subsystem_offset
+            .checked_add(2)
+            .is_none_or(|end| end > bytes.len())
+    {
+        return Err("Windows executable has an invalid PE header".into());
+    }
+    let magic = u16::from_le_bytes(bytes[optional_header..optional_header + 2].try_into()?);
+    if !matches!(magic, 0x10b | 0x20b) {
+        return Err("Windows executable has an unsupported PE optional header".into());
+    }
+    Ok(u16::from_le_bytes(
+        bytes[subsystem_offset..subsystem_offset + 2].try_into()?,
+    ))
+}
+
+fn verify_windows_entrypoint_subsystems(
+    root: &Path,
+    payload: &PayloadManifest,
+) -> Result<(), Box<dyn Error>> {
+    if release_platform(&payload.target)? != ReleasePlatform::Windows {
+        return Ok(());
+    }
+    let entrypoint = fs::read(root.join(&payload.entrypoint))?;
+    if pe_subsystem(&entrypoint)? != 2 {
+        return Err("Windows human entrypoint must use the GUI subsystem".into());
+    }
+    let cli = fs::read(root.join(&payload.cli_binary))?;
+    if pe_subsystem(&cli)? != 3 {
+        return Err("Windows background/CLI runtime must retain the console subsystem".into());
+    }
+    Ok(())
+}
+
 fn smoke_archive(
     archive_path: &Path,
     package_stem: &str,
@@ -2868,6 +2932,7 @@ fn smoke_archive(
     if !cli_binary.is_file() {
         return Err("release CLI binary was not extracted".into());
     }
+    verify_windows_entrypoint_subsystems(temp.path(), expected_payload)?;
     if execute_binary {
         smoke_binary(&cli_binary)?;
     }
@@ -2987,11 +3052,7 @@ fn verify_release_ready_windows_site_kit(
     let signtool = resolve_windows_signtool(None)?;
     let mut archive = ZipArchive::new(File::open(archive_path)?)?;
     let temp = tempfile::tempdir()?;
-    let signed_paths = [
-        ".clew-runtime/clew.exe",
-        "1 Use this computer/Clew.exe",
-        "2 Help nearby computers/Clew.exe",
-    ];
+    let signed_paths = [".clew-runtime/clew.exe", "Clew.exe"];
     for (index, path) in signed_paths.iter().enumerate() {
         let record = payload
             .files
@@ -3679,6 +3740,24 @@ mod tests {
     }
 
     #[test]
+    fn pe_subsystem_parser_distinguishes_gui_and_console_images() {
+        fn image(subsystem: u16) -> Vec<u8> {
+            let mut bytes = vec![0_u8; 0x120];
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[0x3c..0x40].copy_from_slice(&(0x80_u32).to_le_bytes());
+            bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+            let optional = 0x80 + 24;
+            bytes[optional..optional + 2].copy_from_slice(&0x20b_u16.to_le_bytes());
+            let offset = optional + 68;
+            bytes[offset..offset + 2].copy_from_slice(&subsystem.to_le_bytes());
+            bytes
+        }
+        assert_eq!(pe_subsystem(&image(2)).unwrap(), 2);
+        assert_eq!(pe_subsystem(&image(3)).unwrap(), 3);
+        assert!(pe_subsystem(b"not-pe").is_err());
+    }
+
+    #[test]
     fn target_layouts_bind_native_identity_and_entrypoints() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect width="16" height="16" fill="#123456"/></svg>"##;
         let mut profile = OutfitProfile::preset(OutfitPreset::ClewOriginal);
@@ -3703,14 +3782,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(windows.name, "windows-portable");
-        assert_eq!(windows.entrypoint, "clew.exe");
+        assert_eq!(windows.entrypoint, "Clew Launcher.exe");
         assert_eq!(windows.cli_binary, "clew.exe");
         assert_eq!(windows.files.len(), 3);
         assert!(
             windows
                 .files
                 .iter()
-                .any(|file| file.path == "clew-role-launcher.exe" && file.mode == 0o755)
+                .any(|file| file.path == "Clew Launcher.exe" && file.mode == 0o755)
         );
 
         let macos = build_package_layout(
@@ -3854,9 +3933,15 @@ mod tests {
             ReleasePlatform::Windows => (
                 "x86_64-pc-windows-msvc",
                 "windows-portable",
-                "clew.exe",
+                "Clew Launcher.exe",
                 "clew.exe",
                 vec![
+                    PayloadFile {
+                        path: "Clew Launcher.exe".into(),
+                        size: 8,
+                        sha256: sha256_bytes(b"launcher"),
+                        mode: "0755".into(),
+                    },
                     PayloadFile {
                         path: "README.md".into(),
                         size: 6,
@@ -3946,7 +4031,13 @@ mod tests {
             unsigned: true,
             signing: None,
             client_flavor: None,
-            site_kit_launcher: None,
+            site_kit_launcher: (platform == ReleasePlatform::Windows).then(|| {
+                SiteKitLauncherInfo {
+                    schema_version: SITE_KIT_LAUNCHER_SCHEMA_VERSION,
+                    executable_path: "Clew Launcher.exe".into(),
+                    bundle_root: None,
+                }
+            }),
             files,
         }
     }
@@ -3960,6 +4051,36 @@ mod tests {
             },
             payload,
         }
+    }
+
+    #[test]
+    fn windows_launcher_metadata_keeps_legacy_verification_but_requires_v2_path_for_v2() {
+        let legacy = SiteKitLauncherInfo {
+            schema_version: LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION,
+            executable_path: "clew-role-launcher.exe".into(),
+            bundle_root: None,
+        };
+        assert!(validate_site_kit_launcher(Some(&legacy), ReleasePlatform::Windows).is_ok());
+
+        let current = SiteKitLauncherInfo {
+            schema_version: SITE_KIT_LAUNCHER_SCHEMA_VERSION,
+            executable_path: "Clew Launcher.exe".into(),
+            bundle_root: None,
+        };
+        assert!(validate_site_kit_launcher(Some(&current), ReleasePlatform::Windows).is_ok());
+
+        let mut mismatch = legacy;
+        mismatch.schema_version = SITE_KIT_LAUNCHER_SCHEMA_VERSION;
+        assert!(validate_site_kit_launcher(Some(&mismatch), ReleasePlatform::Windows).is_err());
+    }
+
+    #[test]
+    fn windows_signing_covers_launcher_and_background_runtime() {
+        let payload = sample_payload(ReleasePlatform::Windows);
+        assert_eq!(
+            windows_signable_paths(&payload).unwrap(),
+            vec!["Clew Launcher.exe", "clew.exe"]
+        );
     }
 
     #[test]

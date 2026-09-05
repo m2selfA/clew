@@ -708,10 +708,11 @@ Outfit 不可以改：
 - Windows icon/version-resource build 与 macOS bundle name/icon/localization；
 - secret-free unsigned package、独立 verify、Windows Authenticode / macOS Developer ID + notarization 管线；
 - 以 Outfit revision/build key、runtime version、target/profile/source commit、signing identity 绑定的 immutable `ClientFlavor` cache；
-- 通用 role launcher 随 ClientFlavor runtime 一次构建/签名，同一 Site Kit 物理提供“使用这台电脑 / 只帮助附近电脑连接”两个入口；
-- Controller-owned release-ready ClientFlavor artifact store，导入时重新验证 exact file set/hash、clean provenance、签名 evidence 与 cache identity；
-- Controller GUI 默认调用复合 `SiteKitCreate`，先确认当前 default Outfit 有 matching active native ClientFlavor，再签 invite 并事务式组装完整 Site Kit；没有 matching runtime 时不签发 invite；
-- Windows/macOS/Linux native packaging 与 Site Kit smoke；Linux exact-clean release-ready Site Kit 已验收，Windows/macOS 最终 release acceptance 只待外部签名凭据。
+- Windows Release 把 GUI-subsystem `Clew Launcher.exe` 作为人类默认 entrypoint，后台 CLI/runtime 仍是 `clew.exe`；Windows Site Kit 使用 launcher contract v2，在根目录只提供一个 `Clew.exe`，启动后由用户选择“Use this computer”或“Help nearby computers connect”，不再要求理解两个 role 目录；macOS/Linux 保留当前原生 launcher 形态；
+- Controller-owned ClientFlavor artifact store 可直接验证并导入解压后的 **unsigned Release** 根目录：逐文件校验 `release-manifest.json` 声明的 size/hash，再重建 immutable cache artifact；Windows/macOS verified unsigned `0.x` 被明确保留为 unsigned，可用于普通 0.x Site Kit，但 unsigned `1.x+` 继续 fail closed。signed Windows/macOS 的解压目录不能凭 metadata 自证签名，仍必须来自 native-verified ClientFlavor cache；legacy Windows launcher v1 只保留验证兼容，不能生成新的单-root Site Kit；
+- Controller GUI 默认调用复合 `SiteKitCreate`：收集 site 名、远端 root、Write/Shell/TCP capability，自动尝试使用当前解压 Release runtime；没有当前 launcher contract 的 matching native runtime 时在 invite 签发前拒绝；
+- Controller GUI 直接管理 loopback MCP HTTP lifecycle，并提供 `http://127.0.0.1:4877/mcp` Copy URL；Controller/MCP/Host background child 在 Windows 使用 `CREATE_NO_WINDOW`，用户入口不留下 console 尾窗；
+- Windows/macOS/Linux native packaging 与 Site Kit smoke；Windows package verifier 额外硬验 PE subsystem：`Clew Launcher.exe` 必须 GUI=2、后台 `clew.exe` 必须 Console=3，避免 GUI 再回归黑框尾窗。Linux exact-clean release-ready Site Kit 已验收，Windows/macOS 最终 signed-major release acceptance 只待外部签名凭据。
 
 ## 18. 验收标准
 

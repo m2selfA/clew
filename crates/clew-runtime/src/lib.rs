@@ -19,7 +19,7 @@ mod transport;
 pub use backup::{ControllerBackupIoError, export_controller_backup, restore_controller_backup};
 pub use clew_distribution::{
     ClientFlavorArtifactStore, ClientFlavorArtifactSummary, DistributionError, ReleasePlatform,
-    ValidatedClientFlavorArtifact,
+    SITE_KIT_LAUNCHER_SCHEMA_VERSION, ValidatedClientFlavorArtifact,
 };
 pub use clew_transport::{
     FileConflictPolicy, FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus,

@@ -59,9 +59,23 @@ pub fn assemble_site_kit(
     request: SiteKitAssemblyRequest<'_>,
 ) -> Result<SiteKitAssemblyResult, DistributionError> {
     let artifact = request.artifact;
-    if !artifact.entry.release_ready {
+    if artifact.platform == ReleasePlatform::Windows
+        && artifact
+            .release
+            .payload
+            .site_kit_launcher
+            .as_ref()
+            .is_none_or(|launcher| {
+                launcher.schema_version != super::SITE_KIT_LAUNCHER_SCHEMA_VERSION
+            })
+    {
         return Err(site_error(
-            "product Site Kit assembly requires release-ready ClientFlavor",
+            "Windows single-launcher Site Kit requires the current role-chooser launcher contract",
+        ));
+    }
+    if !super::site_kit_distribution_eligible(artifact) {
+        return Err(site_error(
+            "product Site Kit assembly requires a release-ready runtime or a verified unsigned 0.x runtime",
         ));
     }
     let native = native_release_platform()?;
@@ -96,10 +110,14 @@ pub fn assemble_site_kit(
 
     let mut common = common_files(
         contract.start_here_name,
+        artifact.platform,
         &profile,
         request.site_bytes,
         &assets,
     )?;
+    if artifact.platform != ReleasePlatform::Windows {
+        append_legacy_role_markers(&mut common);
+    }
     let release_archive = artifact.root.join(&artifact.entry.artifact_file);
     let release_stem = release_package_stem(&artifact.release.payload);
     let payload_files = match artifact.platform {
@@ -124,7 +142,7 @@ pub fn assemble_site_kit(
         target: artifact.entry.target.clone(),
         source_release_sha256: artifact.entry.artifact_sha256.clone(),
         site_sha256: sha256_bytes(request.site_bytes),
-        runtime_release_ready: true,
+        runtime_release_ready: artifact.entry.release_ready,
         files: payload_files,
     };
     let payload_json = serde_json::to_vec_pretty(&payload)?;
@@ -273,26 +291,21 @@ fn validate_assets(
 
 fn common_files(
     start_here_name: &str,
+    platform: ReleasePlatform,
     profile: &OutfitProfile,
     site_bytes: &[u8],
     assets: &BTreeMap<String, SiteKitAsset>,
 ) -> Result<Vec<AssemblyFile>, DistributionError> {
     let mut files = vec![
         file("site.clew", site_bytes.to_vec(), 0o600),
-        file(start_here_name, start_html(profile).into_bytes(), 0o644),
+        file(
+            start_here_name,
+            start_html(profile, platform).into_bytes(),
+            0o644,
+        ),
         file(
             "Message to collaborator.txt",
             format!("{}\n", profile.distribution_copy.chat_message_template).into_bytes(),
-            0o644,
-        ),
-        file(
-            format!("{USE_ROLE_DIR}/{ROLE_HINT_FILE}"),
-            b"use-this-machine\n".to_vec(),
-            0o644,
-        ),
-        file(
-            format!("{HELPER_ROLE_DIR}/{ROLE_HINT_FILE}"),
-            b"connector-only\n".to_vec(),
             0o644,
         ),
     ];
@@ -304,6 +317,19 @@ fn common_files(
         ));
     }
     Ok(files)
+}
+
+fn append_legacy_role_markers(files: &mut Vec<AssemblyFile>) {
+    files.push(file(
+        format!("{USE_ROLE_DIR}/{ROLE_HINT_FILE}"),
+        b"use-this-machine\n".to_vec(),
+        0o644,
+    ));
+    files.push(file(
+        format!("{HELPER_ROLE_DIR}/{ROLE_HINT_FILE}"),
+        b"connector-only\n".to_vec(),
+        0o644,
+    ));
 }
 
 fn append_windows_files(
@@ -328,12 +354,7 @@ fn append_windows_files(
         .executable_path;
     let launcher = read_release_file(&mut archive, release_stem, artifact, launcher_path)?;
     files.push(file(".clew-runtime/clew.exe", runtime, 0o755));
-    files.push(file(
-        format!("{USE_ROLE_DIR}/Clew.exe"),
-        launcher.clone(),
-        0o755,
-    ));
-    files.push(file(format!("{HELPER_ROLE_DIR}/Clew.exe"), launcher, 0o755));
+    files.push(file("Clew.exe", launcher, 0o755));
     Ok(())
 }
 
@@ -887,7 +908,7 @@ fn file(path: impl Into<String>, bytes: Vec<u8>, mode: u32) -> AssemblyFile {
     }
 }
 
-fn start_html(profile: &OutfitProfile) -> String {
+fn start_html(profile: &OutfitProfile, platform: ReleasePlatform) -> String {
     let title = html_escape(&profile.distribution_copy.start_here_title);
     let body = html_escape(&profile.distribution_copy.start_here_body);
     let support = profile
@@ -896,8 +917,13 @@ fn start_html(profile: &OutfitProfile) -> String {
         .as_ref()
         .map(|value| format!("<p>Support: {}</p>", html_escape(value)))
         .unwrap_or_default();
+    let steps = if platform == ReleasePlatform::Windows {
+        "<ol><li>Double-click <b>Clew.exe</b> in this folder.</li><li>Choose <b>Use this computer</b> on the computer you want to access.</li><li>If it needs a nearby online helper, copy the same Site Kit there, open <b>Clew.exe</b>, and choose <b>Help nearby computers connect</b>.</li></ol>"
+    } else {
+        "<ol><li>On the computer you want to use remotely, open the <b>1 Use this computer</b> launcher.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer and open the <b>2 Help nearby computers</b> launcher.</li></ol>"
+    };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p><ol><li>On the computer you want to use remotely, open <b>{USE_ROLE_DIR}</b> and start Clew.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer, open <b>{HELPER_ROLE_DIR}</b>, and start Clew there.</li></ol><p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p>{steps}<p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
     )
 }
 
@@ -1067,7 +1093,7 @@ mod tests {
             archive_format: "zip".into(),
             layout: "windows-portable".into(),
             app_id: "io.clew.app".into(),
-            entrypoint: "clew.exe".into(),
+            entrypoint: "Clew Launcher.exe".into(),
             cli_binary: "clew.exe".into(),
             source_commit: "1".repeat(40),
             source_date_epoch: 1,
@@ -1091,12 +1117,12 @@ mod tests {
             client_flavor: Some(client_flavor.clone()),
             site_kit_launcher: Some(SiteKitLauncherInfo {
                 schema_version: crate::SITE_KIT_LAUNCHER_SCHEMA_VERSION,
-                executable_path: "clew-role-launcher.exe".into(),
+                executable_path: "Clew Launcher.exe".into(),
                 bundle_root: None,
             }),
             files: vec![
                 PayloadFile {
-                    path: "clew-role-launcher.exe".into(),
+                    path: "Clew Launcher.exe".into(),
                     size: launcher.len() as u64,
                     sha256: sha256_bytes(&launcher),
                     mode: "0755".into(),
@@ -1117,7 +1143,7 @@ mod tests {
             .compression_method(CompressionMethod::Deflated)
             .last_modified_time(DateTime::default())
             .unix_permissions(0o755);
-        zip.start_file(format!("{stem}/clew-role-launcher.exe"), executable)
+        zip.start_file(format!("{stem}/Clew Launcher.exe"), executable)
             .unwrap();
         zip.write_all(&launcher).unwrap();
         zip.start_file(format!("{stem}/clew.exe"), executable)
@@ -1191,20 +1217,35 @@ mod tests {
             entry.read_to_end(&mut bytes).unwrap();
             bytes
         };
-        let ordinary = read_entry(&format!("{USE_ROLE_DIR}/Clew.exe"));
-        let helper = read_entry(&format!("{HELPER_ROLE_DIR}/Clew.exe"));
-        assert_eq!(ordinary, b"signed-role-launcher");
-        assert_eq!(helper, ordinary);
-        assert_eq!(
-            read_entry(&format!("{USE_ROLE_DIR}/{ROLE_HINT_FILE}")),
-            b"use-this-machine\n"
-        );
-        assert_eq!(
-            read_entry(&format!("{HELPER_ROLE_DIR}/{ROLE_HINT_FILE}")),
-            b"connector-only\n"
-        );
+        assert_eq!(read_entry("Clew.exe"), b"signed-role-launcher");
         assert_eq!(read_entry(".clew-runtime/clew.exe"), b"signed-runtime");
         assert_eq!(read_entry("site.clew"), site_bytes);
+    }
+
+    #[test]
+    fn product_windows_site_kit_rejects_legacy_role_launcher_contract() {
+        let source = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (mut artifact, site, site_bytes) = fixture(source.path());
+        artifact
+            .release
+            .payload
+            .site_kit_launcher
+            .as_mut()
+            .unwrap()
+            .schema_version = super::super::LEGACY_SITE_KIT_LAUNCHER_SCHEMA_VERSION;
+        assert!(matches!(
+            assemble_site_kit(SiteKitAssemblyRequest {
+                artifact: &artifact,
+                site_label: "Legacy Launcher",
+                site_file: &site,
+                site_bytes: &site_bytes,
+                assets: &[],
+                out_dir: out.path(),
+            }),
+            Err(DistributionError::SiteKit(message))
+                if message.contains("current role-chooser launcher contract")
+        ));
     }
 
     #[test]
