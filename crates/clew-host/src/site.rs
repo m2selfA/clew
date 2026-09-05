@@ -94,11 +94,27 @@ impl ClientFlavor {
     }
 
     pub fn from_outfit_current(outfit: &OutfitProfile) -> Result<Self, SiteClewError> {
+        Self::from_outfit_target(outfit, TargetPlatform::current(), std::env::consts::ARCH)
+    }
+
+    pub fn from_outfit_target(
+        outfit: &OutfitProfile,
+        platform: TargetPlatform,
+        arch: &str,
+    ) -> Result<Self, SiteClewError> {
         outfit.validate().map_err(SiteClewError::Outfit)?;
+        if arch.is_empty()
+            || arch.len() > 32
+            || !arch
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(SiteClewError::InvalidTargetArchitecture);
+        }
         Ok(Self {
             runtime_version: env!("CARGO_PKG_VERSION").into(),
-            platform: TargetPlatform::current(),
-            arch: std::env::consts::ARCH.into(),
+            platform,
+            arch: arch.into(),
             outfit_id: outfit.outfit_id.clone(),
             outfit_revision: outfit.revision,
         })
@@ -225,9 +241,36 @@ impl SignedSiteClew {
         read_policy: ReadPolicy,
         controller_bootstrap_noise_public_key: [u8; 32],
     ) -> Result<Self, SiteClewError> {
+        let client_flavor = ClientFlavor::from_outfit_current(&outfit_profile)?;
+        Self::issue_networked_outfit_sealed_for_flavor(
+            controller,
+            outfit_profile,
+            client_flavor,
+            bootstrap,
+            role_hint,
+            controller_endpoint,
+            read_policy,
+            controller_bootstrap_noise_public_key,
+        )
+    }
+
+    pub fn issue_networked_outfit_sealed_for_flavor(
+        controller: &ControllerIdentity,
+        outfit_profile: OutfitProfile,
+        client_flavor: ClientFlavor,
+        bootstrap: SignedSiteBootstrapPass,
+        role_hint: HostRoleHint,
+        controller_endpoint: EndpointAddr,
+        read_policy: ReadPolicy,
+        controller_bootstrap_noise_public_key: [u8; 32],
+    ) -> Result<Self, SiteClewError> {
         outfit_profile.validate()?;
         read_policy.validate()?;
-        let client_flavor = ClientFlavor::from_outfit_current(&outfit_profile)?;
+        if client_flavor.outfit_id != outfit_profile.outfit_id
+            || client_flavor.outfit_revision != outfit_profile.revision
+        {
+            return Err(SiteClewError::OutfitFlavorMismatch);
+        }
         Self::issue_with_network(
             controller,
             client_flavor,
@@ -482,6 +525,8 @@ pub enum SiteClewError {
     FlavorFingerprintMismatch,
     #[error("site.clew OutfitProfile does not match its ClientFlavor")]
     OutfitFlavorMismatch,
+    #[error("target architecture is empty, too long, or contains unsupported characters")]
+    InvalidTargetArchitecture,
     #[error("site.clew was generated for a different ClientFlavor")]
     WrongClientFlavor,
     #[error("site.clew is {actual} bytes; maximum is {max}")]
@@ -535,6 +580,29 @@ mod tests {
         assert!(matches!(
             tampered.verify(),
             Err(SiteClewError::Identity(IdentityError::InvalidSignature))
+        ));
+    }
+
+    #[test]
+    fn target_client_flavor_is_explicit_and_arch_is_bounded() {
+        let profile = OutfitProfile::preset(OutfitPreset::ResearchLab);
+        let linux =
+            ClientFlavor::from_outfit_target(&profile, TargetPlatform::Linux, "x86_64").unwrap();
+        assert_eq!(linux.platform, TargetPlatform::Linux);
+        assert_eq!(linux.arch, "x86_64");
+        assert_eq!(linux.outfit_id, profile.outfit_id);
+        assert_eq!(linux.outfit_revision, profile.revision);
+
+        for invalid in ["", "x86 64", "../x86_64", "x86/64"] {
+            assert!(matches!(
+                ClientFlavor::from_outfit_target(&profile, TargetPlatform::Linux, invalid),
+                Err(SiteClewError::InvalidTargetArchitecture)
+            ));
+        }
+        let too_long = "a".repeat(33);
+        assert!(matches!(
+            ClientFlavor::from_outfit_target(&profile, TargetPlatform::Linux, &too_long),
+            Err(SiteClewError::InvalidTargetArchitecture)
         ));
     }
 

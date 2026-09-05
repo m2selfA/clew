@@ -12,7 +12,7 @@ Clew（线团）是一根穿过多层 NAT、中继和内网跳板的线：把合
 | [05-distribution-studio.md](05-distribution-studio.md) | Distribution Studio：图标、名称、颜色、文案、预设与签名 ClientFlavor |
 | [06-gaps.md](06-gaps.md) | Architecture v1.5 已裁定边界与实施检查表 |
 | [RELEASE_SIGNING.md](RELEASE_SIGNING.md) | Release signing：Windows Authenticode、macOS Developer ID/notarization、secret boundary 与验签流程 |
-| [SERVICE_RUNTIME.md](SERVICE_RUNTIME.md) | Advanced Service Runtime：Linux `systemd --user` 生命周期、linger 与 ownership 安全边界 |
+| [SERVICE_RUNTIME.md](SERVICE_RUNTIME.md) | Advanced Service Runtime：Linux user/system service、Windows machine/user-session lifecycle 与权限边界 |
 | [DEVELOPMENT_CHECKPOINT.md](DEVELOPMENT_CHECKPOINT.md) | 正式开发计划、分块状态、验收证据与下一步 |
 
 图形资源见 [`../assets`](../assets/README.md)。

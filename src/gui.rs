@@ -660,6 +660,8 @@ impl ControllerApp {
                     let request = InviteIssueRequest {
                         site_name: self.invite_site_name.trim().to_owned(),
                         outfit_id: None,
+                        target_platform: None,
+                        target_arch: None,
                         roots: vec![self.invite_read_root.trim().to_owned()],
                         max_claims: INVITE_MAX_CLAIMS,
                         valid_for_ms: INVITE_VALID_FOR_MS,

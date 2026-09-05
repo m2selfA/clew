@@ -14,7 +14,10 @@ use clew_core::{
     DeviceSummary, ForwardId, InviteId, ProxyId, ReadPolicy, SiteId, StateLayout, TaskId,
     TransferId,
 };
-use clew_host::{HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew};
+use clew_host::{
+    ClientFlavor, HostRoleHint, OutfitAssetRef, OutfitPreset, OutfitProfile, SignedSiteClew,
+    TargetPlatform,
+};
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
 use clew_transport::{
     FileConflictPolicy, FsGlobPage, FsGrepPage, FsMutationErrorBody, FsMutationErrorCode,
@@ -79,6 +82,10 @@ pub struct InviteIssueRequest {
     pub site_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outfit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_platform: Option<TargetPlatform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_arch: Option<String>,
     pub roots: Vec<String>,
     pub max_claims: u32,
     pub valid_for_ms: u64,
@@ -1098,6 +1105,22 @@ async fn issue_invite_response(
         Ok(profile) => profile,
         Err(error) => return LocalResponse::Error(error),
     };
+    let client_flavor = match (request.target_platform, request.target_arch.as_deref()) {
+        (None, None) => ClientFlavor::from_outfit_current(&outfit_profile),
+        (Some(platform), Some(arch)) => {
+            ClientFlavor::from_outfit_target(&outfit_profile, platform, arch)
+        }
+        _ => {
+            return local_error(
+                LocalApiErrorCode::InvalidRequest,
+                "target_platform and target_arch must be provided together",
+            );
+        }
+    };
+    let client_flavor = match client_flavor {
+        Ok(flavor) => flavor,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
     let controller_bootstrap_noise_public_key =
         match noise_static_public(state.controller_identity.bootstrap_noise_static_secret()) {
             Ok(key) => key,
@@ -1108,9 +1131,10 @@ async fn issue_invite_response(
                 );
             }
         };
-    let site_file = match SignedSiteClew::issue_networked_outfit_sealed(
+    let site_file = match SignedSiteClew::issue_networked_outfit_sealed_for_flavor(
         state.controller_identity.identity(),
         outfit_profile,
+        client_flavor,
         pass.clone(),
         HostRoleHint::ExecutePreferred,
         controller_endpoint,

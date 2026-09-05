@@ -1,6 +1,6 @@
 # Advanced Service Runtime
 
-Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 已完成；V7b Windows machine runtime与user-session control plane也已封板，包括protected IPC、standard-user lifecycle backend以及独立交互session中的GUI/tray生命周期验收；Linux system service 属于后续 V7c。
+Clew V7 的 Service Runtime 是**显式 opt-in** 的长期在线能力，不改变默认 portable / tray / foreground 使用方式。V7a Linux `systemd --user` 与 V7b Windows machine runtime/user-session control plane 已完成；V7c Linux machine system service 也已进入实现收口，继续保持 Connector-only、独立 machine identity 与显式 lifecycle。
 
 ## V7a：Linux `systemd --user`
 
@@ -139,8 +139,62 @@ V7b-2 不把 ProgramData machine state 或 DeviceKey 暴露给普通用户，而
 
 安全验收使用 restricted token真实移除 Administrators membership后完成：同一 authorized user仍能查询 protected IPC并用生产 backend stop/start service，但 `CHANGE_CONFIG` / `DELETE` 均被SCM拒绝，读取ProgramData `service.json`也返回 Access Denied；重启后仍恢复 `serving_connector` 且不获得 EXECUTE。最终 implementation commit `3ebc9fe` 的 binary又投到 mzd Active RDP Session 2：同session Win32 inspector通过 `EnumWindows`精确看到 visible `Clew Background Service` 顶层窗口；向该窗口发送 `WM_CLOSE` 后同一PID继续存活，窗口变为 invisible，证明默认close只hide-to-tray而不会退出client或停止machine service。临时scheduled tasks/binary/process均在验收后清理。V7b-2至此封板。
 
-## 后续 V7
+## V7c：Linux system service
 
-- **V7c Linux system service**：专用低权限 service account 与 machine state scope。
+V7c 服务化的是朋友侧长期在线 **Connector Host runtime**。它不把 user Controller 迁进 system scope，也不复用 user DeviceKey。生命周期入口仍保持显式分离：
+
+```text
+clew service status --scope machine
+sudo clew service install --scope machine --site /path/to/site.clew
+sudo clew service enable --scope machine
+sudo clew service start --scope machine
+sudo clew service stop --scope machine
+sudo clew service disable --scope machine
+sudo clew service uninstall --scope machine
+```
+
+`install` 只安装，不 enable、不 start；`enable` 只加入 `multi-user.target`，不立即启动；`start` / `stop` 只改变当前运行状态。machine scope 不提供 Linux tray/GUI，也没有 linger 概念。
+
+### identity、文件布局与权限
+
+Linux machine runtime 使用固定低权限账号 `clew-service`，由 `systemd-sysusers` 创建为 `/sbin/nologin` system user/private group。固定布局为：
+
+```text
+/usr/local/lib/clew-service/clew
+/etc/systemd/system/clew-connector.service
+/etc/sysusers.d/clew-service.conf
+/var/lib/clew-service/
+  service.json
+  kit/site.clew
+  state/
+```
+
+binary 与 system files 是 root-owned；machine root/kit/config 为 `root:clew-service`，service process 只读；只有 `state/` 归 `clew-service` 可写。普通本机用户不能读取 Site Kit/config。`service.json` 绑定 service uid/gid、binary SHA-256 与 Site Kit SHA-256；`start` / `enable` 会重新证明 unit/sysusers/account/ownership/mode/hash，payload 被篡改时 fail closed。`stop` / `disable` / `uninstall` 只要求能证明 Clew-owned system files，因此损坏安装仍可清理。
+
+install 从 `/proc/self/exe` 复制正在执行的 inode，而不是重新打开一个可能被替换的 argv 路径。预先存在的 `clew-service` user/group 或固定 system path 都会被视为 unmanaged collision 并拒绝采用。
+
+### Connector-only 与跨平台 Site Kit
+
+unit 固定启动：
+
+```text
+clew host --site /var/lib/clew-service/kit/site.clew \
+  --state-dir /var/lib/clew-service/state \
+  --foreground --connector-only
+```
+
+因此 Site Kit 即使原本允许 EXECUTE，machine service 也只申请 Connector capability，不开放 Read/Shell/File。若从另一平台的 Controller CLI 生成 Linux Site Kit，需要显式绑定目标 runtime，例如：
+
+```text
+clew mint <SITE> --root <ROOT> --output site.clew \
+  --target-platform linux --target-arch x86_64 \
+  --state-dir <CONTROLLER_STATE>
+```
+
+`--target-platform` 与 `--target-arch` 必须同时出现；目标 arch 有严格长度/字符边界。默认不指定时仍生成当前 Controller runtime 的 ClientFlavor，保持既有行为。
+
+### systemd hardening 与恢复
+
+`clew-connector.service` 使用 `Restart=on-failure`、`RestartSec=2s`、SIGTERM graceful stop、`UMask=0077`，并启用 `NoNewPrivileges`、`PrivateTmp`、`PrivateDevices`、`ProtectSystem=strict`、`ProtectHome`、kernel/control-group protections、空 capability bounding/ambient set；只有 `/var/lib/clew-service/state` 可写。Host foreground runtime同时监听 SIGTERM，因此 systemd stop 会沿现有 Host shutdown 路径释放 runtime lock/socket与网络任务，而不是依赖 SIGKILL。
 
 machine-level service 不得静默复用 portable/user DeviceKey，也不得因为 service account 权限较高就自动扩大 Shell/File/EXECUTE policy。相关总原则见 `01-design.md`、`03-gui.md` 与 `06-gaps.md`。

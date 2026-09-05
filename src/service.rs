@@ -8,6 +8,8 @@ use std::{ffi::OsStr, path::Path};
 use clap::ValueEnum;
 use serde::Serialize;
 
+#[cfg(target_os = "linux")]
+mod linux_system;
 #[cfg(windows)]
 mod windows;
 
@@ -99,7 +101,7 @@ pub fn manage(
         }
         ServiceScope::Machine => {
             if state_dir.is_some() {
-                return Err("Windows machine service state is fixed under ProgramData; --state-dir is not accepted".into());
+                return Err("machine service state is fixed by the platform service runtime; --state-dir is not accepted".into());
             }
             if matches!(
                 action,
@@ -119,10 +121,14 @@ pub fn manage(
             {
                 return windows::manage_machine(action, site);
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            {
+                return linux_system::manage_machine(action, site);
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 let _ = (action, site);
-                Err("`clew service --scope machine` is currently available on Windows only".into())
+                Err("`clew service --scope machine` is currently available on Windows and Linux only".into())
             }
         }
     }

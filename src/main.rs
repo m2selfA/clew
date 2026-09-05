@@ -18,7 +18,7 @@ use clew_core::{
 };
 use clew_host::{
     HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitPreset,
-    acquire_host_instance, resolve_host_launch_with_mode,
+    TargetPlatform, acquire_host_instance, resolve_host_launch_with_mode,
     serve_networked_membership_until_with_layout, wait_for_networked_activation_until,
 };
 #[cfg(any(windows, target_os = "macos"))]
@@ -65,11 +65,35 @@ struct ServiceCli {
     site: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum MintTargetPlatform {
+    Windows,
+    Macos,
+    Linux,
+}
+
+impl From<MintTargetPlatform> for TargetPlatform {
+    fn from(value: MintTargetPlatform) -> Self {
+        match value {
+            MintTargetPlatform::Windows => Self::Windows,
+            MintTargetPlatform::Macos => Self::MacOs,
+            MintTargetPlatform::Linux => Self::Linux,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct MintArgs {
     site_name: String,
     #[arg(long, value_name = "OUTFIT_ID")]
     outfit: Option<String>,
+    /// Sign the invitation for a different target OS. Must be paired with --target-arch.
+    #[arg(long, value_enum, requires = "target_arch")]
+    target_platform: Option<MintTargetPlatform>,
+    /// Rust target architecture name for the target runtime, for example x86_64 or aarch64.
+    #[arg(long, value_name = "ARCH", requires = "target_platform")]
+    target_arch: Option<String>,
     #[arg(long = "root", value_name = "DIR", required = true)]
     roots: Vec<PathBuf>,
     #[arg(long, value_name = "FILE", default_value = "site.clew")]
@@ -740,6 +764,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Mint(MintArgs {
             site_name,
             outfit,
+            target_platform,
+            target_arch,
             roots,
             output,
             max_claims,
@@ -764,6 +790,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .invite_issue(InviteIssueRequest {
                     site_name,
                     outfit_id: outfit,
+                    target_platform: target_platform.map(Into::into),
+                    target_arch,
                     roots: roots
                         .into_iter()
                         .map(|path| path.to_string_lossy().into_owned())
@@ -1544,6 +1572,27 @@ async fn run_host_network_lifecycle(
     Ok(())
 }
 
+async fn wait_for_host_process_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = terminate.recv() => {}
+            }
+        } else {
+            let _ = ctrl_c.await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 async fn run_host_foreground(
     layout: &clew_core::StateLayout,
     state: HostLaunchState,
@@ -1567,10 +1616,10 @@ async fn run_host_foreground(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let server =
         tokio::spawn(instance.serve_until(wait_for_host_shutdown(shutdown_rx.clone()), None));
-    let ctrl_shutdown = shutdown_tx.clone();
-    let ctrl_c = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = ctrl_shutdown.send(true);
+    let signal_shutdown = shutdown_tx.clone();
+    let process_signal = tokio::spawn(async move {
+        wait_for_host_process_signal().await;
+        let _ = signal_shutdown.send(true);
     });
 
     let result = async {
@@ -1597,8 +1646,8 @@ async fn run_host_foreground(
     .await;
 
     let _ = shutdown_tx.send(true);
-    ctrl_c.abort();
-    let _ = ctrl_c.await;
+    process_signal.abort();
+    let _ = process_signal.await;
     server.await??;
     result?;
     Ok(())
