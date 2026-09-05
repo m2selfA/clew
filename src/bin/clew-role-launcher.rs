@@ -41,9 +41,21 @@ fn main() -> ExitCode {
     match launch() {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("Clew Site Kit could not start: {error}");
+            report_error(&format!("Clew Site Kit could not start: {error}"));
             ExitCode::FAILURE
         }
+    }
+}
+
+fn report_error(message: &str) {
+    eprintln!("{message}");
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let _ = rfd::MessageDialog::new()
+            .set_title("Clew Site Kit")
+            .set_description(message)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
     }
 }
 
