@@ -247,11 +247,12 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF_TYPE" = "tag"
           test "$GITHUB_REF_NAME" = "v${{ needs.metadata.outputs.version }}"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $GITHUB_REF_NAME already exists; refusing to overwrite immutable assets" >&2
             exit 1
           fi
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "Clew ${{ needs.metadata.outputs.version }}" \
             --notes-file RELEASE_NOTES.md \
@@ -440,6 +441,7 @@ jobs:
           test "$GITHUB_REF_TYPE" = "tag"
           test "$GITHUB_REF_NAME" = "v${{ needs.metadata.outputs.version }}"
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "Clew ${{ needs.metadata.outputs.version }}" \
             --generate-notes \
