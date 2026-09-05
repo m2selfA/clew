@@ -701,7 +701,7 @@ Validation：`cargo fmt -- --check` PASS；`cargo check --workspace --all-target
 - CLI `mint` 与 GUI 共用新 `invite_io`：先从 Controller 取回 Outfit assets，核对 asset id/长度/content hash，原子写到 kit sibling，再落 signed `site.clew`。显式隔离 Controller smoke 真正走 Local API 签出 **7990-byte** `site.clew`，serde role 为 `execute_preferred`，证明 GUI 默认邀请仍是 site-capable artifact而不是预判 Gateway；随后 authenticated shutdown 与 smoke state/output 清理均完成；
 - 新 `HostLaunchMode::{Default, ConnectorOnly}` 只存在于**尚未 enrollment** 的启动 intent；已有 membership 以持久化 capability 为准，第二次从另一个入口打开不能改写既有授权；组合规则是 signed `HostRoleHint::ConnectorOnly` **或**本次 `--connector-only` 任一成立就只发送 `BootstrapMemberMode::ConnectorOnly`，因此入口只能降权、不能升级；
 - 同一 signed `ExecutePreferred` Site Kit 的真实 no-public sealed enrollment 新增 helper-only acceptance：Controller 的 production `claim_with_ceiling` 最终得到 `execute=false/read=false/write=false/shell=false/connector=true`，Active membership 也 `executable=false`，**1/1 PASS（2.84s）**；monotonic downgrade 与 pending-only state 另有 focused regression；
-- `SiteKitContract` 冻结同 runtime / 同 `site.clew` 的双入口 argv：普通入口 `host`，helper 入口 `host --connector-only`，Windows/macOS/Linux 一致。**这里冻结的是 V1.5 产品语义 contract；真正 Windows shortcut/macOS launcher/Linux packaging、codesign/notarization 仍属于 V6，不提前宣称已生成正式双 launcher artifact。**
+- `SiteKitContract` 冻结同 runtime / 同 `site.clew` 的双入口 argv：普通入口 `host`，helper 入口 `host --connector-only`，Windows/macOS/Linux 一致。**这里在 V1.5 阶段冻结的是产品语义 contract；V6c-3 已按该 contract 落地 Windows/macOS/Linux 双 role launcher 与 Site Kit assembly。正式 Windows/macOS release-ready 签名仍由 V6b-3b 外部凭据 gate 管理。**
 - Host GUI/foreground 对 helper-only 使用 Outfit 的 helper-ready string，并固定明确“这台电脑只帮助附近电脑连接；不会开放文件或命令；Target↔Controller 内容仍端到端保护”；普通 EXECUTE+CONNECTOR 自动 promotion 不要求朋友切换模式；
 - Controller GUI disabled invite 占位已移除，真实表单/后台 command 已接通；Windows interactive GUI job 持续 >15 秒 stderr 为空，且 GUI 自动拉起的隔离 Controller `status` 返回 `ready=true` + remote EndpointId。Host interactive GUI/tray regression **1/1 PASS**。
 
@@ -711,7 +711,7 @@ macOS exact-commit acceptance：implementation commit `84b99c7` 的 tracked arch
 
 Aqua product gate：exact binary 的 Controller GUI 持续 >15 秒 stderr 为空并自动拉起 `ready=true` Controller；该 Controller 又在 **442 ms** 内真实签出 macOS 当前 ClientFlavor 的 `site.clew`。同一普通 `execute_preferred` sidecar 以 `host --connector-only` 启动后，Host Aqua GUI 持续 >15 秒 stderr 为空，Controller `devices` 明确返回 `online=true / executable=false / connector=true`；second launch **112 ms** 返回 `already running; requested the existing window to show`。Host/Controller job 与 smoke state/kit 均已清理。
 
-V1.5 final multi-machine acceptance 已推进到真实三机产品路径；2026-09-03 的连续物理诊断又把 blocker 从“LAN 拓扑”与“Windows GPO/Defender”两种过早归因中进一步收窄：**当前测试网络对普通终端之间的 peer UDP/QUIC direct ingress 存在上游 ACL / isolation，无法作为稳定的 physical Connector acceptance 拓扑**。最终 physical Site Kit 双 launcher/signing 继续留在 V6。
+V1.5 final multi-machine acceptance 已推进到真实三机产品路径；2026-09-03 的连续物理诊断又把 blocker 从“LAN 拓扑”与“Windows GPO/Defender”两种过早归因中进一步收窄：**当前测试网络对普通终端之间的 peer UDP/QUIC direct ingress 存在上游 ACL / isolation，无法作为稳定的 physical Connector acceptance 拓扑**。该轮只把 physical Site Kit 双 launcher/signing 延后到 V6；V6c-3 后续已完成双 launcher/assembly，Windows/macOS 正式签名 acceptance 仍只受 V6b-3b 外部凭据 gate 阻塞。
 
 2026-09-03 三机 acceptance 与后续物理诊断：
 
@@ -1391,7 +1391,7 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ### V6c — Release productionization
 
-**Status：IN PROGRESS**
+**Status：DONE（2026-09-05）**
 
 #### V6c-1 — Outfit build contract + native ClientFlavor artifact cache
 
@@ -1415,17 +1415,18 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 #### V6c-3 — Friend-facing Site Kit assembly + dual role launchers
 
-**Status：IN PROGRESS（implementation complete；exact-clean Site Kit closeout pending）**
+**Status：DONE（2026-09-05）**
 
 - 新增feature-gated `clew-role-launcher`，不扩张已经接近Windows主线程栈上限的root Clap tree。launcher只接受固定`role-hint.clew`两种canonical marker，普通入口只执行`host --site <root/site.clew>`，helper入口只额外追加`--connector-only`；site/runtime/marker都要求regular non-symlink file。Windows/macOS launcher只spawn后返回，Linux保持可观察foreground wait；
 - `xtask package`现在把通用role launcher作为ClientFlavor runtime的一部分一次构建：Windows `clew-role-launcher.exe`，macOS独立`Clew Role.app`，Linux `bin/clew-role-launcher`；release manifest增加可选`site_kit_launcher` provenance且旧manifest仍可验证。Windows签名路径覆盖主exe+role launcher；macOS inside-out签主CLI/main app + role executable/role app，同一次notary submission后分别staple并验证；
 - 新增`cargo xtask assemble-site-kit`：输入immutable ClientFlavor cache entry、human site label与Controller-signed `site.clew`，重新验证cache exact file set/hash、release shape、clean provenance、ClientFlavor/build key、semantic cache key与cache目录identity；Windows/macOS release-ready kit强制在对应native OS组装。每个Site只加入signed sidecar、精确referenced Outfit assets、`Start Here.html`/消息文案与两个friend-facing role目录，不触发runtime rebuild/re-sign；Linux输出deterministic `.tar.gz`；
 - macOS正式Site Kit不使用普通ZIP库假装保真：release-ready路径用`ditto`从已notarize release ZIP展开并复制主app/role app，再用`ditto --keepParent`生成最终ZIP；最终ZIP再次展开，对`.clew-runtime/Clew.app`和两个role app逐一重复codesign + stapler + Gatekeeper验证。Windows正式Site Kit也从最终ZIP重新抽取主exe+两个role launcher跑SignTool；unsigned rehearsal可跨平台组装但不能冒充release-ready；
 - Windows dirty package smoke：ZIP SHA=`bebaeeddc423eea19cb38871160c48421a62e3d1adcc10343f5e4f558d7df2e6`，manifest exact shape=`README 0644 + clew-role-launcher.exe 0755 + clew.exe 0755`，role PE ProductName/FileDescription=`Clew`且associated icon可提取。首次独立verify暴露validator仍把新launcher误判为0644，统一按`site_kit_launcher.executable_path`识别后同一artifact verify PASS；dirty cache negative control仍明确拒绝。pre-commit gates：fmt PASS；workspace locked check 0 warning；workspace tests **274 passed / 0 failed / 7 ignored**；xtask **13/13**；git diff check PASS。下一步固定implementation SHA，从clean SHA完成真实Controller mint→release/cache→Site Kit assembly与三平台native rehearsal后再标DONE。
+- exact-clean closeout固定在implementation/fix commit `21fcee81b8c9bceecd8f61e25692c9aaca1ba7d0`。Windows/macOS native closeout已完成；Linux wmn02 exact checkout重新独立复核：source release ZIP SHA=`dae668baf3bed80010dc45a37c6f66d69f3baacc080b0e6a5c32cc1745bc509a`，cache key=`client-flavor-v1-28ea3aa57d0e0f8ef618e4b4f69505bab7caa8164f72939a9fc8e533138f505e`且`release_ready=true`；最终 `V6C3 Linux Site-Clew-Linux.tar.gz` SHA=`898cb443bb5270643d99ac123552894edd27edcd350eafc670e279383ec751c1`。独立 `verify-package` PASS；展开后8个受管文件 exact set/size/SHA/mode 全匹配sidecar，normal/helper marker分别为`use-this-machine`/`connector-only`，主runtime与两个role launcher均为native x86-64 ELF，主runtime `--version`=`clew 0.1.0`。V6c-3封板。
 
 #### V6c-4 — Product-side ClientFlavor / complete Site Kit integration
 
-**Status：IN PROGRESS**
+**Status：DONE（2026-09-05）**
 
 ##### V6c-4a — Shared distribution authority + Controller artifact store + composite Local API
 
@@ -1439,11 +1440,11 @@ V5a-3 process-restart durability至此双端封板：Controller与Host都能在�
 
 ##### V6c-4b — Controller GUI complete Site Kit output
 
-**Status：IN PROGRESS** — GUI Invite从“只保存`site.clew`并让用户自己找matching runtime”升级为native-platform完整Site Kit；显示active ClientFlavor readiness，提供release-ready artifact import入口，并调用复合`SiteKitCreate`而不是GUI自行复制签名/组装逻辑。没有matching artifact时明确阻止，不签invite。
+**Status：DONE（2026-09-05）** — GUI Invite已从“只保存`site.clew`并让用户自己找matching runtime”升级为native-platform完整Site Kit：Snapshot同步ClientFlavor artifact catalog；Invite面板显示default Outfit与matching active release-ready runtime readiness，提供受后端严格校验的ClientFlavor cache import；主按钮只在Outfit revision + runtime version + native platform/arch + active/release-ready全部精确匹配时可用，并调用复合`SiteKitCreate`，没有matching artifact时不签invite。旧sidecar-only路径保留在明确标注的Advanced折叠区。readiness纯函数回归覆盖inactive/not-ready/revision/version/platform/arch六类错配；workspace locked check 0 warning，workspace **285 passed / 0 failed**。
 
 #### V6c-5 — Release docs/checkpoint cleanup
 
-**Status：TODO** — README/checkpoint/Distribution Studio/Site Kit文档与最终生产链对齐，清理V1.5/V5/V6中已经失效的“后续V6再做launcher”陈述。
+**Status：DONE（2026-09-05）** — README、GUI、Site Connector UX、Distribution Studio、gaps/checkpoint 已与最终生产链对齐：删除“V6以后再做双launcher”的未来时陈述，明确一次构建/签名ClientFlavor runtime + 通用role launcher、Controller-owned release-ready artifact store、native-platform复合`SiteKitCreate`以及Windows/macOS仍受外部签名凭据gate约束。
 
 Packaging smoke 应持续早做；V6 是发布级收口，不把“能编译”冒充可发布。
 
@@ -1520,11 +1521,13 @@ V0.1 已建立 workspace，因此从本块起 check/test 统一使用 workspace/
 
 **Current release gate：V6b-3b — Real credential acceptance（BLOCKED by external credentials）**
 
-**Parallel unblocked implementation block：V6c-4b — Controller GUI complete Site Kit output（V6c-3 exact Linux native closeout 同时运行）**
+**Parallel unblocked implementation block：none — V6c productization / Site Kit / docs blocks are closed**
 
-V7 Advanced Service Runtime 已全线封板。正式release blocker仍是V6b-3b外部真实签名凭据；V6c-1 ClientFlavor cache与V6c-2 protected release workflow已封板，V6c-3代码/Windows/macOS exact closeout完成、Linux exact native closeout仍在跑。进一步产品审计发现repo-only assembler还不足以满足Controller GUI一键分发，因此V6c-4a已把release/cache/Site Kit authority下沉到产品库并接入Controller；当前继续V6c-4b GUI完整Site Kit输出，最后才做V6c-5纯文档一致性收口。V8+仍保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
+V7 Advanced Service Runtime 已全线封板。V6c-1 ClientFlavor cache、V6c-2 protected release workflow、V6c-3双launcher Site Kit assembly、V6c-4产品侧artifact store/Local API/GUI完整输出以及V6c-5文档一致性均已封板；Linux已有release-ready exact-clean完整Site Kit native证据。当前唯一正式release blocker仍是V6b-3b外部真实Windows Code Signing证书与macOS Developer ID/notary凭据 acceptance；除该外部凭据gate外没有已知未完成的V6/V7实现块。V8+保持deferred。wmn02当前n0 relay egress异常继续作为环境问题，不扩大成新的service开发块。
 
 ### Change log
+
+- **2026-09-05** — V6c productization **DONE / V6c-3/4b/5 closed**：V6c-3 Linux exact checkout `21fcee8` 的 release ZIP=`dae668ba...509a`、release-ready cache与最终 Site Kit tar=`898cb443...51c1`重新独立验真，8-file exact hash/mode + 双marker + native ELF均PASS；Controller GUI现以matching active native ClientFlavor readiness为硬门禁，默认复合`SiteKitCreate`输出完整Site Kit，sidecar-only降到Advanced；readiness错配回归PASS。README/GUI/Connector/Distribution Studio/gaps全部消除旧“未来V6 launcher”陈述。workspace locked check 0 warning，workspace **285/0**。当前只剩V6b-3b外部Windows/macOS签名凭据gate。
 
 - **2026-09-05** — V6c-4a product distribution backend **DONE**：新增共享`clew-distribution` release/cache/Site Kit authority、Controller-owned release-ready ClientFlavor artifact store、native-platform product assembler与复合Local API `SiteKitCreate`；preflight发生在invite签发前，后半段失败自动close新Invite。Windows store测试实际抓修只读句柄`sync_all`的Access denied；distribution **6/6**、SiteKit transaction **2/2**、workspace **284/0**、locked check 0 warning。下一块V6c-4b Controller GUI完整Site Kit输出；V6c-3 Linux exact native closeout并行继续。
 

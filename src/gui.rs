@@ -9,10 +9,12 @@ use std::{
 use clew_core::ActivityResult;
 use clew_host::OutfitProfile;
 use clew_runtime::{
-    ActivityList, BackupExportRequest, ControllerConfig, ControllerStatus, DeviceList,
-    InviteIssueRequest, LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
+    ActivityList, BackupExportRequest, ClientFlavorArtifactList, ClientFlavorArtifactSummary,
+    ClientFlavorImportRequest, ControllerConfig, ControllerStatus, DeviceList, InviteIssueRequest,
+    LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
     OutfitAssetPreviewResponse, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
-    OutfitSetAssetRequest, OutfitUpdateRequest, RecoveryStatus,
+    OutfitSetAssetRequest, OutfitUpdateRequest, RecoveryStatus, ReleasePlatform,
+    SiteKitCreateRequest, SiteKitCreateResult,
 };
 
 use crate::{
@@ -85,6 +87,8 @@ enum BackendCommand {
     OutfitClone(OutfitCloneRequest),
     OutfitUpdate(OutfitUpdateRequest),
     OutfitSetDefault(String),
+    ClientFlavorImport(PathBuf),
+    SiteKitCreate(SiteKitCreateRequest),
     OutfitAssetImport(String),
     OutfitSetAsset(OutfitSetAssetRequest),
     OutfitAssetPreview(String),
@@ -105,6 +109,7 @@ enum BackendEvent {
         recovery: RecoveryStatus,
         outfits: OutfitList,
         outfit_assets: OutfitAssetList,
+        client_flavors: ClientFlavorArtifactList,
     },
     InviteIssued {
         path: PathBuf,
@@ -116,6 +121,8 @@ enum BackendEvent {
         notice: String,
     },
     OutfitDefaultChanged(String),
+    ClientFlavorImported(ClientFlavorArtifactSummary),
+    SiteKitCreated(SiteKitCreateResult),
     OutfitAssetImported(OutfitAssetInfo),
     OutfitAssetPreview(OutfitAssetPreviewResponse),
     BackupExportComplete(String),
@@ -153,6 +160,7 @@ impl Backend {
                                 let recovery = client.recovery_status().await?;
                                 let outfits = client.outfit_list().await?;
                                 let outfit_assets = client.outfit_asset_list().await?;
+                                let client_flavors = client.client_flavor_list().await?;
                                 Ok::<_, clew_runtime::LocalApiClientError>((
                                     status,
                                     devices,
@@ -160,6 +168,7 @@ impl Backend {
                                     recovery,
                                     outfits,
                                     outfit_assets,
+                                    client_flavors,
                                 ))
                             }
                             .await;
@@ -171,6 +180,7 @@ impl Backend {
                                     recovery,
                                     outfits,
                                     outfit_assets,
+                                    client_flavors,
                                 )) => BackendEvent::Snapshot {
                                     status,
                                     devices,
@@ -178,6 +188,7 @@ impl Backend {
                                     recovery,
                                     outfits,
                                     outfit_assets,
+                                    client_flavors,
                                 },
                                 Err(error) => BackendEvent::Error(error.to_string()),
                             }
@@ -203,6 +214,28 @@ impl Backend {
                                 }
                             })
                         }
+                        BackendCommand::ClientFlavorImport(path) => runtime.block_on(async {
+                            let Some(path) = path.to_str() else {
+                                return BackendEvent::Error(
+                                    "The ClientFlavor cache path must be valid UTF-8.".into(),
+                                );
+                            };
+                            match client
+                                .client_flavor_import(ClientFlavorImportRequest {
+                                    path: path.to_owned(),
+                                })
+                                .await
+                            {
+                                Ok(summary) => BackendEvent::ClientFlavorImported(summary),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::SiteKitCreate(request) => runtime.block_on(async {
+                            match client.site_kit_create(request).await {
+                                Ok(result) => BackendEvent::SiteKitCreated(result),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
                         BackendCommand::OutfitShow(outfit_id) => runtime.block_on(async {
                             match client.outfit_show(outfit_id).await {
                                 Ok(profile) => BackendEvent::OutfitProfileLoaded(profile),
@@ -345,6 +378,14 @@ impl Backend {
         let _ = self.tx.send(BackendCommand::OutfitSetDefault(outfit_id));
     }
 
+    fn client_flavor_import(&self, path: PathBuf) {
+        let _ = self.tx.send(BackendCommand::ClientFlavorImport(path));
+    }
+
+    fn site_kit_create(&self, request: SiteKitCreateRequest) {
+        let _ = self.tx.send(BackendCommand::SiteKitCreate(request));
+    }
+
     fn outfit_asset_import(&self, path: String) {
         let _ = self.tx.send(BackendCommand::OutfitAssetImport(path));
     }
@@ -432,6 +473,29 @@ fn activity_result_label(result: ActivityResult) -> &'static str {
     }
 }
 
+fn native_release_platform() -> ReleasePlatform {
+    #[cfg(windows)]
+    {
+        ReleasePlatform::Windows
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ReleasePlatform::Macos
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        ReleasePlatform::Linux
+    }
+}
+
+fn release_platform_label(platform: ReleasePlatform) -> &'static str {
+    match platform {
+        ReleasePlatform::Windows => "Windows",
+        ReleasePlatform::Macos => "macOS",
+        ReleasePlatform::Linux => "Linux",
+    }
+}
+
 fn clew_icon() -> Result<Icon, tray_icon::BadIcon> {
     let side = 32_u32;
     let mut rgba = vec![0_u8; (side * side * 4) as usize];
@@ -456,10 +520,13 @@ struct ControllerApp {
     activity: ActivityList,
     recovery: RecoveryStatus,
     studio: StudioState,
+    outfits: OutfitList,
+    client_flavors: ClientFlavorArtifactList,
     invite_open: bool,
     invite_site_name: String,
     invite_read_root: String,
     invite_in_flight: bool,
+    client_flavor_import_in_flight: bool,
     error: Option<String>,
     notice: Option<String>,
     backup_passphrase: String,
@@ -489,10 +556,19 @@ impl ControllerApp {
             activity: ActivityList { events: Vec::new() },
             recovery: RecoveryStatus { review: None },
             studio: StudioState::new(),
+            outfits: OutfitList {
+                entries: Vec::new(),
+                default_outfit_id: String::new(),
+                recent_outfit_id: None,
+            },
+            client_flavors: ClientFlavorArtifactList {
+                entries: Vec::new(),
+            },
             invite_open: false,
             invite_site_name: "Collaborator".into(),
             invite_read_root: String::new(),
             invite_in_flight: false,
+            client_flavor_import_in_flight: false,
             error: None,
             notice: None,
             backup_passphrase: String::new(),
@@ -516,11 +592,14 @@ impl ControllerApp {
                     recovery,
                     outfits,
                     outfit_assets,
+                    client_flavors,
                 } => {
                     self.status = Some(status);
                     self.devices = devices;
                     self.activity = activity;
                     self.recovery = recovery;
+                    self.outfits = outfits.clone();
+                    self.client_flavors = client_flavors;
                     self.error = None;
                     if let Some(action) = self.studio.set_catalogs(outfits, outfit_assets) {
                         self.dispatch_studio_action(action);
@@ -530,8 +609,34 @@ impl ControllerApp {
                     self.invite_in_flight = false;
                     self.invite_open = false;
                     self.notice = Some(format!(
-                        "Invitation for {site_name} saved to {}. Keep site.clew beside the matching Clew runtime.",
+                        "Signed site.clew for {site_name} saved to {}. This advanced sidecar-only export still requires a matching runtime.",
                         path.display()
+                    ));
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::ClientFlavorImported(summary) => {
+                    self.client_flavor_import_in_flight = false;
+                    self.notice = Some(format!(
+                        "Release-ready ClientFlavor imported and activated: {} {} ({}/{})",
+                        summary.app_display_name,
+                        summary.version,
+                        release_platform_label(summary.platform),
+                        summary.arch
+                    ));
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::SiteKitCreated(result) => {
+                    self.invite_in_flight = false;
+                    self.invite_open = false;
+                    self.notice = Some(format!(
+                        "Complete Site Kit created: {}",
+                        result.archive_path
                     ));
                     self.error = None;
                     self.backend.refresh();
@@ -602,6 +707,7 @@ impl ControllerApp {
                 }
                 BackendEvent::Error(error) => {
                     self.invite_in_flight = false;
+                    self.client_flavor_import_in_flight = false;
                     self.backup_export_in_flight = false;
                     self.studio.accept_error();
                     self.error = Some(error);
@@ -639,7 +745,7 @@ impl ControllerApp {
         }
         ui.group(|ui| {
             ui.heading("Invite collaborator");
-            ui.label("Every invitation is Site-capable; there is no Gateway mode to configure here.");
+            ui.label("Create one complete Site Kit for this Controller's platform. The collaborator gets the signed runtime, site.clew, Start Here page, and two clear launch choices in one archive.");
             ui.horizontal(|ui| {
                 ui.label("Site name");
                 ui.text_edit_singleline(&mut self.invite_site_name);
@@ -648,43 +754,149 @@ impl ControllerApp {
             ui.text_edit_singleline(&mut self.invite_read_root);
             ui.small("This is a remote Host path, not a folder on the Controller computer.");
             ui.small("The current default Outfit is used. Files and commands outside the signed policy are not opened.");
+
+            ui.separator();
+            ui.strong("ClientFlavor runtime");
+            if let Some(default) = self.default_outfit_entry() {
+                ui.label(format!(
+                    "Default Outfit: {} · revision {}",
+                    default.display_name, default.revision
+                ));
+            }
+            if let Some(artifact) = self.active_native_client_flavor() {
+                ui.label(format!(
+                    "Ready: {} {} · {} · {}",
+                    artifact.app_display_name,
+                    artifact.version,
+                    release_platform_label(artifact.platform),
+                    artifact.arch
+                ));
+            } else {
+                ui.label("No matching active release-ready ClientFlavor is installed for the current default Outfit/runtime.");
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.client_flavor_import_in_flight && !self.invite_in_flight,
+                        egui::Button::new("Import release-ready ClientFlavor..."),
+                    )
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.backend.client_flavor_import(path);
+                    self.client_flavor_import_in_flight = true;
+                    self.error = None;
+                }
+                if self.client_flavor_import_in_flight {
+                    ui.spinner();
+                    ui.label("Verifying and importing runtime...");
+                }
+            });
+            if !self.client_flavors.entries.is_empty() {
+                egui::CollapsingHeader::new("Imported ClientFlavors")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for artifact in &self.client_flavors.entries {
+                            ui.label(format!(
+                                "{} r{} · {} {} · {} · {}{}",
+                                artifact.outfit_id,
+                                artifact.outfit_revision,
+                                artifact.version,
+                                artifact.arch,
+                                release_platform_label(artifact.platform),
+                                if artifact.release_ready { "release-ready" } else { "not release-ready" },
+                                if artifact.active { " · active" } else { "" }
+                            ));
+                        }
+                    });
+            }
+
+            ui.separator();
             ui.horizontal(|ui| {
                 let ready = !self.invite_site_name.trim().is_empty()
                     && !self.invite_read_root.trim().is_empty()
-                    && !self.invite_in_flight;
+                    && self.active_native_client_flavor().is_some()
+                    && !self.invite_in_flight
+                    && !self.client_flavor_import_in_flight;
                 if ui
-                    .add_enabled(ready, egui::Button::new("Create invitation..."))
+                    .add_enabled(ready, egui::Button::new("Create complete Site Kit..."))
                     .clicked()
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
-                    let request = InviteIssueRequest {
-                        site_name: self.invite_site_name.trim().to_owned(),
-                        outfit_id: None,
-                        target_platform: None,
-                        target_arch: None,
-                        roots: vec![self.invite_read_root.trim().to_owned()],
-                        max_claims: INVITE_MAX_CLAIMS,
-                        valid_for_ms: INVITE_VALID_FOR_MS,
-                        deployment_window_ms: INVITE_DEPLOYMENT_WINDOW_MS,
-                        max_result_bytes: INVITE_MAX_RESULT_BYTES,
-                        read_timeout_ms: INVITE_READ_TIMEOUT_MS,
-                        allow_write: false,
-                        allow_shell: false,
-                        allow_tcp_egress: false,
-                    };
-                    self.backend.invite_issue(request, folder.join("site.clew"));
+                    self.backend.site_kit_create(SiteKitCreateRequest {
+                        invite: self.invite_request(),
+                        output_dir: folder.to_string_lossy().into_owned(),
+                    });
                     self.invite_in_flight = true;
                     self.error = None;
                 }
-                if ui.button("Cancel").clicked() && !self.invite_in_flight {
+                if ui.button("Cancel").clicked()
+                    && !self.invite_in_flight
+                    && !self.client_flavor_import_in_flight
+                {
                     self.invite_open = false;
                 }
                 if self.invite_in_flight {
                     ui.spinner();
-                    ui.label("Signing invitation...");
+                    ui.label("Signing invitation and assembling Site Kit...");
                 }
             });
+
+            egui::CollapsingHeader::new("Advanced: export signed site.clew only")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.small("Use this only for a different target platform or an existing matching runtime. It does not create a complete Site Kit.");
+                    let ready = !self.invite_site_name.trim().is_empty()
+                        && !self.invite_read_root.trim().is_empty()
+                        && !self.invite_in_flight
+                        && !self.client_flavor_import_in_flight;
+                    if ui
+                        .add_enabled(ready, egui::Button::new("Export site.clew..."))
+                        .clicked()
+                        && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.backend
+                            .invite_issue(self.invite_request(), folder.join("site.clew"));
+                        self.invite_in_flight = true;
+                        self.error = None;
+                    }
+                });
         });
+    }
+
+    fn invite_request(&self) -> InviteIssueRequest {
+        InviteIssueRequest {
+            site_name: self.invite_site_name.trim().to_owned(),
+            outfit_id: None,
+            target_platform: None,
+            target_arch: None,
+            roots: vec![self.invite_read_root.trim().to_owned()],
+            max_claims: INVITE_MAX_CLAIMS,
+            valid_for_ms: INVITE_VALID_FOR_MS,
+            deployment_window_ms: INVITE_DEPLOYMENT_WINDOW_MS,
+            max_result_bytes: INVITE_MAX_RESULT_BYTES,
+            read_timeout_ms: INVITE_READ_TIMEOUT_MS,
+            allow_write: false,
+            allow_shell: false,
+            allow_tcp_egress: false,
+        }
+    }
+
+    fn default_outfit_entry(&self) -> Option<&clew_runtime::OutfitLibraryEntry> {
+        self.outfits
+            .entries
+            .iter()
+            .find(|entry| entry.outfit_id == self.outfits.default_outfit_id)
+    }
+
+    fn active_native_client_flavor(&self) -> Option<&ClientFlavorArtifactSummary> {
+        matching_active_client_flavor(
+            &self.outfits,
+            &self.client_flavors,
+            env!("CARGO_PKG_VERSION"),
+            native_release_platform(),
+            std::env::consts::ARCH,
+        )
     }
 
     fn dispatch_studio_action(&mut self, action: StudioAction) {
@@ -707,6 +919,133 @@ impl ControllerApp {
             }
             StudioAction::SetAsset(request) => self.backend.outfit_set_asset(request),
             StudioAction::PreviewAsset(asset_id) => self.backend.outfit_asset_preview(asset_id),
+        }
+    }
+}
+
+fn matching_active_client_flavor<'a>(
+    outfits: &OutfitList,
+    client_flavors: &'a ClientFlavorArtifactList,
+    version: &str,
+    platform: ReleasePlatform,
+    arch: &str,
+) -> Option<&'a ClientFlavorArtifactSummary> {
+    let default = outfits
+        .entries
+        .iter()
+        .find(|entry| entry.outfit_id == outfits.default_outfit_id)?;
+    client_flavors.entries.iter().find(|artifact| {
+        artifact.active
+            && artifact.release_ready
+            && artifact.outfit_id == default.outfit_id
+            && artifact.outfit_revision == default.revision
+            && artifact.version == version
+            && artifact.platform == platform
+            && artifact.arch == arch
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outfit_list() -> OutfitList {
+        OutfitList {
+            entries: vec![clew_runtime::OutfitLibraryEntry {
+                outfit_id: "lab".into(),
+                display_name: "Research Lab".into(),
+                revision: 3,
+                base_preset: clew_host::OutfitPreset::ResearchLab,
+                built_in: false,
+                is_default: true,
+                is_recent: true,
+            }],
+            default_outfit_id: "lab".into(),
+            recent_outfit_id: Some("lab".into()),
+        }
+    }
+
+    fn artifact() -> ClientFlavorArtifactSummary {
+        ClientFlavorArtifactSummary {
+            cache_key: format!("client-flavor-v1-{}", "a".repeat(64)),
+            client_flavor_id: "flavor-id".into(),
+            outfit_id: "lab".into(),
+            outfit_revision: 3,
+            build_cache_key: format!("outfit-v1-{}", "b".repeat(64)),
+            app_display_name: "Research Connect".into(),
+            version: "0.1.0".into(),
+            target: "x86_64-pc-windows-msvc".into(),
+            platform: ReleasePlatform::Windows,
+            arch: "x86_64".into(),
+            source_commit: "c".repeat(40),
+            release_ready: true,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn complete_site_kit_readiness_requires_exact_active_native_flavor() {
+        let outfits = outfit_list();
+        let exact = artifact();
+        let list = ClientFlavorArtifactList {
+            entries: vec![exact.clone()],
+        };
+        assert_eq!(
+            matching_active_client_flavor(
+                &outfits,
+                &list,
+                "0.1.0",
+                ReleasePlatform::Windows,
+                "x86_64",
+            ),
+            Some(&exact)
+        );
+
+        for mismatched in [
+            {
+                let mut value = exact.clone();
+                value.active = false;
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.release_ready = false;
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.outfit_revision = 2;
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.version = "0.0.9".into();
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.platform = ReleasePlatform::Linux;
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.arch = "aarch64".into();
+                value
+            },
+        ] {
+            let list = ClientFlavorArtifactList {
+                entries: vec![mismatched.clone()],
+            };
+            assert!(
+                matching_active_client_flavor(
+                    &outfits,
+                    &list,
+                    "0.1.0",
+                    ReleasePlatform::Windows,
+                    "x86_64",
+                )
+                .is_none()
+            );
         }
     }
 }
@@ -786,7 +1125,7 @@ impl eframe::App for ControllerApp {
                     "Send the generated Site Kit to a collaborator; they can open it directly.",
                 );
                 ui.add_space(12.0);
-                ui.label("Use Invite collaborator above to create a signed site.clew without opening a terminal.");
+                ui.label("Use Invite collaborator above to create a complete Site Kit without opening a terminal.");
             });
         } else {
             ui.heading("Devices");

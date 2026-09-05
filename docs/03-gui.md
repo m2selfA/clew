@@ -243,7 +243,7 @@ Clew
 
 如果这台电脑是 helper-only，窗口仍然极简：
 
-当前实现把 helper-only 冻结为**同一 runtime / 同一 `site.clew` 的第二启动 intent**：普通入口等价于 `clew host`，帮助附近电脑入口等价于 `clew host --connector-only`。这个 flag 只会把本次 enrollment 权限向下收窄；已有 membership 不会因为换入口被升级或改写。V6 release packaging 再把这两个 argv contract 物理做成 Windows shortcut/macOS launcher/Linux artifact。
+helper-only 已冻结为**同一 runtime / 同一 `site.clew` 的第二启动 intent**：普通入口等价于 `clew host`，帮助附近电脑入口等价于 `clew host --connector-only`。这个 flag 只会把本次 enrollment 权限向下收窄；已有 membership 不会因为换入口被升级或改写。V6 release packaging 已把这两个 argv contract 物理落成同一 Site Kit 内的两个 friend-facing role launcher；ClientFlavor runtime/launcher 只构建和签名一次，每个 Site 只重新组装 signed `site.clew`、Outfit assets 与说明。
 
 ```text
 Clew

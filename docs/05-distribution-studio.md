@@ -701,15 +701,17 @@ Outfit 不可以改：
 - `clew outfit` CLI；
 - `clew invite --outfit`。
 
-### V6 — Release branding pipeline
+### V6 — Release branding + Site Kit production pipeline
 
-与正式 signing 收口一起完成：
+生产链已经落地：
 
-- Windows icon/version-resource build；
-- macOS bundle name/icon/localization；
-- signing/notarization；
-- `ClientFlavor` cache；
-- cross-platform preview/smoke。
+- Windows icon/version-resource build 与 macOS bundle name/icon/localization；
+- secret-free unsigned package、独立 verify、Windows Authenticode / macOS Developer ID + notarization 管线；
+- 以 Outfit revision/build key、runtime version、target/profile/source commit、signing identity 绑定的 immutable `ClientFlavor` cache；
+- 通用 role launcher 随 ClientFlavor runtime 一次构建/签名，同一 Site Kit 物理提供“使用这台电脑 / 只帮助附近电脑连接”两个入口；
+- Controller-owned release-ready ClientFlavor artifact store，导入时重新验证 exact file set/hash、clean provenance、签名 evidence 与 cache identity；
+- Controller GUI 默认调用复合 `SiteKitCreate`，先确认当前 default Outfit 有 matching active native ClientFlavor，再签 invite 并事务式组装完整 Site Kit；没有 matching runtime 时不签发 invite；
+- Windows/macOS/Linux native packaging 与 Site Kit smoke；Linux exact-clean release-ready Site Kit 已验收，Windows/macOS 最终 release acceptance 只待外部签名凭据。
 
 ## 18. 验收标准
 

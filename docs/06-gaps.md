@@ -138,7 +138,7 @@ V2     Shell/Grep/Edit/Write + 完整 MCP adapter
 V3     reconnect / task reattach / resume
 V4     forward / proxy
 V5     file plane
-V6     release signing/notarization/client-flavor hardening
+V6     release signing/notarization + immutable ClientFlavor cache + dual-launcher Site Kit assembly + Controller GUI distribution
 V7     Advanced Service Runtime: Linux systemd --user -> Windows Service / Linux system service
 ```
 
