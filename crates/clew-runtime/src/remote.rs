@@ -1514,6 +1514,26 @@ async fn handle_member(
     };
     let (generation, mut commands) =
         hub.register(device_id, topology, initial_path, connected_unix_ms)?;
+    // Host UI must not infer Connected from the Noise handshake alone. Prove that this exact
+    // generation is already present in A's RemoteHub using the existing heartbeat wire shape,
+    // which keeps r8 compatible with r7 Hosts that already answer session_ping/session_pong.
+    let registration_payload = generation.to_le_bytes().to_vec();
+    let registration_ping = InnerMessage::new("session_ping", registration_payload.clone())?;
+    let registration_probe = tokio::time::timeout(SESSION_HEARTBEAT_TIMEOUT, async {
+        inner.send(stream, &registration_ping).await?;
+        let pong = inner.recv(stream).await?;
+        Ok::<_, clew_transport::InnerSessionError>(pong)
+    })
+    .await;
+    match registration_probe {
+        Ok(Ok(pong)) if pong.kind == "session_pong" && pong.payload == registration_payload => {
+            continuity.observe_peer_activity(unix_ms()?)?;
+        }
+        _ => {
+            hub.unregister(device_id, generation, unix_ms().ok());
+            return Err(RemoteConnectionError::SessionRegistrationProbeFailed);
+        }
+    }
     let path_watcher = if topology == RemoteSessionTopology::Direct {
         let path_connection = connection.clone();
         let path_hub = hub.clone();
@@ -1985,6 +2005,8 @@ pub enum RemoteConnectionError {
     RecoveryReviewRequired,
     #[error("remote connection was denied")]
     Denied,
+    #[error("Host did not acknowledge A-side session registration")]
+    SessionRegistrationProbeFailed,
     #[error(transparent)]
     ConnectorControl(#[from] ConnectorControlError),
     #[error(transparent)]
@@ -2046,6 +2068,7 @@ fn enrollment_bootstrap_error(error: &EnrollmentError) -> BootstrapErrorBody {
             "This device is already enrolled; reopen its existing Clew Host state.",
         ),
         EnrollmentError::MissingClaim
+        | EnrollmentError::UnknownInvite(_)
         | EnrollmentError::UnknownDevice(_)
         | EnrollmentError::PersistTokenMismatch => BootstrapErrorBody::new(
             BootstrapErrorCode::Denied,
@@ -2090,7 +2113,8 @@ impl RemoteConnectionError {
             | Self::Hub(_)
             | Self::ConnectorControl(_)
             | Self::SealedBootstrap(_)
-            | Self::ConnectorLease(_) => None,
+            | Self::ConnectorLease(_)
+            | Self::SessionRegistrationProbeFailed => None,
         }
     }
 
@@ -2106,6 +2130,7 @@ impl RemoteConnectionError {
             Self::Control(_) => "controller_state",
             Self::RecoveryReviewRequired => "recovery_review",
             Self::Denied => "denied",
+            Self::SessionRegistrationProbeFailed => "session_registration_probe",
             Self::ConnectorControl(_) => "connector_control",
             Self::SealedBootstrap(_) => "sealed_bootstrap",
             Self::ConnectorLease(_) => "connector_lease",
@@ -4352,6 +4377,19 @@ mod tests {
                 .unwrap(),
             connector_device_id
         );
+
+        let ready = tokio::time::timeout(Duration::from_secs(5), inner.recv(&mut stream))
+            .await
+            .expect("Controller did not prove RemoteHub registration")
+            .unwrap();
+        assert_eq!(ready.kind, "session_ping");
+        inner
+            .send(
+                &mut stream,
+                &InnerMessage::new("session_pong", ready.payload).unwrap(),
+            )
+            .await
+            .unwrap();
 
         hub.disconnect(connector_device_id);
         tokio::time::timeout(Duration::from_secs(5), server)

@@ -13,7 +13,8 @@ pub use backup::{
 };
 pub use enrollment::{
     EnrollmentDeviceRecord, EnrollmentError, EnrollmentReceipt, EnrollmentRegistry,
-    EnrollmentStatus, SignedSiteBootstrapPass, SiteBootstrapPayload, SiteBootstrapSpec,
+    EnrollmentStatus, SignedSiteBootstrapPass, SiteAccessCredentialRecord, SiteBootstrapPayload,
+    SiteBootstrapSpec,
 };
 pub use grant::PermissionGrant;
 pub use keys::{

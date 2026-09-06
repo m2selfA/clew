@@ -167,9 +167,12 @@ pub async fn start_controller(
     let outfit_assets = Arc::new(Mutex::new(OutfitAssetStore::load_or_create(
         layout.clone(),
     )?));
-    let client_flavors = Arc::new(Mutex::new(ClientFlavorArtifactStore::new(
-        layout.client_flavor_artifacts_root(),
-    )?));
+    let client_flavor_store = if config.local_acceptance_runtime() {
+        ClientFlavorArtifactStore::new_local_acceptance(layout.client_flavor_artifacts_root())?
+    } else {
+        ClientFlavorArtifactStore::new(layout.client_flavor_artifacts_root())?
+    };
+    let client_flavors = Arc::new(Mutex::new(client_flavor_store));
     let remote = IrohOuter::bind_with_secret(controller_identity.iroh_endpoint_secret()).await?;
     let remote_endpoint_id = remote.addr().id.to_string();
     let remote_hub = RemoteHub::default();

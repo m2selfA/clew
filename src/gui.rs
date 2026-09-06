@@ -3,13 +3,13 @@ use std::{
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use clew_core::ActivityResult;
+use clew_core::{ActivityResult, InviteId, site_access_credential_id};
 use clew_host::OutfitProfile;
 use clew_runtime::{
     ActivityList, BackupExportRequest, ClientFlavorArtifactList, ClientFlavorArtifactSummary,
@@ -17,7 +17,8 @@ use clew_runtime::{
     LocalApiClient, OutfitAssetImportRequest, OutfitAssetInfo, OutfitAssetList,
     OutfitAssetPreviewResponse, OutfitCloneRequest, OutfitCreateRequest, OutfitList,
     OutfitSetAssetRequest, OutfitUpdateRequest, RecoveryStatus, ReleasePlatform,
-    SITE_KIT_LAUNCHER_SCHEMA_VERSION, SiteKitCreateRequest, SiteKitCreateResult,
+    SITE_KIT_LAUNCHER_SCHEMA_VERSION, SiteAccessCredentialList, SiteKitCreateRequest,
+    SiteKitCreateResult,
 };
 
 use crate::{
@@ -45,6 +46,12 @@ const MCP_HTTP_URL: &str = "http://127.0.0.1:4877/mcp";
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(8);
 const CONTROLLER_START_POLL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InviteScenario {
+    DirectTarget,
+    PrivateTargetViaHelper,
+}
+
 fn configure_background_command(command: &mut Command) {
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
@@ -54,12 +61,236 @@ fn configure_background_command(command: &mut Command) {
         .stderr(Stdio::null());
 }
 
+fn configure_light_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Light);
+    let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = egui::Color32::from_rgb(245, 247, 250);
+    visuals.window_fill = egui::Color32::WHITE;
+    visuals.faint_bg_color = egui::Color32::from_rgb(241, 245, 249);
+    visuals.extreme_bg_color = egui::Color32::WHITE;
+    visuals.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::WHITE;
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 232, 240));
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(248, 250, 252);
+    visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 213, 225));
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(239, 246, 255);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(219, 234, 254);
+    ctx.set_visuals_of(egui::Theme::Light, visuals);
+
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.interact_size.y = 34.0;
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
+fn primary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(
+        egui::RichText::new(text)
+            .color(egui::Color32::WHITE)
+            .strong(),
+    )
+    .fill(egui::Color32::from_rgb(37, 99, 235))
+    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(29, 78, 216)))
+}
+
+fn section_card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::WHITE)
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(226, 232, 240),
+        ))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(16))
+}
+
+fn option_card(selected: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if selected {
+            egui::Color32::from_rgb(239, 246, 255)
+        } else {
+            egui::Color32::from_rgb(248, 250, 252)
+        })
+        .stroke(egui::Stroke::new(
+            if selected { 1.5 } else { 1.0 },
+            if selected {
+                egui::Color32::from_rgb(96, 165, 250)
+            } else {
+                egui::Color32::from_rgb(226, 232, 240)
+            },
+        ))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(12))
+}
+
+#[derive(Clone, Copy)]
+enum FlowGlyph {
+    Package,
+    Computer,
+    Link,
+    Agent,
+}
+
+#[derive(Clone, Copy)]
+enum FlowState {
+    Complete,
+    Active,
+    Pending,
+}
+
+fn flow_icon(ui: &mut egui::Ui, glyph: FlowGlyph, state: FlowState) {
+    let (fill, foreground) = match state {
+        FlowState::Complete => (
+            egui::Color32::from_rgb(220, 252, 231),
+            egui::Color32::from_rgb(22, 101, 52),
+        ),
+        FlowState::Active => (
+            egui::Color32::from_rgb(219, 234, 254),
+            egui::Color32::from_rgb(29, 78, 216),
+        ),
+        FlowState::Pending => (
+            egui::Color32::from_rgb(241, 245, 249),
+            egui::Color32::from_rgb(100, 116, 139),
+        ),
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+    let center = rect.center();
+    let painter = ui.painter();
+    painter.circle_filled(center, 18.0, fill);
+    let stroke = egui::Stroke::new(2.0, foreground);
+    match glyph {
+        FlowGlyph::Package => {
+            let x = center.x;
+            let y = center.y;
+            for (a, b) in [
+                (egui::pos2(x - 9.0, y - 6.0), egui::pos2(x, y - 11.0)),
+                (egui::pos2(x, y - 11.0), egui::pos2(x + 9.0, y - 6.0)),
+                (egui::pos2(x - 9.0, y - 6.0), egui::pos2(x - 9.0, y + 7.0)),
+                (egui::pos2(x + 9.0, y - 6.0), egui::pos2(x + 9.0, y + 7.0)),
+                (egui::pos2(x - 9.0, y + 7.0), egui::pos2(x, y + 12.0)),
+                (egui::pos2(x + 9.0, y + 7.0), egui::pos2(x, y + 12.0)),
+                (egui::pos2(x - 9.0, y - 6.0), egui::pos2(x, y - 1.0)),
+                (egui::pos2(x + 9.0, y - 6.0), egui::pos2(x, y - 1.0)),
+                (egui::pos2(x, y - 1.0), egui::pos2(x, y + 12.0)),
+            ] {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+        FlowGlyph::Computer => {
+            let x = center.x;
+            let y = center.y;
+            for (a, b) in [
+                (egui::pos2(x - 11.0, y - 9.0), egui::pos2(x + 11.0, y - 9.0)),
+                (egui::pos2(x + 11.0, y - 9.0), egui::pos2(x + 11.0, y + 5.0)),
+                (egui::pos2(x + 11.0, y + 5.0), egui::pos2(x - 11.0, y + 5.0)),
+                (egui::pos2(x - 11.0, y + 5.0), egui::pos2(x - 11.0, y - 9.0)),
+                (egui::pos2(x, y + 5.0), egui::pos2(x, y + 10.0)),
+                (egui::pos2(x - 6.0, y + 10.0), egui::pos2(x + 6.0, y + 10.0)),
+            ] {
+                painter.line_segment([a, b], stroke);
+            }
+        }
+        FlowGlyph::Link => {
+            painter.circle_stroke(egui::pos2(center.x - 6.0, center.y), 6.0, stroke);
+            painter.circle_stroke(egui::pos2(center.x + 6.0, center.y), 6.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 2.0, center.y),
+                    egui::pos2(center.x + 2.0, center.y),
+                ],
+                stroke,
+            );
+        }
+        FlowGlyph::Agent => {
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 11.0, center.y),
+                    egui::pos2(center.x - 7.0, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 7.0, center.y),
+                    egui::pos2(center.x + 11.0, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - 11.0),
+                    egui::pos2(center.x, center.y - 7.0),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+fn workflow_step(
+    ui: &mut egui::Ui,
+    glyph: FlowGlyph,
+    state: FlowState,
+    title: &str,
+    subtitle: &str,
+) {
+    ui.horizontal(|ui| {
+        flow_icon(ui, glyph, state);
+        ui.vertical(|ui| {
+            ui.strong(title);
+            ui.add(egui::Label::new(egui::RichText::new(subtitle).size(12.5)).wrap());
+        });
+    });
+}
+
+fn status_badge(ui: &mut egui::Ui, text: &str, good: bool) {
+    let (fill, foreground) = if good {
+        (
+            egui::Color32::from_rgb(236, 253, 245),
+            egui::Color32::from_rgb(5, 122, 85),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(241, 245, 249),
+            egui::Color32::from_rgb(71, 85, 105),
+        )
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(99))
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").color(foreground));
+                ui.label(egui::RichText::new(text).color(foreground).strong());
+            });
+        });
+}
+
+fn muted(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.add(egui::Label::new(text.into()).wrap());
+}
+
 pub async fn run(config: ControllerConfig) -> Result<(), Box<dyn std::error::Error>> {
     ensure_controller(&config).await?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 700.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_inner_size([1180.0, 840.0])
+            .with_min_inner_size([840.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -85,6 +316,9 @@ async fn ensure_controller(config: &ControllerConfig) -> Result<(), Box<dyn std:
         .arg("controller")
         .arg("--state-dir")
         .arg(config.state_root());
+    if config.local_acceptance_runtime() {
+        command.arg("--local-acceptance-runtime");
+    }
     configure_background_command(&mut command);
     let mut child = command.spawn()?;
     let client = LocalApiClient::new(config.clone());
@@ -118,6 +352,9 @@ enum BackendCommand {
     OutfitSetDefault(String),
     ClientFlavorImport(PathBuf),
     SiteKitCreate(SiteKitCreateRequest),
+    CredentialClose(InviteId),
+    CredentialRevoke(InviteId),
+    CredentialDelete(InviteId),
     OutfitAssetImport(String),
     OutfitSetAsset(OutfitSetAssetRequest),
     OutfitAssetPreview(String),
@@ -134,6 +371,7 @@ enum BackendEvent {
     Snapshot {
         status: ControllerStatus,
         devices: DeviceList,
+        credentials: SiteAccessCredentialList,
         activity: ActivityList,
         recovery: RecoveryStatus,
         outfits: OutfitList,
@@ -151,7 +389,9 @@ enum BackendEvent {
     },
     OutfitDefaultChanged(String),
     ClientFlavorImported(ClientFlavorArtifactSummary),
+    ClientFlavorImportFailed(String),
     SiteKitCreated(SiteKitCreateResult),
+    CredentialChanged(String),
     OutfitAssetImported(OutfitAssetInfo),
     OutfitAssetPreview(OutfitAssetPreviewResponse),
     BackupExportComplete(String),
@@ -185,6 +425,7 @@ impl Backend {
                             let result = async {
                                 let status = client.controller_status().await?;
                                 let devices = client.device_list().await?;
+                                let credentials = client.credential_list().await?;
                                 let activity = client.activity_list(20).await?;
                                 let recovery = client.recovery_status().await?;
                                 let outfits = client.outfit_list().await?;
@@ -193,6 +434,7 @@ impl Backend {
                                 Ok::<_, clew_runtime::LocalApiClientError>((
                                     status,
                                     devices,
+                                    credentials,
                                     activity,
                                     recovery,
                                     outfits,
@@ -205,6 +447,7 @@ impl Backend {
                                 Ok((
                                     status,
                                     devices,
+                                    credentials,
                                     activity,
                                     recovery,
                                     outfits,
@@ -213,6 +456,7 @@ impl Backend {
                                 )) => BackendEvent::Snapshot {
                                     status,
                                     devices,
+                                    credentials,
                                     activity,
                                     recovery,
                                     outfits,
@@ -256,12 +500,38 @@ impl Backend {
                                 .await
                             {
                                 Ok(summary) => BackendEvent::ClientFlavorImported(summary),
-                                Err(error) => BackendEvent::Error(error.to_string()),
+                                Err(error) => {
+                                    BackendEvent::ClientFlavorImportFailed(error.to_string())
+                                }
                             }
                         }),
                         BackendCommand::SiteKitCreate(request) => runtime.block_on(async {
                             match client.site_kit_create(request).await {
                                 Ok(result) => BackendEvent::SiteKitCreated(result),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::CredentialClose(invite_id) => runtime.block_on(async {
+                            match client.invite_close(invite_id).await {
+                                Ok(()) => BackendEvent::CredentialChanged(
+                                    "Site Access Credential closed to new devices.".into(),
+                                ),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::CredentialRevoke(invite_id) => runtime.block_on(async {
+                            match client.invite_revoke(invite_id).await {
+                                Ok(()) => BackendEvent::CredentialChanged(
+                                    "Site Access Credential revoked; its enrolled devices were disconnected.".into(),
+                                ),
+                                Err(error) => BackendEvent::Error(error.to_string()),
+                            }
+                        }),
+                        BackendCommand::CredentialDelete(invite_id) => runtime.block_on(async {
+                            match client.invite_delete(invite_id).await {
+                                Ok(()) => BackendEvent::CredentialChanged(
+                                    "Old Site Access Credential deleted; a revocation tombstone is retained so the old Site Kit cannot be reused.".into(),
+                                ),
                                 Err(error) => BackendEvent::Error(error.to_string()),
                             }
                         }),
@@ -415,6 +685,18 @@ impl Backend {
         let _ = self.tx.send(BackendCommand::SiteKitCreate(request));
     }
 
+    fn credential_close(&self, invite_id: InviteId) {
+        let _ = self.tx.send(BackendCommand::CredentialClose(invite_id));
+    }
+
+    fn credential_revoke(&self, invite_id: InviteId) {
+        let _ = self.tx.send(BackendCommand::CredentialRevoke(invite_id));
+    }
+
+    fn credential_delete(&self, invite_id: InviteId) {
+        let _ = self.tx.send(BackendCommand::CredentialDelete(invite_id));
+    }
+
     fn outfit_asset_import(&self, path: String) {
         let _ = self.tx.send(BackendCommand::OutfitAssetImport(path));
     }
@@ -541,29 +823,45 @@ fn clew_icon() -> Result<Icon, tray_icon::BadIcon> {
     Icon::from_rgba(rgba, side, side)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialConfirmAction {
+    Revoke(InviteId),
+    Delete(InviteId),
+}
+
 struct ControllerApp {
     backend: Backend,
     controller_config: ControllerConfig,
     tray: Tray,
     status: Option<ControllerStatus>,
     devices: DeviceList,
+    credentials: SiteAccessCredentialList,
+    selected_credential: Option<InviteId>,
+    credential_confirm: Option<CredentialConfirmAction>,
     activity: ActivityList,
     recovery: RecoveryStatus,
     studio: StudioState,
     outfits: OutfitList,
     client_flavors: ClientFlavorArtifactList,
     invite_open: bool,
+    invite_scenario: InviteScenario,
     invite_site_name: String,
     invite_read_root: String,
+    invite_all_filesystem: bool,
     invite_allow_write: bool,
     invite_allow_shell: bool,
     invite_allow_tcp_egress: bool,
     invite_in_flight: bool,
     client_flavor_import_in_flight: bool,
+    current_runtime_import_attempted: bool,
+    client_flavor_import_error: Option<String>,
     mcp_http: Option<Child>,
     mcp_last_error: Option<String>,
     error: Option<String>,
     notice: Option<String>,
+    last_site_kit_path: Option<String>,
+    last_site_kit_scenario: Option<InviteScenario>,
+    last_site_kit_invite_id: Option<InviteId>,
     backup_passphrase: String,
     backup_passphrase_confirm: String,
     backup_export_in_flight: bool,
@@ -578,6 +876,8 @@ impl ControllerApp {
         cc: &eframe::CreationContext<'_>,
         config: ControllerConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        configure_light_theme(&cc.egui_ctx);
+
         let backend = Backend::start(config.clone(), cc.egui_ctx.clone());
         let tray = Tray::new(&cc.egui_ctx)?;
         backend.refresh();
@@ -589,6 +889,11 @@ impl ControllerApp {
             devices: DeviceList {
                 devices: Vec::new(),
             },
+            credentials: SiteAccessCredentialList {
+                credentials: Vec::new(),
+            },
+            selected_credential: None,
+            credential_confirm: None,
             activity: ActivityList { events: Vec::new() },
             recovery: RecoveryStatus { review: None },
             studio: StudioState::new(),
@@ -601,17 +906,24 @@ impl ControllerApp {
                 entries: Vec::new(),
             },
             invite_open: false,
+            invite_scenario: InviteScenario::DirectTarget,
             invite_site_name: "Collaborator".into(),
             invite_read_root: String::new(),
+            invite_all_filesystem: true,
             invite_allow_write: false,
             invite_allow_shell: false,
             invite_allow_tcp_egress: false,
             invite_in_flight: false,
             client_flavor_import_in_flight: false,
+            current_runtime_import_attempted: false,
+            client_flavor_import_error: None,
             mcp_http: None,
             mcp_last_error: None,
             error: None,
             notice: None,
+            last_site_kit_path: None,
+            last_site_kit_scenario: None,
+            last_site_kit_invite_id: None,
             backup_passphrase: String::new(),
             backup_passphrase_confirm: String::new(),
             backup_export_in_flight: false,
@@ -629,6 +941,7 @@ impl ControllerApp {
                 BackendEvent::Snapshot {
                     status,
                     devices,
+                    credentials,
                     activity,
                     recovery,
                     outfits,
@@ -637,6 +950,20 @@ impl ControllerApp {
                 } => {
                     self.status = Some(status);
                     self.devices = devices;
+                    let selected_present = self.selected_credential.is_some_and(|selected| {
+                        credentials
+                            .credentials
+                            .iter()
+                            .any(|credential| credential.invite_id == selected)
+                    });
+                    if !selected_present {
+                        self.selected_credential = credentials
+                            .credentials
+                            .first()
+                            .map(|credential| credential.invite_id);
+                        self.credential_confirm = None;
+                    }
+                    self.credentials = credentials;
                     self.activity = activity;
                     self.recovery = recovery;
                     self.outfits = outfits.clone();
@@ -660,6 +987,7 @@ impl ControllerApp {
                 }
                 BackendEvent::ClientFlavorImported(summary) => {
                     self.client_flavor_import_in_flight = false;
+                    self.client_flavor_import_error = None;
                     self.notice = Some(format!(
                         "Verified runtime imported and activated: {} {} ({}/{})",
                         summary.app_display_name,
@@ -672,13 +1000,27 @@ impl ControllerApp {
                     self.refresh_in_flight = true;
                     self.last_refresh = Instant::now();
                 }
+                BackendEvent::ClientFlavorImportFailed(error) => {
+                    self.client_flavor_import_in_flight = false;
+                    self.client_flavor_import_error = Some(error);
+                }
                 BackendEvent::SiteKitCreated(result) => {
                     self.invite_in_flight = false;
                     self.invite_open = false;
-                    self.notice = Some(format!(
-                        "Complete Site Kit created: {}",
-                        result.archive_path
-                    ));
+                    self.last_site_kit_path = Some(result.archive_path.clone());
+                    self.last_site_kit_scenario = Some(self.invite_scenario);
+                    self.last_site_kit_invite_id = Some(result.invite_id);
+                    self.selected_credential = Some(result.invite_id);
+                    self.credential_confirm = None;
+                    self.notice = Some(format!("Site Kit created: {}", result.archive_path));
+                    self.error = None;
+                    self.backend.refresh();
+                    self.refresh_in_flight = true;
+                    self.last_refresh = Instant::now();
+                }
+                BackendEvent::CredentialChanged(notice) => {
+                    self.credential_confirm = None;
+                    self.notice = Some(notice);
                     self.error = None;
                     self.backend.refresh();
                     self.refresh_in_flight = true;
@@ -833,10 +1175,13 @@ impl ControllerApp {
     }
 
     fn import_current_runtime_if_available(&mut self) {
-        if self.active_native_client_flavor().is_some()
-            || self.client_flavor_import_in_flight
-            || self.invite_in_flight
-        {
+        if !should_import_current_runtime(
+            self.controller_config.local_acceptance_runtime(),
+            self.current_runtime_import_attempted,
+            self.active_native_client_flavor().is_some(),
+            self.client_flavor_import_in_flight,
+            self.invite_in_flight,
+        ) {
             return;
         }
         let Ok(executable) = std::env::current_exe() else {
@@ -848,74 +1193,140 @@ impl ControllerApp {
         if !root.join("release-manifest.json").is_file() {
             return;
         }
+        self.current_runtime_import_attempted = true;
         self.backend.client_flavor_import(root.to_path_buf());
         self.client_flavor_import_in_flight = true;
+        self.client_flavor_import_error = None;
         self.error = None;
     }
 
     fn render_mcp(&mut self, ui: &mut egui::Ui) {
         self.poll_mcp_http();
-        ui.group(|ui| {
-            ui.strong("Agent access (MCP)");
-            ui.label("Local Streamable HTTP endpoint");
-            ui.horizontal(|ui| {
-                ui.monospace(MCP_HTTP_URL);
-                if ui.button("Copy URL").clicked() {
-                    ui.ctx().copy_text(MCP_HTTP_URL.to_owned());
-                }
-            });
-            ui.small("The listener remains loopback-only. Remote clients should reach it through a secure tunnel rather than exposing it directly to the internet.");
-            ui.horizontal(|ui| {
-                if self.mcp_http.is_some() {
-                    ui.label("Status: Running");
-                    if ui.button("Stop MCP").clicked() {
-                        self.stop_mcp_http();
-                    }
-                } else {
-                    ui.label("Status: Stopped");
-                    if ui.button("Start MCP").clicked() {
-                        self.start_mcp_http();
-                    }
-                }
-            });
-            if let Some(error) = &self.mcp_last_error {
-                ui.label(format!("MCP: {error}"));
+        ui.label("Connect your local coding/research agent to Clew after target B is online.");
+        muted(
+            ui,
+            "Available through MCP: bounded read/search/edit, durable file and directory transfer, safe Trash/Recycle-Bin operations, managed temporary resources, and Shell when explicitly granted.",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.monospace(MCP_HTTP_URL);
+            if ui.button("Copy URL").clicked() {
+                ui.ctx().copy_text(MCP_HTTP_URL.to_owned());
             }
         });
+        muted(
+            ui,
+            "This listener stays loopback-only on Controller A. Use a secure tunnel for a remote MCP client instead of exposing the port to the Internet.",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if self.mcp_http.is_some() {
+                status_badge(ui, "MCP running", true);
+                if ui.button("Stop MCP").clicked() {
+                    self.stop_mcp_http();
+                }
+            } else {
+                status_badge(ui, "MCP stopped", false);
+                if ui.add(primary_button("Start MCP")).clicked() {
+                    self.start_mcp_http();
+                }
+            }
+        });
+        if let Some(error) = &self.mcp_last_error {
+            ui.label(
+                egui::RichText::new(format!("MCP: {error}"))
+                    .color(egui::Color32::from_rgb(185, 28, 28)),
+            );
+        }
     }
 
     fn render_invite(&mut self, ui: &mut egui::Ui) {
         if !self.invite_open {
             return;
         }
-        ui.group(|ui| {
-            ui.heading("Create a package to send");
-            ui.label("Fill in what the other computer should be allowed to do. Clew signs the invitation and builds the complete Site Kit for you.");
+        ui.vertical(|ui| {
+            ui.label("Choose the setup that matches the collaborator's network. These two cases cover the normal Clew workflow.");
+            ui.add_space(6.0);
+            option_card(self.invite_scenario == InviteScenario::DirectTarget).show(ui, |ui| {
+                ui.radio_value(
+                    &mut self.invite_scenario,
+                    InviteScenario::DirectTarget,
+                    "A/B — B can access the Internet",
+                );
+                muted(ui, "A = this Controller · B = the collaborator's target. Send one Site Kit to B; on B choose “Use this computer”.");
+            });
+            option_card(self.invite_scenario == InviteScenario::PrivateTargetViaHelper).show(ui, |ui| {
+                ui.radio_value(
+                    &mut self.invite_scenario,
+                    InviteScenario::PrivateTargetViaHelper,
+                    "A/B/C — B is private and uses helper C",
+                );
+                muted(ui, "A = this Controller · B = the private target · C = the collaborator's online helper that can also reach B. Send the same Site Kit to B and C.");
+            });
+            ui.add_space(8.0);
+            match self.invite_scenario {
+                InviteScenario::DirectTarget => {
+                    ui.strong("You will send one Site Kit to target computer B.");
+                }
+                InviteScenario::PrivateTargetViaHelper => {
+                    ui.strong("You will create one Site Kit and send the same archive to both B and C.");
+                    ui.small("Do not create a second package for helper C. Helper mode can only reduce authority; C never receives B's file or shell permissions.");
+                }
+            }
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label("Name for this collaborator/site");
+                ui.label("Site / collaborator name");
                 ui.text_edit_singleline(&mut self.invite_site_name);
             });
-            ui.label("Folder on the other computer that Clew may access (absolute path)");
-            ui.text_edit_singleline(&mut self.invite_read_root);
-            ui.small("Example: D:\\research. This path is on the collaborator's computer, not on this Controller.");
+            ui.strong("Filesystem access on target B");
+            ui.radio_value(
+                &mut self.invite_all_filesystem,
+                true,
+                "All folders visible to B's operating-system account (default)",
+            );
+            ui.small("Clew does not bypass Windows/macOS/Linux permissions. This only removes Clew's extra root restriction.");
+            ui.radio_value(
+                &mut self.invite_all_filesystem,
+                false,
+                "Only an approved folder",
+            );
+            if !self.invite_all_filesystem {
+                ui.label("Approved folder on target B (absolute path)");
+                ui.text_edit_singleline(&mut self.invite_read_root);
+                ui.small(match self.invite_scenario {
+                    InviteScenario::DirectTarget => "Example: D:\\research. This path is on target B, not on Controller A.",
+                    InviteScenario::PrivateTargetViaHelper => "Example: D:\\research. This path is on target B, not on Controller A or helper C.",
+                });
+            }
 
             ui.add_space(8.0);
-            ui.strong("Capabilities");
-            ui.checkbox(&mut self.invite_allow_write, "Allow changing files inside the approved folder");
+            ui.strong("Permissions for target B");
+            ui.checkbox(
+                &mut self.invite_allow_write,
+                "Allow file changes in the selected filesystem scope",
+            );
+            if self.invite_allow_write {
+                muted(ui, "Includes Write/Edit, file upload, mkdir/copy/move, safe Trash, and Clew-managed temporary resources. Permanent deletion still requires a separate two-step confirmation.");
+            }
             ui.checkbox(&mut self.invite_allow_shell, "Allow running commands on that computer");
             ui.checkbox(&mut self.invite_allow_tcp_egress, "Allow TCP forwarding/proxy from that computer");
             if self.invite_allow_shell || self.invite_allow_tcp_egress {
                 ui.small("These are powerful permissions. Only enable them when the collaborator expects this access.");
             }
+            if self.invite_scenario == InviteScenario::PrivateTargetViaHelper {
+                ui.small("These permissions apply to target B only. Helper C is always connector-only even when target permissions are enabled.");
+            }
+
+            ui.small("Creating a Site Kit always creates a new Site Access Credential on Controller A and selects it automatically. Existing credentials are never silently reused.");
 
             ui.separator();
-            ui.strong("Runtime to include");
+            ui.strong("Runtime included in the Site Kit");
             if let Some(default) = self.default_outfit_entry() {
-                ui.label(format!("Appearance: {} · revision {}", default.display_name, default.revision));
+                ui.small(format!("Appearance: {} · revision {}", default.display_name, default.revision));
             }
             if let Some(artifact) = self.active_native_client_flavor() {
                 ui.label(format!(
-                    "{} {} · {} · {} · {}",
+                    "Ready: {} {} · {} · {} · {}",
                     artifact.app_display_name,
                     artifact.version,
                     release_platform_label(artifact.platform),
@@ -931,7 +1342,14 @@ impl ControllerApp {
                     ui.label("Verifying this Clew installation...");
                 });
             } else {
-                ui.label("No matching runtime has been verified yet.");
+                if let Some(error) = &self.client_flavor_import_error {
+                    ui.label(
+                        egui::RichText::new(format!("Runtime verification failed: {error}"))
+                            .color(egui::Color32::from_rgb(185, 28, 28)),
+                    );
+                } else {
+                    ui.label("No matching runtime has been verified yet.");
+                }
                 if ui.button("Use this Clew installation").clicked() {
                     self.import_current_runtime_if_available();
                     if !self.client_flavor_import_in_flight {
@@ -953,47 +1371,56 @@ impl ControllerApp {
                     {
                         self.backend.client_flavor_import(path);
                         self.client_flavor_import_in_flight = true;
+                        self.client_flavor_import_error = None;
                         self.error = None;
                     }
                 });
 
             ui.separator();
             ui.horizontal(|ui| {
-                let ready = !self.invite_site_name.trim().is_empty()
-                    && !self.invite_read_root.trim().is_empty()
-                    && self.active_native_client_flavor().is_some()
-                    && !self.invite_in_flight
-                    && !self.client_flavor_import_in_flight;
+                let ready = self.site_kit_ready();
                 if ui
-                    .add_enabled(ready, egui::Button::new("Create complete Site Kit..."))
+                    .add_enabled(ready, primary_button("Create Site Kit to send..."))
                     .clicked()
-                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
-                    self.backend.site_kit_create(SiteKitCreateRequest {
-                        invite: self.invite_request(),
-                        output_dir: folder.to_string_lossy().into_owned(),
-                    });
-                    self.invite_in_flight = true;
-                    self.error = None;
+                    self.start_site_kit_create();
                 }
-                if ui.button("Cancel").clicked()
-                    && !self.invite_in_flight
-                    && !self.client_flavor_import_in_flight
+                if ui
+                    .add_enabled(
+                        !self.invite_in_flight && !self.client_flavor_import_in_flight,
+                        egui::Button::new("Cancel"),
+                    )
+                    .clicked()
                 {
                     self.invite_open = false;
                 }
                 if self.invite_in_flight {
                     ui.spinner();
-                    ui.label("Signing invitation and assembling Site Kit...");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(blocker) = self.site_kit_blocker() {
+                        ui.label(
+                            egui::RichText::new(blocker)
+                                .small()
+                                .color(egui::Color32::from_rgb(100, 116, 139)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Ready to create")
+                                .small()
+                                .color(egui::Color32::from_rgb(5, 150, 105)),
+                        );
+                    }
+                });
             });
+            ui.add_space(4.0);
 
             egui::CollapsingHeader::new("Advanced: export signed site.clew only")
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.small("Use this only for a different target platform or an existing matching runtime. It does not create a complete Site Kit.");
                     let ready = !self.invite_site_name.trim().is_empty()
-                        && !self.invite_read_root.trim().is_empty()
+                        && (self.invite_all_filesystem || !self.invite_read_root.trim().is_empty())
                         && !self.invite_in_flight
                         && !self.client_flavor_import_in_flight;
                     if ui
@@ -1010,13 +1437,357 @@ impl ControllerApp {
         });
     }
 
+    fn site_kit_ready(&self) -> bool {
+        !self.invite_site_name.trim().is_empty()
+            && (self.invite_all_filesystem || !self.invite_read_root.trim().is_empty())
+            && self.active_native_client_flavor().is_some()
+            && !self.invite_in_flight
+            && !self.client_flavor_import_in_flight
+            && self.client_flavor_import_error.is_none()
+    }
+
+    fn site_kit_blocker(&self) -> Option<&'static str> {
+        if self.invite_in_flight {
+            Some("Creating Site Kit...")
+        } else if self.client_flavor_import_in_flight {
+            Some("Verifying runtime...")
+        } else if self.invite_site_name.trim().is_empty() {
+            Some("Enter a Site / collaborator name")
+        } else if !self.invite_all_filesystem && self.invite_read_root.trim().is_empty() {
+            Some("Choose an approved folder on target B")
+        } else if self.client_flavor_import_error.is_some() {
+            Some("Runtime verification failed — see details above")
+        } else if self.active_native_client_flavor().is_none() {
+            Some("Runtime verification required")
+        } else {
+            None
+        }
+    }
+
+    fn start_site_kit_create(&mut self) {
+        if !self.site_kit_ready() {
+            return;
+        }
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            self.backend.site_kit_create(SiteKitCreateRequest {
+                invite: self.invite_request(),
+                output_dir: folder.to_string_lossy().into_owned(),
+            });
+            self.invite_in_flight = true;
+            self.error = None;
+        }
+    }
+
+    fn render_fixed_footer(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(egui::Color32::WHITE)
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(226, 232, 240),
+            ))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    muted(
+                        ui,
+                        "Clew stays available in the tray when this window is hidden.",
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Exit Clew").clicked() {
+                            self.backend.shutdown();
+                        }
+                        if ui.button("Hide to tray").clicked() {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        }
+                    });
+                });
+                ui.separator();
+
+                let controller_ready =
+                    self.status.as_ref().is_some_and(|status| status.ready) && self.error.is_none();
+                let runtime = if self.client_flavor_import_in_flight {
+                    "Verifying".to_owned()
+                } else if self.client_flavor_import_error.is_some() {
+                    "Verification failed".to_owned()
+                } else if let Some(artifact) = self.active_native_client_flavor() {
+                    if self.controller_config.local_acceptance_runtime() && !artifact.release_ready
+                    {
+                        format!("{} local acceptance", artifact.version)
+                    } else {
+                        format!("{} ready", artifact.version)
+                    }
+                } else {
+                    "Unavailable".to_owned()
+                };
+
+                ui.columns(4, |columns| {
+                    columns[0].vertical(|ui| {
+                        ui.small("Controller");
+                        ui.strong(if controller_ready {
+                            "Ready"
+                        } else {
+                            "Starting"
+                        });
+                    });
+                    columns[1].vertical(|ui| {
+                        ui.small("Runtime");
+                        ui.strong(runtime);
+                    });
+                    columns[2].vertical(|ui| {
+                        ui.small("Site Kit");
+                        ui.strong(if self.last_site_kit_path.is_some() {
+                            "Created"
+                        } else {
+                            "Not created"
+                        });
+                    });
+                    columns[3].vertical(|ui| {
+                        ui.small("MCP");
+                        ui.strong(if self.mcp_http.is_some() {
+                            "Running"
+                        } else {
+                            "Stopped"
+                        });
+                    });
+                });
+            });
+    }
+
+    fn render_site_kit_next_steps(&self, ui: &mut egui::Ui) {
+        let (Some(path), Some(scenario)) = (&self.last_site_kit_path, self.last_site_kit_scenario)
+        else {
+            return;
+        };
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(239, 246, 255))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(191, 219, 254)))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
+            ui.strong(egui::RichText::new("Site Kit ready").size(18.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Created:");
+                ui.monospace(path);
+                if ui.button("Copy path").clicked() {
+                    ui.ctx().copy_text(path.clone());
+                }
+            });
+            ui.add_space(6.0);
+            if let Some(invite_id) = self.last_site_kit_invite_id {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!(
+                        "Site Access Credential: {}",
+                        site_access_credential_id(invite_id)
+                    ));
+                    ui.small(format!("InviteId: {invite_id}"));
+                });
+                ui.small("B and C should show this same Credential ID when they open the Site Kit.");
+                ui.add_space(6.0);
+            }
+            match scenario {
+                InviteScenario::DirectTarget => {
+                    ui.strong("A/B setup");
+                    ui.label("1. A is this Controller computer. Send this archive to target computer B.");
+                    ui.label("2. On B: extract the full archive, open Clew.exe, choose “Use this computer”, and keep Clew running.");
+                    ui.label("3. Back on A: wait for B to appear as a connected Target, then start MCP below.");
+                }
+                InviteScenario::PrivateTargetViaHelper => {
+                    ui.strong("A/B/C setup");
+                    ui.label("1. A is this Controller computer. Send this same archive to both target B and helper C.");
+                    ui.label("2. On C: extract it, open Clew.exe, choose “Help nearby computers connect”, and keep Clew running.");
+                    ui.label("3. On B: extract the same archive, open Clew.exe, choose “Use this computer”, and keep Clew running.");
+                    ui.small("Strict A/B/C validation: if B itself can reach the Internet, enable “Private-network validation: require helper C for target B” before starting B. This disables direct B→A dialing so the test proves the C path.");
+                    ui.label("4. Back on A: wait for C to appear as a Connection helper and B as a Target, then start MCP below.");
+                    ui.small("If B keeps waiting because LAN discovery is blocked: on C use “Save Nearby Connection File...”, copy nearby-connection.clew to B, and drop it onto B's Clew window. Clew retries automatically.");
+                }
+            }
+        });
+    }
+
+    fn render_credentials(&mut self, ui: &mut egui::Ui) {
+        section_card().show(ui, |ui| {
+            ui.strong(egui::RichText::new("Site Access Credentials").size(18.0));
+            muted(
+                ui,
+                "Each Site Kit has its own enrollment credential. Select one to see only the B/C computers enrolled from that Kit.",
+            );
+            ui.add_space(6.0);
+
+            if self.credentials.credentials.is_empty() {
+                muted(ui, "No Site Access Credentials yet. Create a Site Kit above.");
+                return;
+            }
+
+            let credentials = self.credentials.credentials.clone();
+            let selected_text = self
+                .selected_credential
+                .and_then(|selected| {
+                    credentials
+                        .iter()
+                        .find(|credential| credential.invite_id == selected)
+                })
+                .map(|credential| {
+                    format!("{} · {}", credential.credential_id, credential.site_name)
+                })
+                .unwrap_or_else(|| "Select credential".into());
+            egui::ComboBox::from_id_salt("site-access-credential-selector")
+                .selected_text(selected_text)
+                .width(360.0)
+                .show_ui(ui, |ui| {
+                    for credential in &credentials {
+                        ui.selectable_value(
+                            &mut self.selected_credential,
+                            Some(credential.invite_id),
+                            format!("{} · {}", credential.credential_id, credential.site_name),
+                        );
+                    }
+                });
+
+            let Some(selected) = self.selected_credential else {
+                return;
+            };
+            let Some(credential) = credentials
+                .iter()
+                .find(|credential| credential.invite_id == selected)
+                .cloned()
+            else {
+                return;
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| duration.as_millis().try_into().ok())
+                .unwrap_or(0_u64);
+            let expired = credential
+                .expires_unix_ms
+                .is_some_and(|expires| expires <= now);
+            let state_label = if credential.revoked {
+                "Revoked"
+            } else if credential.closed {
+                "Closed"
+            } else if expired {
+                "Expired"
+            } else {
+                "Open"
+            };
+            let claims = credential
+                .max_claims
+                .map(|max| format!("{}/{} enrolled", credential.claim_count, max))
+                .unwrap_or_else(|| format!("{} enrolled", credential.claim_count));
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(248, 250, 252))
+                .corner_radius(egui::CornerRadius::same(9))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(format!("{} · {}", credential.credential_id, state_label));
+                        ui.label(format!("· {claims}"));
+                        if let Some(expires) = credential.expires_unix_ms {
+                            if expires > now {
+                                let hours = expires.saturating_sub(now) / (60 * 60 * 1_000);
+                                ui.label(format!("· expires in {hours}h"));
+                            } else {
+                                ui.label("· expired");
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("InviteId:");
+                        ui.monospace(credential.invite_id.to_string());
+                        if ui.small_button("Copy InviteId").clicked() {
+                            ui.ctx().copy_text(credential.invite_id.to_string());
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Credential fingerprint:");
+                        ui.monospace(&credential.fingerprint_sha256);
+                        if ui.small_button("Copy fingerprint").clicked() {
+                            ui.ctx().copy_text(credential.fingerprint_sha256.clone());
+                        }
+                    });
+                    let mut permissions = Vec::new();
+                    if credential.allow_read == Some(true) {
+                        permissions.push("Read");
+                    }
+                    if credential.allow_write == Some(true) {
+                        permissions.push("Write");
+                    }
+                    if credential.allow_shell == Some(true) {
+                        permissions.push("Shell");
+                    }
+                    if credential.allow_tcp_egress == Some(true) {
+                        permissions.push("TCP egress");
+                    }
+                    if !permissions.is_empty() {
+                        ui.small(format!("Signed target permissions: {}", permissions.join(" · ")));
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if !credential.closed && !credential.revoked
+                            && ui.button("Close to new devices").clicked()
+                        {
+                            self.backend.credential_close(credential.invite_id);
+                        }
+                        if !credential.revoked {
+                            if self.credential_confirm
+                                == Some(CredentialConfirmAction::Revoke(credential.invite_id))
+                            {
+                                ui.label("Revoke this credential and disconnect its enrolled devices?");
+                                if ui.button("Confirm revoke").clicked() {
+                                    self.backend.credential_revoke(credential.invite_id);
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.credential_confirm = None;
+                                }
+                            } else if ui.button("Revoke credential...").clicked() {
+                                self.credential_confirm =
+                                    Some(CredentialConfirmAction::Revoke(credential.invite_id));
+                            }
+                        }
+                    });
+                    let deletable = credential.closed || credential.revoked || expired;
+                    if self.credential_confirm
+                        == Some(CredentialConfirmAction::Delete(credential.invite_id))
+                    {
+                        ui.separator();
+                        ui.label("Delete this old credential from normal history and remove its enrolled device records? Clew will retain only a revocation tombstone so the old Site Kit cannot be reused.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Confirm delete old credential").clicked() {
+                                self.backend.credential_delete(credential.invite_id);
+                                if self.selected_credential == Some(credential.invite_id) {
+                                    self.selected_credential = None;
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.credential_confirm = None;
+                            }
+                        });
+                    } else if deletable {
+                        if ui.button("Delete old credential...").clicked() {
+                            self.credential_confirm =
+                                Some(CredentialConfirmAction::Delete(credential.invite_id));
+                        }
+                    } else {
+                        ui.small("Close or revoke this credential before deleting it from history.");
+                    }
+                });
+        });
+    }
+
     fn invite_request(&self) -> InviteIssueRequest {
         InviteIssueRequest {
             site_name: self.invite_site_name.trim().to_owned(),
             outfit_id: None,
             target_platform: None,
             target_arch: None,
-            roots: vec![self.invite_read_root.trim().to_owned()],
+            all_filesystem: self.invite_all_filesystem,
+            roots: if self.invite_all_filesystem {
+                Vec::new()
+            } else {
+                vec![self.invite_read_root.trim().to_owned()]
+            },
             max_claims: INVITE_MAX_CLAIMS,
             valid_for_ms: INVITE_VALID_FOR_MS,
             deployment_window_ms: INVITE_DEPLOYMENT_WINDOW_MS,
@@ -1067,6 +1838,19 @@ impl ControllerApp {
             StudioAction::PreviewAsset(asset_id) => self.backend.outfit_asset_preview(asset_id),
         }
     }
+}
+
+fn should_import_current_runtime(
+    local_acceptance_runtime: bool,
+    current_runtime_import_attempted: bool,
+    has_active_native_flavor: bool,
+    import_in_flight: bool,
+    invite_in_flight: bool,
+) -> bool {
+    if import_in_flight || invite_in_flight {
+        return false;
+    }
+    !has_active_native_flavor || (local_acceptance_runtime && !current_runtime_import_attempted)
 }
 
 fn matching_active_client_flavor<'a>(
@@ -1130,6 +1914,28 @@ mod tests {
             release_ready: true,
             active: true,
         }
+    }
+
+    #[test]
+    fn local_acceptance_refreshes_current_package_once_even_with_active_runtime() {
+        assert!(should_import_current_runtime(
+            true, false, true, false, false
+        ));
+        assert!(!should_import_current_runtime(
+            true, true, true, false, false
+        ));
+        assert!(!should_import_current_runtime(
+            false, false, true, false, false
+        ));
+        assert!(should_import_current_runtime(
+            false, false, false, false, false
+        ));
+        assert!(!should_import_current_runtime(
+            true, false, true, true, false
+        ));
+        assert!(!should_import_current_runtime(
+            true, false, true, false, true
+        ));
     }
 
     #[test]
@@ -1240,6 +2046,10 @@ impl Drop for ControllerApp {
 }
 
 impl eframe::App for ControllerApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [245.0 / 255.0, 247.0 / 255.0, 250.0 / 255.0, 1.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_events(&ctx);
@@ -1249,32 +2059,145 @@ impl eframe::App for ControllerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
-        ui.heading("Clew");
-        ui.add_space(8.0);
+        let footer_height = 118.0;
+        let footer_gap = 6.0;
+        let scroll_height = (ui.available_height() - footer_height - footer_gap).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), scroll_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("controller-main-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Clew").size(30.0).strong());
+                muted(
+                    ui,
+                    "Controller A · private remote capability bridge for your agent",
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ready =
+                    self.status.as_ref().is_some_and(|status| status.ready) && self.error.is_none();
+                status_badge(
+                    ui,
+                    if ready {
+                        "Controller ready"
+                    } else {
+                        "Controller starting"
+                    },
+                    ready,
+                );
+            });
+        });
+        ui.add_space(12.0);
+
+        let target_online = self.devices.devices.iter().any(|device| {
+            device.executable
+                && device.online
+                && self.selected_credential == Some(device.enrolled_via_invite_id)
+        });
+            let site_ready = self.last_site_kit_path.is_some() || !self.credentials.credentials.is_empty();
+            let mcp_running = self.mcp_http.is_some();
+            section_card().show(ui, |ui| {
+                ui.columns(3, |columns| {
+                    workflow_step(
+                        &mut columns[0],
+                        FlowGlyph::Package,
+                        if site_ready {
+                            FlowState::Complete
+                        } else {
+                            FlowState::Active
+                        },
+                        "1 · Site Kit",
+                        if site_ready {
+                            "Package ready or already used"
+                        } else {
+                            "Create the collaborator package"
+                        },
+                    );
+                    workflow_step(
+                        &mut columns[1],
+                        FlowGlyph::Computer,
+                        if target_online {
+                            FlowState::Complete
+                        } else if site_ready {
+                            FlowState::Active
+                        } else {
+                            FlowState::Pending
+                        },
+                        "2 · Target B",
+                        if target_online {
+                            "Target connected"
+                        } else {
+                            "Open the Site Kit on B"
+                        },
+                    );
+                    workflow_step(
+                        &mut columns[2],
+                        FlowGlyph::Agent,
+                        if mcp_running {
+                            FlowState::Complete
+                        } else if target_online {
+                            FlowState::Active
+                        } else {
+                            FlowState::Pending
+                        },
+                        "3 · Agent MCP",
+                        if mcp_running {
+                            "Agent endpoint running"
+                        } else {
+                            "Start after B is connected"
+                        },
+                    );
+                });
+            });
+            ui.add_space(12.0);
+
         if let Some(error) = &self.error {
-            ui.label(format!("Controller status: unavailable · {error}"));
-        } else if let Some(status) = &self.status {
-            ui.label(format!(
-                "Controller status: {} · PID {}",
-                if status.ready { "Ready" } else { "Not ready" },
-                status.pid
-            ));
-        } else {
-            ui.label("Controller status: Connecting...");
+            section_card().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Controller unavailable: {error}"))
+                        .color(egui::Color32::from_rgb(185, 28, 28)),
+                );
+            });
         }
-
         if let Some(notice) = &self.notice {
-            ui.label(notice);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(240, 253, 250))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.label(notice);
+                });
         }
 
-        if ui.button("Create package for someone else").clicked() {
-            self.invite_open = true;
-            self.import_current_runtime_if_available();
-        }
-        self.render_invite(ui);
-
-        ui.separator();
-        self.render_mcp(ui);
+        section_card().show(ui, |ui| {
+            egui::CollapsingHeader::new(
+                egui::RichText::new("1. Create Site Kit")
+                    .size(18.0)
+                    .strong(),
+            )
+            .default_open(self.credentials.credentials.is_empty())
+            .show(ui, |ui| {
+                if !self.invite_open {
+                    self.invite_open = true;
+                    self.import_current_runtime_if_available();
+                }
+                self.render_invite(ui);
+            });
+            muted(
+                ui,
+                "Create one package for B, or the same package for B + helper C.",
+            );
+        });
+        ui.add_space(10.0);
+        self.render_site_kit_next_steps(ui);
+        ui.add_space(10.0);
+        self.render_credentials(ui);
 
         if let Some(review) = self.recovery.review
             && review.remote_access_paused
@@ -1302,57 +2225,122 @@ impl eframe::App for ControllerApp {
             });
         }
 
-        ui.separator();
-        if self.devices.devices.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(56.0);
-                ui.heading("No collaborators yet");
-                ui.label(
-                    "Send the generated Site Kit to a collaborator; they can open it directly.",
-                );
-                ui.add_space(12.0);
-                ui.label("Use Invite collaborator above to create a complete Site Kit without opening a terminal.");
-            });
-        } else {
-            ui.heading("Devices");
-            for device in &self.devices.devices {
-                ui.group(|ui| {
-                    ui.strong(format!("{} / {}", device.site_name, device.display_name));
-                    ui.label(format!(
-                        "{} · {}",
-                        if device.online {
-                            "Connected"
-                        } else {
-                            "Offline"
-                        },
-                        if device.executable {
-                            "Executable"
-                        } else {
-                            "Connector"
-                        }
-                    ));
-                });
-            }
-        }
-
-        ui.separator();
-        let mut studio_actions = Vec::new();
-        egui::CollapsingHeader::new("Outfit Studio")
-            .default_open(true)
+        ui.add_space(10.0);
+        section_card().show(ui, |ui| {
+            egui::CollapsingHeader::new(
+                egui::RichText::new("2. Collaborator computers").size(18.0).strong(),
+            )
+            .default_open(self.selected_credential.is_some())
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("outfit-studio-scroll")
-                    .max_height(560.0)
-                    .show(ui, |ui| {
-                        studio_actions = self.studio.ui(ui);
-                    });
+                let visible_devices = self
+                    .selected_credential
+                    .map(|credential| {
+                        self.devices
+                            .devices
+                            .iter()
+                            .filter(|device| device.enrolled_via_invite_id == credential)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(credential) = self.selected_credential
+                    && let Some(summary) = self
+                        .credentials
+                        .credentials
+                        .iter()
+                        .find(|item| item.invite_id == credential)
+                {
+                    muted(
+                        ui,
+                        &format!(
+                            "Showing computers enrolled with {}. Select another credential above to review its machines.",
+                            summary.credential_id
+                        ),
+                    );
+                    ui.add_space(6.0);
+                }
+                if self.selected_credential.is_none() {
+                    muted(ui, "Create or select a Site Access Credential to view its collaborator computers.");
+                } else if visible_devices.is_empty() {
+                    muted(ui, "No computers are enrolled with the selected credential yet. Start B, and C for an A/B/C setup, from the matching Site Kit.");
+                } else {
+                    for device in visible_devices {
+                        let role = if device.executable {
+                            "Target B"
+                        } else if device.connector {
+                            "Connection helper C"
+                        } else {
+                            "Site member"
+                        };
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(248, 250, 252))
+                            .corner_radius(egui::CornerRadius::same(9))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    flow_icon(
+                                        ui,
+                                        if device.executable {
+                                            FlowGlyph::Computer
+                                        } else {
+                                            FlowGlyph::Link
+                                        },
+                                        if device.online {
+                                            FlowState::Complete
+                                        } else {
+                                            FlowState::Pending
+                                        },
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.strong(format!("{} / {}", device.site_name, device.display_name));
+                                        muted(ui, role);
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        status_badge(ui, if device.online { "Connected" } else { "Offline" }, device.online);
+                                    });
+                                });
+                            });
+                    }
+                }
             });
-        for action in studio_actions {
-            self.dispatch_studio_action(action);
-        }
+        });
 
-        ui.separator();
-        ui.collapsing("Activity", |ui| {
+        ui.add_space(10.0);
+        section_card().show(ui, |ui| {
+            egui::CollapsingHeader::new(
+                egui::RichText::new("3. Agent access (MCP)")
+                    .size(18.0)
+                    .strong(),
+            )
+            .default_open(
+                self.devices
+                    .devices
+                    .iter()
+                    .any(|device| device.executable && device.online),
+            )
+            .show(ui, |ui| self.render_mcp(ui));
+        });
+
+        ui.add_space(10.0);
+        section_card().show(ui, |ui| {
+            egui::CollapsingHeader::new("Advanced")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut studio_actions = Vec::new();
+                    egui::CollapsingHeader::new("Outfit Studio")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("outfit-studio-scroll")
+                                .max_height(560.0)
+                                .show(ui, |ui| {
+                                    studio_actions = self.studio.ui(ui);
+                                });
+                        });
+                    for action in studio_actions {
+                        self.dispatch_studio_action(action);
+                    }
+
+                    ui.collapsing("Activity", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Latest 20 local activity summaries");
                 if ui.button("Clear").clicked() {
@@ -1380,10 +2368,9 @@ impl eframe::App for ControllerApp {
                     });
                 }
             }
-        });
+                    });
 
-        ui.separator();
-        ui.collapsing("Controller backup", |ui| {
+                    ui.collapsing("Controller backup", |ui| {
             ui.label("Exports are encrypted with Argon2id + XChaCha20-Poly1305. The passphrase is never written to logs or command-line arguments.");
             ui.add(
                 egui::TextEdit::singleline(&mut self.backup_passphrase)
@@ -1423,17 +2410,15 @@ impl eframe::App for ControllerApp {
                 }
             }
             ui.label("Restore requires a stopped Controller and an empty target state. Use `clew backup-restore` for that offline step, then complete Recovery Review here.");
+                    });
+                });
         });
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Exit Clew").clicked() {
-                    self.backend.shutdown();
-                }
-                if ui.button("Hide to tray").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
-            });
-        });
+        ui.add_space(12.0);
+                    });
+            },
+        );
+        ui.add_space(footer_gap);
+        self.render_fixed_footer(ui);
     }
 }

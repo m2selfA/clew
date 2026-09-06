@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
+use crate::target_path::expand_target_path;
+
 pub const HARD_MAX_HOST_FILE_TRANSFERS: usize = 16;
 const HARD_MAX_RENAME_ATTEMPTS: u32 = 1024;
 const HOST_TRANSFER_STATE_FILE_A: &str = "state.a.json";
@@ -744,7 +746,7 @@ impl HostFileTransferService {
                 (self.can_get && allow_read) || (self.can_put && allow_write)
             }
         };
-        if !permitted || self.policy.roots.is_empty() {
+        if !permitted || !self.policy.allows_read() {
             return FileTransferReply::error(
                 FileTransferErrorCode::Denied,
                 "file transfer is outside the allowed device grant",
@@ -1330,9 +1332,12 @@ fn prepare_get_source(
     policy: &ReadPolicy,
     requested_device_path: &str,
 ) -> Result<(String, File, u64, String), FileTransferReply> {
-    let requested = PathBuf::from(requested_device_path);
+    let requested = expand_target_path(requested_device_path)
+        .map_err(|_| transfer_denied("device source must be absolute or use ~/..."))?;
     if !requested.is_absolute() {
-        return Err(transfer_denied("device source must be absolute"));
+        return Err(transfer_denied(
+            "device source must be absolute or use ~/...",
+        ));
     }
     let metadata = fs::symlink_metadata(&requested).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -1380,7 +1385,13 @@ fn prepare_get_source(
 }
 
 fn ensure_allowed_file(policy: &ReadPolicy, path: &Path) -> Result<(), FileTransferReply> {
+    if policy.all_filesystem {
+        return Ok(());
+    }
     for root in &policy.roots {
+        let Ok(root) = expand_target_path(root) else {
+            continue;
+        };
         let Ok(root) = fs::canonicalize(root) else {
             continue;
         };
@@ -1395,9 +1406,12 @@ fn prepare_put_target(
     policy: &ReadPolicy,
     manifest: &FileTransferManifest,
 ) -> Result<PathBuf, FileTransferReply> {
-    let requested = PathBuf::from(&manifest.device_path);
+    let requested = expand_target_path(&manifest.device_path)
+        .map_err(|_| transfer_denied("device destination must be absolute or use ~/..."))?;
     if !requested.is_absolute() {
-        return Err(transfer_denied("device destination must be absolute"));
+        return Err(transfer_denied(
+            "device destination must be absolute or use ~/...",
+        ));
     }
     let Some(Component::Normal(file_name)) = requested.components().next_back() else {
         return Err(FileTransferReply::error(
@@ -1443,7 +1457,13 @@ fn prepare_put_target(
 }
 
 fn ensure_allowed_parent(policy: &ReadPolicy, parent: &Path) -> Result<(), FileTransferReply> {
+    if policy.all_filesystem {
+        return Ok(());
+    }
     for root in &policy.roots {
+        let Ok(root) = expand_target_path(root) else {
+            continue;
+        };
         let Ok(root) = fs::canonicalize(root) else {
             continue;
         };

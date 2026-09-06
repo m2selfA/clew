@@ -22,7 +22,9 @@ pub use clew_distribution::{
     SITE_KIT_LAUNCHER_SCHEMA_VERSION, ValidatedClientFlavorArtifact,
 };
 pub use clew_transport::{
-    FileConflictPolicy, FsMutationResult, FsWritePrecondition, ShellTaskOutput, ShellTaskStatus,
+    FileConflictPolicy, FsControlResult, FsManagedTempKind, FsManagedTempResource,
+    FsMutationRequest, FsMutationResult, FsTrashItem, FsWritePrecondition, ShellTaskOutput,
+    ShellTaskStatus,
 };
 pub use config::{
     ControllerConfig, ControllerConfigError, ControllerLifecycleOwner, LocalEndpoint,
@@ -52,9 +54,11 @@ pub use local_api::{
     OutfitCloneRequest, OutfitCreateRequest, OutfitList, OutfitSetAssetRequest,
     OutfitSetFieldRequest, OutfitUpdateRequest, RecoveryStatus, RemoteDirectoryGetRequest,
     RemoteDirectoryPutRequest, RemoteEditRequest, RemoteFileGetRequest, RemoteFilePutRequest,
-    RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest, RemoteReadRequest,
-    RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest, RemoteShellStartRequest,
-    RemoteWriteRequest, SiteKitCreateRequest, SiteKitCreateResult, Socks5AddRequest, Socks5List,
+    RemoteFsControlRequest, RemoteGlobRequest, RemoteGrepRequest, RemotePathInfoRequest,
+    RemoteReadRequest, RemoteReadResult, RemoteSessionPathInfo, RemoteShellAttachRequest,
+    RemoteShellStartRequest, RemoteWriteRequest, SiteAccessCredentialList,
+    SiteAccessCredentialSummary, SiteKitCreateRequest, SiteKitCreateResult, Socks5AddRequest,
+    Socks5List,
 };
 pub use outfit::{
     MAX_CUSTOM_OUTFITS, OutfitEditPatch, OutfitLibrary, OutfitLibraryEntry, OutfitLibrarySnapshot,

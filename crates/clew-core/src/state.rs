@@ -239,6 +239,19 @@ impl StateLayout {
     }
 
     #[must_use]
+    pub fn host_managed_fs_root(
+        &self,
+        controller_id: ControllerId,
+        site_id: SiteId,
+        device_id: DeviceId,
+    ) -> PathBuf {
+        self.membership_dir(controller_id, site_id)
+            .join("host")
+            .join("managed-fs")
+            .join(device_id.to_string())
+    }
+
+    #[must_use]
     pub fn device_record_path(
         &self,
         controller_id: ControllerId,

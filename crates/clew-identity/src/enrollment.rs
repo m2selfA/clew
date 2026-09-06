@@ -133,7 +133,7 @@ impl SignedSiteBootstrapPass {
         Ok(self.payload.controller)
     }
 
-    fn fingerprint(&self) -> Result<[u8; 32], EnrollmentError> {
+    pub fn fingerprint(&self) -> Result<[u8; 32], EnrollmentError> {
         let encoded = serde_json::to_vec(&(&self.payload, &self.signature))?;
         let mut hasher = Sha256::new();
         hasher.update(BOOTSTRAP_FINGERPRINT_DOMAIN);
@@ -224,6 +224,22 @@ pub struct EnrollmentDeviceRecord {
     pub status: EnrollmentStatus,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SiteAccessCredentialRecord {
+    pub invite_id: InviteId,
+    pub site_id: Option<SiteId>,
+    pub site_name: Option<String>,
+    pub grant: Option<PermissionGrant>,
+    pub not_before_unix_ms: Option<u64>,
+    pub expires_unix_ms: Option<u64>,
+    pub deployment_window_ms: Option<u64>,
+    pub max_claims: Option<u32>,
+    pub fingerprint: Option<[u8; 32]>,
+    pub claim_count: u32,
+    pub closed: bool,
+    pub revoked: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EnrollmentRegistry {
     controller_id: ControllerId,
@@ -247,9 +263,27 @@ impl std::fmt::Debug for EnrollmentRegistry {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct InviteRuntimeState {
     issued_pass_fingerprint: Option<[u8; 32]>,
+    #[serde(default)]
+    site_id: Option<SiteId>,
+    #[serde(default)]
+    site_name: Option<String>,
+    #[serde(default)]
+    grant: Option<PermissionGrant>,
+    #[serde(default)]
+    not_before_unix_ms: Option<u64>,
+    #[serde(default)]
+    expires_unix_ms: Option<u64>,
+    #[serde(default)]
+    deployment_window_ms: Option<u64>,
+    #[serde(default)]
+    max_claims: Option<u32>,
     first_claim_unix_ms: Option<u64>,
+    #[serde(default)]
     closed: bool,
+    #[serde(default)]
     revoked: bool,
+    #[serde(default)]
+    deleted: bool,
     claims: Vec<ClaimRecord>,
 }
 
@@ -281,6 +315,45 @@ impl EnrollmentRegistry {
         self.devices.len()
     }
 
+    #[must_use]
+    pub fn credential_records(&self) -> Vec<SiteAccessCredentialRecord> {
+        self.invites
+            .iter()
+            .filter(|(_, state)| !state.deleted && state.issued_pass_fingerprint.is_some())
+            .map(|(invite_id, state)| {
+                let first_receipt = state.claims.first().map(|claim| &claim.receipt);
+                SiteAccessCredentialRecord {
+                    invite_id: *invite_id,
+                    site_id: state
+                        .site_id
+                        .or_else(|| first_receipt.map(|receipt| receipt.site_id)),
+                    site_name: state.site_name.clone(),
+                    grant: state.grant,
+                    not_before_unix_ms: state
+                        .not_before_unix_ms
+                        .or_else(|| first_receipt.map(|receipt| receipt.issued_unix_ms)),
+                    expires_unix_ms: state.expires_unix_ms,
+                    deployment_window_ms: state.deployment_window_ms,
+                    max_claims: state.max_claims,
+                    fingerprint: state.issued_pass_fingerprint,
+                    claim_count: state.claims.len().try_into().unwrap_or(u32::MAX),
+                    closed: state.closed,
+                    revoked: state.revoked,
+                }
+            })
+            .collect()
+    }
+
+    fn remember_pass_metadata(state: &mut InviteRuntimeState, pass: &SignedSiteBootstrapPass) {
+        state.site_id = Some(pass.payload.site_id);
+        state.site_name = Some(pass.payload.site_name.clone());
+        state.grant = Some(pass.payload.grant);
+        state.not_before_unix_ms = Some(pass.payload.not_before_unix_ms);
+        state.expires_unix_ms = Some(pass.payload.expires_unix_ms);
+        state.deployment_window_ms = Some(pass.payload.deployment_window_ms);
+        state.max_claims = Some(pass.payload.max_claims);
+    }
+
     pub fn issue_bootstrap(
         &mut self,
         controller: &ControllerIdentity,
@@ -301,11 +374,18 @@ impl EnrollmentRegistry {
         }
         let fingerprint = pass.fingerprint()?;
         let state = self.invites.entry(pass.payload.invite_id).or_default();
+        if state.revoked || state.deleted {
+            return Err(EnrollmentError::InviteRevoked);
+        }
         match state.issued_pass_fingerprint {
             Some(existing) if existing != fingerprint => Err(EnrollmentError::PassConflict),
-            Some(_) => Ok(()),
+            Some(_) => {
+                Self::remember_pass_metadata(state, pass);
+                Ok(())
+            }
             None => {
                 state.issued_pass_fingerprint = Some(fingerprint);
+                Self::remember_pass_metadata(state, pass);
                 Ok(())
             }
         }
@@ -407,6 +487,7 @@ impl EnrollmentRegistry {
         } else {
             state.issued_pass_fingerprint = Some(fingerprint);
         }
+        Self::remember_pass_metadata(state, pass);
         state.first_claim_unix_ms.get_or_insert(now_unix_ms);
         state.claims.push(ClaimRecord {
             pass_fingerprint: fingerprint,
@@ -468,13 +549,21 @@ impl EnrollmentRegistry {
         Ok(device.clone())
     }
 
-    pub fn close_invite(&mut self, invite_id: InviteId) {
-        self.invites.entry(invite_id).or_default().closed = true;
+    pub fn close_invite(&mut self, invite_id: InviteId) -> Result<(), EnrollmentError> {
+        let state = self
+            .invites
+            .get_mut(&invite_id)
+            .ok_or(EnrollmentError::UnknownInvite(invite_id))?;
+        state.closed = true;
+        Ok(())
     }
 
-    pub fn revoke_invite(&mut self, invite_id: InviteId) {
+    pub fn revoke_invite(&mut self, invite_id: InviteId) -> Result<Vec<DeviceId>, EnrollmentError> {
         let device_ids = {
-            let state = self.invites.entry(invite_id).or_default();
+            let state = self
+                .invites
+                .get_mut(&invite_id)
+                .ok_or(EnrollmentError::UnknownInvite(invite_id))?;
             state.closed = true;
             state.revoked = true;
             let mut device_ids = Vec::with_capacity(state.claims.len());
@@ -484,11 +573,50 @@ impl EnrollmentRegistry {
             }
             device_ids
         };
-        for device_id in device_ids {
-            if let Some(device) = self.devices.get_mut(&device_id) {
+        for device_id in &device_ids {
+            if let Some(device) = self.devices.get_mut(device_id) {
                 device.status = EnrollmentStatus::Revoked;
             }
         }
+        Ok(device_ids)
+    }
+
+    pub fn delete_invite_history(
+        &mut self,
+        invite_id: InviteId,
+    ) -> Result<Vec<DeviceId>, EnrollmentError> {
+        let Some(state) = self.invites.get_mut(&invite_id) else {
+            return Err(EnrollmentError::UnknownInvite(invite_id));
+        };
+        let mut device_ids: Vec<DeviceId> = self
+            .devices
+            .values()
+            .filter(|device| device.invite_id == invite_id)
+            .map(|device| device.device_id)
+            .collect();
+        for claim in &state.claims {
+            if !device_ids.contains(&claim.receipt.device_id) {
+                device_ids.push(claim.receipt.device_id);
+            }
+        }
+        state.closed = true;
+        state.revoked = true;
+        state.deleted = true;
+        // Keep only the immutable fingerprint plus revoked/closed/deleted tombstone flags.
+        // That is enough to fail old Site Kits closed without retaining normal history metadata.
+        state.site_id = None;
+        state.site_name = None;
+        state.grant = None;
+        state.not_before_unix_ms = None;
+        state.expires_unix_ms = None;
+        state.deployment_window_ms = None;
+        state.max_claims = None;
+        state.first_claim_unix_ms = None;
+        state.claims.clear();
+        for device_id in &device_ids {
+            self.devices.remove(device_id);
+        }
+        Ok(device_ids)
     }
 
     pub fn revoke_device(&mut self, device_id: DeviceId) -> Result<(), EnrollmentError> {
@@ -592,6 +720,8 @@ pub enum EnrollmentError {
     FinalizedReplay,
     #[error("enrollment claim was not found")]
     MissingClaim,
+    #[error("unknown Site Access Credential {0}")]
+    UnknownInvite(InviteId),
     #[error("unknown enrolled DeviceId {0}")]
     UnknownDevice(DeviceId),
     #[error("host persist acknowledgement token does not match")]
@@ -714,16 +844,73 @@ mod tests {
         ));
 
         let pass = registry.issue_bootstrap(&controller, spec(1)).unwrap();
-        registry.close_invite(pass.payload.invite_id);
+        registry.close_invite(pass.payload.invite_id).unwrap();
         assert!(matches!(
             registry.claim(&pass, device, 1_100),
             Err(EnrollmentError::InviteClosed)
         ));
 
         let pass = registry.issue_bootstrap(&controller, spec(1)).unwrap();
-        registry.revoke_invite(pass.payload.invite_id);
+        registry.revoke_invite(pass.payload.invite_id).unwrap();
         assert!(matches!(
             registry.claim(&pass, device, 1_100),
+            Err(EnrollmentError::InviteRevoked)
+        ));
+    }
+
+    #[test]
+    fn unknown_credential_lifecycle_rejects_without_creating_phantom_state() {
+        let (_, mut registry) = controller_and_registry();
+        let invite_id = InviteId::new();
+
+        assert!(matches!(
+            registry.close_invite(invite_id),
+            Err(EnrollmentError::UnknownInvite(id)) if id == invite_id
+        ));
+        assert!(registry.invites.is_empty());
+
+        assert!(matches!(
+            registry.revoke_invite(invite_id),
+            Err(EnrollmentError::UnknownInvite(id)) if id == invite_id
+        ));
+        assert!(registry.invites.is_empty());
+    }
+
+    #[test]
+    fn deleted_credential_keeps_revocation_tombstone_and_cannot_be_reused() {
+        let (controller, mut registry) = controller_and_registry();
+        let pass = registry.issue_bootstrap(&controller, spec(2)).unwrap();
+        let invite_id = pass.payload.invite_id;
+        let device = DeviceIdentity::generate().unwrap().public_identity();
+        let receipt = registry.claim(&pass, device, 1_100).unwrap();
+        registry
+            .finalize_host_persist(
+                receipt.invite_id,
+                receipt.device_id,
+                receipt.persist_ack_token(),
+            )
+            .unwrap();
+
+        let records = registry.credential_records();
+        let record = records
+            .iter()
+            .find(|record| record.invite_id == invite_id)
+            .unwrap();
+        assert_eq!(record.site_name.as_deref(), Some("Alice Lab"));
+        assert_eq!(record.claim_count, 1);
+        assert!(record.fingerprint.is_some());
+
+        let removed = registry.delete_invite_history(invite_id).unwrap();
+        assert_eq!(removed, vec![receipt.device_id]);
+        assert!(registry.credential_records().is_empty());
+        assert_eq!(registry.device_count(), 0);
+        assert!(matches!(
+            registry.register_pass(&pass),
+            Err(EnrollmentError::InviteRevoked)
+        ));
+        let replacement_device = DeviceIdentity::generate().unwrap().public_identity();
+        assert!(matches!(
+            registry.claim(&pass, replacement_device, 1_200),
             Err(EnrollmentError::InviteRevoked)
         ));
     }

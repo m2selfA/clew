@@ -1,6 +1,6 @@
 use std::{fmt, path::Path};
 
-use clew_core::ReadPolicy;
+use clew_core::{ReadPolicy, site_access_credential_id};
 use clew_identity::{
     ControllerIdentity, ControllerPublicIdentity, IdentityError, SignedSiteBootstrapPass,
 };
@@ -170,6 +170,11 @@ impl fmt::Debug for SignedSiteClew {
 }
 
 impl SignedSiteClew {
+    #[must_use]
+    pub fn site_access_credential_id(&self) -> String {
+        site_access_credential_id(self.payload.bootstrap.payload.invite_id)
+    }
+
     pub fn issue(
         controller: &ControllerIdentity,
         client_flavor: ClientFlavor,

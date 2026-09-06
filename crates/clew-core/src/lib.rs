@@ -16,7 +16,7 @@ pub use control::{
 pub use device::{DeviceNameOrigin, DeviceRecord, DeviceSummary, MemberCapabilities, SiteMember};
 pub use id::{
     ControllerId, DeviceId, ForwardConnectionId, ForwardId, InviteId, ProxyId, RequestId, SiteId,
-    StableIdError, TaskId, TransferId,
+    StableIdError, TaskId, TransferId, site_access_credential_id,
 };
 pub use naming::{
     DeviceTag, DeviceTagAllocation, DeviceTagAllocationError, DeviceTagParseError,

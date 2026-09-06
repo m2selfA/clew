@@ -66,6 +66,7 @@ pub struct DeviceRecord {
 pub struct DeviceSummary {
     pub device_id: DeviceId,
     pub site_id: SiteId,
+    pub enrolled_via_invite_id: InviteId,
     pub site_name: String,
     pub display_name: String,
     pub hostname_observed: String,
@@ -81,6 +82,7 @@ impl DeviceSummary {
         Self {
             device_id: record.device_id,
             site_id: record.site_id,
+            enrolled_via_invite_id: record.enrolled_via_invite_id,
             site_name: site_name.into(),
             display_name: record.display_name.clone(),
             hostname_observed: record.hostname_observed.clone(),

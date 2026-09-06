@@ -94,6 +94,7 @@ mod tests {
         DeviceSummary {
             device_id: DeviceId::new(),
             site_id: SiteId::new(),
+            enrolled_via_invite_id: crate::InviteId::new(),
             site_name: site.into(),
             display_name: name.into(),
             hostname_observed: name.into(),

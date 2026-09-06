@@ -23,6 +23,11 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => println!("cargo:rustc-link-arg=/STACK:8388608"),
+        Ok("gnu") => println!("cargo:rustc-link-arg=-Wl,--stack,8388608"),
+        _ => {}
+    }
     if let Err(error) = compile_windows_resources() {
         panic!("failed to compile Clew Windows resources: {error}");
     }

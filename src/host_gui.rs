@@ -3,14 +3,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use clew_core::{ControllerId, SiteId, StateLayout};
+use clew_core::{ControllerId, SiteId, StateLayout, site_access_credential_id};
 use clew_host::{
-    HostLaunchState, LEGACY_NEARBY_CONNECTOR_FILE_NAME, NEARBY_CONNECTOR_FILE_NAME,
-    NearbyConnectorStore, OutfitAssetRef, OutfitProfile, OutfitRuntimeView,
+    HelperTunnelStatus, HostLaunchState, HostNetworkState, LEGACY_NEARBY_CONNECTOR_FILE_NAME,
+    NEARBY_CONNECTOR_FILE_NAME, NearbyConnectorStore, OutfitAssetRef, OutfitProfile,
+    OutfitRuntimeView,
 };
 use clew_runtime::{OutfitAssetError, OutfitAssetPreview, OutfitAssetStore};
 use eframe::egui;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuId, MenuItem},
@@ -26,11 +27,79 @@ pub enum HostGuiAction {
     },
 }
 
+fn configure_light_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Light);
+    let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = egui::Color32::from_rgb(246, 248, 252);
+    visuals.window_fill = egui::Color32::WHITE;
+    visuals.faint_bg_color = egui::Color32::from_rgb(239, 243, 249);
+    visuals.extreme_bg_color = egui::Color32::WHITE;
+    visuals.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    ctx.set_visuals_of(egui::Theme::Light, visuals);
+
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.interact_size.y = 34.0;
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(23.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
+fn host_role_icon(ui: &mut egui::Ui, connector_only: bool, active: bool) {
+    let fill = if active {
+        egui::Color32::from_rgb(220, 252, 231)
+    } else {
+        egui::Color32::from_rgb(219, 234, 254)
+    };
+    let foreground = if active {
+        egui::Color32::from_rgb(22, 101, 52)
+    } else {
+        egui::Color32::from_rgb(29, 78, 216)
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+    let center = rect.center();
+    let painter = ui.painter();
+    painter.circle_filled(center, 21.0, fill);
+    let stroke = egui::Stroke::new(2.2, foreground);
+    if connector_only {
+        painter.circle_stroke(egui::pos2(center.x - 7.0, center.y), 7.0, stroke);
+        painter.circle_stroke(egui::pos2(center.x + 7.0, center.y), 7.0, stroke);
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 2.0, center.y),
+                egui::pos2(center.x + 2.0, center.y),
+            ],
+            stroke,
+        );
+    } else {
+        let x = center.x;
+        let y = center.y;
+        for (a, b) in [
+            (egui::pos2(x - 12.0, y - 9.0), egui::pos2(x + 12.0, y - 9.0)),
+            (egui::pos2(x + 12.0, y - 9.0), egui::pos2(x + 12.0, y + 6.0)),
+            (egui::pos2(x + 12.0, y + 6.0), egui::pos2(x - 12.0, y + 6.0)),
+            (egui::pos2(x - 12.0, y + 6.0), egui::pos2(x - 12.0, y - 9.0)),
+            (egui::pos2(x, y + 6.0), egui::pos2(x, y + 11.0)),
+            (egui::pos2(x - 6.0, y + 11.0), egui::pos2(x + 6.0, y + 11.0)),
+        ] {
+            painter.line_segment([a, b], stroke);
+        }
+    }
+}
+
 pub fn run(
     layout: &StateLayout,
     state: HostLaunchState,
     wake_rx: mpsc::UnboundedReceiver<()>,
     state_rx: mpsc::UnboundedReceiver<HostLaunchState>,
+    network_rx: watch::Receiver<HostNetworkState>,
+    helper_status_rx: watch::Receiver<HelperTunnelStatus>,
 ) -> Result<HostGuiAction, Box<dyn std::error::Error>> {
     let action = Arc::new(Mutex::new(None));
     let action_for_app = Arc::clone(&action);
@@ -38,8 +107,8 @@ pub fn run(
     let visuals = HostVisualAssets::load(layout, &state)?;
     let window_title = outfit.resources.window_title.clone();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([620.0, 430.0])
-        .with_min_inner_size([500.0, 320.0]);
+        .with_inner_size([780.0, 600.0])
+        .with_min_inner_size([620.0, 460.0]);
     if let Some(icon) = visuals.app_icon.as_ref() {
         viewport = viewport.with_icon(Arc::new(egui::IconData {
             rgba: icon.rgba.clone(),
@@ -63,6 +132,8 @@ pub fn run(
                 visuals,
                 wake_rx,
                 state_rx,
+                network_rx,
+                helper_status_rx,
                 action_for_app,
             )?))
         }),
@@ -197,6 +268,10 @@ struct HostApp {
     outfit: OutfitRuntimeView,
     wake_rx: mpsc::UnboundedReceiver<()>,
     state_rx: mpsc::UnboundedReceiver<HostLaunchState>,
+    network_rx: watch::Receiver<HostNetworkState>,
+    network_state: HostNetworkState,
+    helper_status_rx: watch::Receiver<HelperTunnelStatus>,
+    helper_status: HelperTunnelStatus,
     tray: Tray,
     app_icon: Option<egui::TextureHandle>,
     logo: Option<egui::TextureHandle>,
@@ -215,8 +290,11 @@ impl HostApp {
         visuals: HostVisualAssets,
         wake_rx: mpsc::UnboundedReceiver<()>,
         state_rx: mpsc::UnboundedReceiver<HostLaunchState>,
+        network_rx: watch::Receiver<HostNetworkState>,
+        helper_status_rx: watch::Receiver<HelperTunnelStatus>,
         action: Arc<Mutex<Option<HostGuiAction>>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        configure_light_theme(&cc.egui_ctx);
         let tooltip = state
             .site_name()
             .map(|name| format!("{} · {name}", outfit.resources.app_name))
@@ -249,12 +327,18 @@ impl HostApp {
             .as_ref()
             .map(|preview| preview_texture(&cc.egui_ctx, "host-key-visual", preview))
             .transpose()?;
+        let network_state = *network_rx.borrow();
+        let helper_status = *helper_status_rx.borrow();
         Ok(Self {
             layout,
             state,
             outfit,
             wake_rx,
             state_rx,
+            network_rx,
+            network_state,
+            helper_status_rx,
+            helper_status,
             tray,
             app_icon,
             logo,
@@ -301,6 +385,20 @@ impl HostApp {
         }
     }
 
+    fn poll_network_state(&mut self, ctx: &egui::Context) {
+        if self.network_rx.has_changed().unwrap_or(false) {
+            self.network_state = *self.network_rx.borrow_and_update();
+            ctx.request_repaint();
+        }
+    }
+
+    fn poll_helper_status(&mut self, ctx: &egui::Context) {
+        if self.helper_status_rx.has_changed().unwrap_or(false) {
+            self.helper_status = *self.helper_status_rx.borrow_and_update();
+            ctx.request_repaint();
+        }
+    }
+
     fn poll_dropped_site(&mut self, ctx: &egui::Context) {
         let dropped = ctx
             .input(|input| input.raw.dropped_files.clone())
@@ -339,6 +437,16 @@ impl HostApp {
     }
 }
 
+fn host_network_status_text(state: HostNetworkState) -> &'static str {
+    match state {
+        HostNetworkState::Offline => "Not connected to Controller A",
+        HostNetworkState::Connecting => "Connecting securely to Controller A",
+        HostNetworkState::Connected => "Connected to Controller A",
+        HostNetworkState::Reconnecting => "Connection lost — reconnecting to Controller A",
+        HostNetworkState::Unavailable => "Connection unavailable — Controller A is not reachable",
+    }
+}
+
 fn is_nearby_connector_file(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -356,9 +464,15 @@ impl Drop for HostApp {
 }
 
 impl eframe::App for HostApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [245.0 / 255.0, 247.0 / 255.0, 250.0 / 255.0, 1.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_state_updates(&ctx);
+        self.poll_network_state(&ctx);
+        self.poll_helper_status(&ctx);
         self.poll_wake_and_tray(&ctx);
         self.poll_dropped_site(&ctx);
         if ctx.input(|input| input.viewport().close_requested()) && !self.exit_requested {
@@ -366,6 +480,10 @@ impl eframe::App for HostApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
+        egui::ScrollArea::vertical()
+            .id_salt("host-main-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         let outfit = self.outfit.clone();
         let primary =
             parse_color(&outfit.primary_color).unwrap_or_else(|| ui.visuals().selection.bg_fill);
@@ -388,6 +506,19 @@ impl eframe::App for HostApp {
         }
         ui.add_space(8.0);
         let connector_only = self.state.is_connector_only();
+        let live_connected = self.network_state == HostNetworkState::Connected;
+        ui.horizontal(|ui| {
+            host_role_icon(ui, connector_only, live_connected);
+            ui.vertical(|ui| {
+                ui.strong(if connector_only {
+                    "Connection helper C"
+                } else {
+                    "Target B"
+                });
+                ui.label(host_network_status_text(self.network_state));
+            });
+        });
+        ui.add_space(10.0);
         match &self.state {
             HostLaunchState::Active { membership, .. } => {
                 ui.heading(&membership.marker.site_name);
@@ -401,15 +532,54 @@ impl eframe::App for HostApp {
                     membership.device.display_name, ready_text
                 ));
                 ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!(
+                        "Site Access Credential: {}",
+                        site_access_credential_id(membership.marker.invite_id)
+                    ));
+                    ui.small(format!("InviteId: {}", membership.marker.invite_id));
+                });
+                ui.small("This Credential ID should match the one shown on Controller A for this Site Kit.");
+                ui.add_space(8.0);
+                if !live_connected {
+                    ui.label("Enrollment is saved locally, but there is no authenticated live session with Controller A right now.");
+                    ui.add_space(6.0);
+                }
                 if connector_only {
-                    ui.strong("This computer only helps nearby computers connect.");
-                    ui.label("Its files and commands are not exposed to the Controller.");
+                    ui.strong("This computer is C — the connection helper.");
+                    ui.label("Its files and commands are not exposed to Controller A.");
+                    ui.label("Next: on private target B, open the same Site Kit and choose “Use this computer”.");
                     ui.label("Target-to-Controller content remains end-to-end protected through this helper.");
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(240, 253, 244))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.strong(format!(
+                                "Active target sessions: {}",
+                                self.helper_status.active_target_sessions
+                            ));
+                            if self.helper_status.active_bootstrap_tunnels > 0 {
+                                ui.small(format!(
+                                    "Enrollment tunnels in progress: {}",
+                                    self.helper_status.active_bootstrap_tunnels
+                                ));
+                            }
+                            ui.small(format!(
+                                "Target sessions served since launch: {}",
+                                self.helper_status.total_target_sessions
+                            ));
+                            ui.small("Helper C only sees tunnel lifecycle counts; target files, commands, and inner session contents remain encrypted end-to-end.");
+                        });
                 } else {
                     ui.label(format!("DeviceId: {}", membership.marker.device_id));
                     ui.label(
                         "Local identity restored. Closing this window only hides it to the tray.",
                     );
+                }
+                if connector_only {
+                    ui.small("If B cannot find C automatically, save the Nearby Connection File below and copy it from C to B.");
                 }
                 if membership.device.capabilities.connector
                     && ui.button("Save Nearby Connection File...").clicked()
@@ -447,9 +617,24 @@ impl eframe::App for HostApp {
             } => {
                 ui.heading(&site_file.payload.bootstrap.payload.site_name);
                 ui.label(&outfit.resources.awaiting_enrollment);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!(
+                        "Site Access Credential: {}",
+                        site_file.site_access_credential_id()
+                    ));
+                    ui.small(format!(
+                        "InviteId: {}",
+                        site_file.payload.bootstrap.payload.invite_id
+                    ));
+                });
+                ui.small("Before continuing, this Credential ID should match the one shown on Controller A.");
                 if connector_only {
-                    ui.strong("Connecting only as a nearby connection helper.");
-                    ui.label("This computer will not expose its files or commands.");
+                    ui.strong("Connecting as C — the nearby connection helper.");
+                    ui.label("C will not expose its files or commands to Controller A.");
+                    ui.label("Keep Clew running on C, then open the same Site Kit on private target B and choose “Use this computer”.");
+                } else {
+                    ui.strong("This computer is B — the target.");
+                    ui.label("If B can reach the Internet, no helper is needed. If B is private, keep this window open while C uses the same Site Kit in “Help nearby computers connect” mode.");
                 }
                 if let Some(texture) = &self.key_visual {
                     ui.add(egui::Image::new((
@@ -495,7 +680,12 @@ impl eframe::App for HostApp {
                 ui.add_space(8.0);
                 for candidate in candidates {
                     if ui
-                        .button(format!("{} · {}", candidate.site_name, candidate.device_id))
+                        .button(format!(
+                            "{} · {} · {}",
+                            candidate.site_name,
+                            site_access_credential_id(candidate.invite_id),
+                            candidate.device_id
+                        ))
                         .clicked()
                     {
                         self.request_action(
@@ -526,6 +716,7 @@ impl eframe::App for HostApp {
                 }
             });
         });
+            });
     }
 }
 
@@ -586,4 +777,33 @@ fn clew_icon() -> Result<Icon, tray_icon::BadIcon> {
         }
     }
     Icon::from_rgba(rgba, side, side)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_connection_copy_never_conflates_membership_with_connectivity() {
+        assert_eq!(
+            host_network_status_text(HostNetworkState::Offline),
+            "Not connected to Controller A"
+        );
+        assert_eq!(
+            host_network_status_text(HostNetworkState::Connecting),
+            "Connecting securely to Controller A"
+        );
+        assert_eq!(
+            host_network_status_text(HostNetworkState::Connected),
+            "Connected to Controller A"
+        );
+        assert_eq!(
+            host_network_status_text(HostNetworkState::Reconnecting),
+            "Connection lost — reconnecting to Controller A"
+        );
+        assert_eq!(
+            host_network_status_text(HostNetworkState::Unavailable),
+            "Connection unavailable — Controller A is not reachable"
+        );
+    }
 }

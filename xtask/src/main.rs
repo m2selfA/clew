@@ -528,7 +528,7 @@ fn build_site_kit_files(
         ),
         archive_file(
             "Message to collaborator.txt",
-            format!("{}\n", profile.distribution_copy.chat_message_template).into_bytes(),
+            site_kit_collaborator_message(&profile, platform).into_bytes(),
             0o644,
         ),
     ];
@@ -705,12 +705,25 @@ fn site_kit_start_html(profile: &OutfitProfile, platform: ReleasePlatform) -> St
         .map(|value| format!("<p>Support: {}</p>", html_escape(value)))
         .unwrap_or_default();
     let steps = if platform == ReleasePlatform::Windows {
-        "<ol><li>Double-click <b>Clew.exe</b> in this folder.</li><li>Choose <b>Use this computer</b> on the computer you want to access.</li><li>If it needs a nearby online helper, copy the same Site Kit there, open <b>Clew.exe</b>, and choose <b>Help nearby computers connect</b>.</li></ol>"
+        "<h2>Choose the setup that matches your network</h2><h3>A/B setup</h3><p>A is the Controller computer. B is the collaborator's target. If B can access the Internet: extract this Site Kit on B, open <b>Clew.exe</b>, and choose <b>Use this computer</b>.</p><h3>A/B/C setup</h3><p>A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Use this <b>same Site Kit</b> on B and C. On C, open <b>Clew.exe</b> and choose <b>Help nearby computers connect</b>. On B, open <b>Clew.exe</b> and choose <b>Use this computer</b>.</p>"
     } else {
-        "<ol><li>On the computer you want to use remotely, open the <b>1 Use this computer</b> launcher.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer and open the <b>2 Help nearby computers</b> launcher.</li></ol>"
+        "<h2>Choose the setup that matches your network</h2><h3>A/B setup</h3><p>A is the Controller computer. B is the collaborator's target. If B can access the Internet: extract this Site Kit on B and open <b>1 Use this computer</b>.</p><h3>A/B/C setup</h3><p>A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Use this <b>same Site Kit</b> on B and C. On C, open <b>2 Help nearby computers</b>. On B, open <b>1 Use this computer</b>.</p>"
     };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p>{steps}<p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p>{steps}<p><b>The connection helper is not a target.</b> It receives no file or shell authority and cannot read the end-to-end protected target session.</p><p>If a private target keeps waiting because local discovery is blocked, use <b>Save Nearby Connection File...</b> on the helper, copy <code>nearby-connection.clew</code> to the target, and drop it onto the target's Clew window.</p>{support}</body></html>\n"
+    )
+}
+
+fn site_kit_collaborator_message(profile: &OutfitProfile, platform: ReleasePlatform) -> String {
+    let steps = if platform == ReleasePlatform::Windows {
+        "A/B: A is the Controller. B is the collaborator's target. If B can access the Internet, extract this archive on B, open Clew.exe, and choose “Use this computer”.\n\nA/B/C: A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Extract this same archive on B and C. On C, open Clew.exe and choose “Help nearby computers connect”. On B, open Clew.exe and choose “Use this computer”."
+    } else {
+        "A/B: A is the Controller. B is the collaborator's target. If B can access the Internet, extract this archive on B and open “1 Use this computer”.\n\nA/B/C: A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Extract this same archive on B and C. On C, open “2 Help nearby computers”. On B, open “1 Use this computer”."
+    };
+    format!(
+        "{}\n\n{}\n\nThe connection helper does not expose its files or commands. If the private target cannot find the helper automatically, use “Save Nearby Connection File...” on the helper and copy nearby-connection.clew to the target.\n",
+        profile.distribution_copy.chat_message_template.trim(),
+        steps
     )
 }
 
@@ -2855,6 +2868,44 @@ fn pe_subsystem(bytes: &[u8]) -> Result<u16, Box<dyn Error>> {
     ))
 }
 
+fn pe_stack_reserve(bytes: &[u8]) -> Result<u64, Box<dyn Error>> {
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        return Err("Windows executable is not a bounded PE image".into());
+    }
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into()?) as usize;
+    let optional_header = pe_offset
+        .checked_add(24)
+        .ok_or("PE optional-header offset overflow")?;
+    if pe_offset.checked_add(4).is_none_or(|end| end > bytes.len())
+        || &bytes[pe_offset..pe_offset + 4] != b"PE\0\0"
+        || optional_header
+            .checked_add(2)
+            .is_none_or(|end| end > bytes.len())
+    {
+        return Err("Windows executable has an invalid PE header".into());
+    }
+    let magic = u16::from_le_bytes(bytes[optional_header..optional_header + 2].try_into()?);
+    let width = match magic {
+        0x10b => 4,
+        0x20b => 8,
+        _ => return Err("Windows executable has an unsupported PE optional header".into()),
+    };
+    let stack_offset = optional_header
+        .checked_add(72)
+        .ok_or("PE stack-reserve offset overflow")?;
+    if stack_offset
+        .checked_add(width)
+        .is_none_or(|end| end > bytes.len())
+    {
+        return Err("Windows executable has an invalid PE stack-reserve field".into());
+    }
+    Ok(if width == 4 {
+        u32::from_le_bytes(bytes[stack_offset..stack_offset + 4].try_into()?) as u64
+    } else {
+        u64::from_le_bytes(bytes[stack_offset..stack_offset + 8].try_into()?)
+    })
+}
+
 fn verify_windows_entrypoint_subsystems(
     root: &Path,
     payload: &PayloadManifest,
@@ -2869,6 +2920,12 @@ fn verify_windows_entrypoint_subsystems(
     let cli = fs::read(root.join(&payload.cli_binary))?;
     if pe_subsystem(&cli)? != 3 {
         return Err("Windows background/CLI runtime must retain the console subsystem".into());
+    }
+    if pe_stack_reserve(&cli)? < 8 * 1024 * 1024 {
+        return Err(
+            "Windows background/CLI runtime must reserve at least 8 MiB of main-thread stack"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -3740,21 +3797,28 @@ mod tests {
     }
 
     #[test]
-    fn pe_subsystem_parser_distinguishes_gui_and_console_images() {
-        fn image(subsystem: u16) -> Vec<u8> {
+    fn pe_runtime_parser_distinguishes_subsystems_and_stack_reserve() {
+        fn image(subsystem: u16, stack_reserve: u64) -> Vec<u8> {
             let mut bytes = vec![0_u8; 0x120];
             bytes[..2].copy_from_slice(b"MZ");
             bytes[0x3c..0x40].copy_from_slice(&(0x80_u32).to_le_bytes());
             bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
             let optional = 0x80 + 24;
             bytes[optional..optional + 2].copy_from_slice(&0x20b_u16.to_le_bytes());
-            let offset = optional + 68;
-            bytes[offset..offset + 2].copy_from_slice(&subsystem.to_le_bytes());
+            let subsystem_offset = optional + 68;
+            bytes[subsystem_offset..subsystem_offset + 2].copy_from_slice(&subsystem.to_le_bytes());
+            let stack_offset = optional + 72;
+            bytes[stack_offset..stack_offset + 8].copy_from_slice(&stack_reserve.to_le_bytes());
             bytes
         }
-        assert_eq!(pe_subsystem(&image(2)).unwrap(), 2);
-        assert_eq!(pe_subsystem(&image(3)).unwrap(), 3);
+        let gui = image(2, 1 * 1024 * 1024);
+        let cli = image(3, 8 * 1024 * 1024);
+        assert_eq!(pe_subsystem(&gui).unwrap(), 2);
+        assert_eq!(pe_subsystem(&cli).unwrap(), 3);
+        assert_eq!(pe_stack_reserve(&gui).unwrap(), 1 * 1024 * 1024);
+        assert_eq!(pe_stack_reserve(&cli).unwrap(), 8 * 1024 * 1024);
         assert!(pe_subsystem(b"not-pe").is_err());
+        assert!(pe_stack_reserve(b"not-pe").is_err());
     }
 
     #[test]

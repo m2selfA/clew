@@ -25,6 +25,7 @@ use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
+use crate::lan_discovery::{LanConnectorResponder, discover_lan_connector_candidates};
 use crate::{
     HostDirectoryTreeService, HostFileTransferService, HostLaunchState, HostMembership,
     HostMembershipStore, HostReadService, HostShellService, HostTcpForwardService,
@@ -40,17 +41,108 @@ const MAX_CONNECTOR_CANDIDATES_PER_WINDOW: usize = 32;
 const CONNECTOR_CANDIDATE_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECTOR_PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HostNetworkState {
+    #[default]
+    Offline,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HelperTunnelStatus {
+    pub active_bootstrap_tunnels: u32,
+    pub active_target_sessions: u32,
+    pub total_target_sessions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HostConnectionMode {
+    #[default]
+    Automatic,
+    ConnectorRequired,
+}
+
+fn publish_network_state(
+    status_tx: Option<&watch::Sender<HostNetworkState>>,
+    state: HostNetworkState,
+) {
+    if let Some(status_tx) = status_tx {
+        status_tx.send_replace(state);
+    }
+}
+
+fn publish_helper_tunnel_start(
+    status_tx: Option<&watch::Sender<HelperTunnelStatus>>,
+    purpose: ConnectorTunnelPurpose,
+) -> HelperTunnelGuard {
+    if let Some(status_tx) = status_tx {
+        status_tx.send_modify(|status| match purpose {
+            ConnectorTunnelPurpose::Bootstrap => {
+                status.active_bootstrap_tunnels = status.active_bootstrap_tunnels.saturating_add(1);
+            }
+            ConnectorTunnelPurpose::InnerSession => {
+                status.active_target_sessions = status.active_target_sessions.saturating_add(1);
+                status.total_target_sessions = status.total_target_sessions.saturating_add(1);
+            }
+        });
+    }
+    HelperTunnelGuard {
+        status_tx: status_tx.cloned(),
+        purpose,
+    }
+}
+
+fn clear_active_helper_tunnels(status_tx: Option<&watch::Sender<HelperTunnelStatus>>) {
+    if let Some(status_tx) = status_tx {
+        status_tx.send_modify(|status| {
+            status.active_bootstrap_tunnels = 0;
+            status.active_target_sessions = 0;
+        });
+    }
+}
+
+struct HelperTunnelGuard {
+    status_tx: Option<watch::Sender<HelperTunnelStatus>>,
+    purpose: ConnectorTunnelPurpose,
+}
+
+impl Drop for HelperTunnelGuard {
+    fn drop(&mut self) {
+        if let Some(status_tx) = &self.status_tx {
+            status_tx.send_modify(|status| match self.purpose {
+                ConnectorTunnelPurpose::Bootstrap => {
+                    status.active_bootstrap_tunnels =
+                        status.active_bootstrap_tunnels.saturating_sub(1);
+                }
+                ConnectorTunnelPurpose::InnerSession => {
+                    status.active_target_sessions = status.active_target_sessions.saturating_sub(1);
+                }
+            });
+        }
+    }
+}
+
 pub async fn complete_networked_activation(
     layout: &StateLayout,
     state: HostLaunchState,
 ) -> Result<HostLaunchState, HostRemoteError> {
-    complete_networked_activation_with_window(layout, state, INITIAL_BOOTSTRAP_PATH_WINDOW).await
+    complete_networked_activation_with_window(
+        layout,
+        state,
+        INITIAL_BOOTSTRAP_PATH_WINDOW,
+        HostConnectionMode::Automatic,
+    )
+    .await
 }
 
 async fn complete_networked_activation_with_window(
     layout: &StateLayout,
     state: HostLaunchState,
     path_window: Duration,
+    connection_mode: HostConnectionMode,
 ) -> Result<HostLaunchState, HostRemoteError> {
     match state {
         HostLaunchState::AwaitingEnrollment {
@@ -65,8 +157,13 @@ async fn complete_networked_activation_with_window(
             if let Some(membership) =
                 HostMembershipStore::new(layout.clone()).load(controller.controller_id, site_id)?
             {
-                resume_pending_controller_activation_with_window(layout, &membership, path_window)
-                    .await?;
+                resume_pending_controller_activation_with_window(
+                    layout,
+                    &membership,
+                    path_window,
+                    connection_mode,
+                )
+                .await?;
                 return Ok(HostLaunchState::Active { membership, source });
             }
             let endpoint = site_file.payload.controller_endpoint.clone();
@@ -93,6 +190,7 @@ async fn complete_networked_activation_with_window(
                 site_id,
                 site_file.payload.controller_bootstrap_noise_public_key,
                 path_window,
+                connection_mode,
             )
             .await?;
             channel
@@ -151,8 +249,13 @@ async fn complete_networked_activation_with_window(
             Ok(HostLaunchState::Active { membership, source })
         }
         HostLaunchState::Active { membership, source } => {
-            resume_pending_controller_activation_with_window(layout, &membership, path_window)
-                .await?;
+            resume_pending_controller_activation_with_window(
+                layout,
+                &membership,
+                path_window,
+                connection_mode,
+            )
+            .await?;
             Ok(HostLaunchState::Active { membership, source })
         }
         other => Ok(other),
@@ -176,6 +279,7 @@ async fn resume_pending_controller_activation_with_window(
     layout: &StateLayout,
     membership: &HostMembership,
     path_window: Duration,
+    connection_mode: HostConnectionMode,
 ) -> Result<(), HostRemoteError> {
     let identity_store = DeviceIdentityStore::new(layout.clone());
     let Some(activation) = identity_store.load_pending_controller_activation(
@@ -204,6 +308,7 @@ async fn resume_pending_controller_activation_with_window(
         membership.marker.site_id,
         membership.marker.controller_bootstrap_noise_public_key,
         path_window,
+        connection_mode,
     )
     .await?;
     channel
@@ -236,28 +341,69 @@ pub async fn wait_for_networked_activation_until(
     state: HostLaunchState,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Option<HostLaunchState>, HostRemoteError> {
-    wait_for_networked_activation_until_with_timing(
+    wait_for_networked_activation_until_with_connection_mode(
+        layout,
+        state,
+        shutdown,
+        HostConnectionMode::Automatic,
+    )
+    .await
+}
+
+pub async fn wait_for_networked_activation_until_with_connection_mode(
+    layout: &StateLayout,
+    state: HostLaunchState,
+    shutdown: watch::Receiver<bool>,
+    connection_mode: HostConnectionMode,
+) -> Result<Option<HostLaunchState>, HostRemoteError> {
+    wait_for_networked_activation_until_with_timing_and_mode(
         layout,
         state,
         shutdown,
         INITIAL_BOOTSTRAP_PATH_WINDOW,
         Duration::from_secs(1),
+        connection_mode,
     )
     .await
 }
 
+#[cfg(test)]
 async fn wait_for_networked_activation_until_with_timing(
+    layout: &StateLayout,
+    state: HostLaunchState,
+    shutdown: watch::Receiver<bool>,
+    path_window: Duration,
+    retry_delay: Duration,
+) -> Result<Option<HostLaunchState>, HostRemoteError> {
+    wait_for_networked_activation_until_with_timing_and_mode(
+        layout,
+        state,
+        shutdown,
+        path_window,
+        retry_delay,
+        HostConnectionMode::Automatic,
+    )
+    .await
+}
+
+async fn wait_for_networked_activation_until_with_timing_and_mode(
     layout: &StateLayout,
     mut state: HostLaunchState,
     mut shutdown: watch::Receiver<bool>,
     path_window: Duration,
     retry_delay: Duration,
+    connection_mode: HostConnectionMode,
 ) -> Result<Option<HostLaunchState>, HostRemoteError> {
     loop {
         if *shutdown.borrow() {
             return Ok(None);
         }
-        let attempt = complete_networked_activation_with_window(layout, state.clone(), path_window);
+        let attempt = complete_networked_activation_with_window(
+            layout,
+            state.clone(),
+            path_window,
+            connection_mode,
+        );
         tokio::pin!(attempt);
         let result = tokio::select! {
             changed = shutdown.changed() => {
@@ -294,7 +440,15 @@ pub async fn serve_networked_membership_until<F>(
 where
     F: Future<Output = ()>,
 {
-    serve_networked_membership_until_inner(membership, None, shutdown).await
+    serve_networked_membership_until_inner(
+        membership,
+        None,
+        shutdown,
+        None,
+        HostConnectionMode::Automatic,
+        None,
+    )
+    .await
 }
 
 pub async fn serve_networked_membership_until_with_layout<F>(
@@ -305,28 +459,150 @@ pub async fn serve_networked_membership_until_with_layout<F>(
 where
     F: Future<Output = ()>,
 {
-    serve_networked_membership_until_inner(membership, Some(layout), shutdown).await
+    serve_networked_membership_until_inner(
+        membership,
+        Some(layout),
+        shutdown,
+        None,
+        HostConnectionMode::Automatic,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_networked_membership_until_with_layout_mode<F>(
+    layout: &StateLayout,
+    membership: &HostMembership,
+    shutdown: F,
+    connection_mode: HostConnectionMode,
+) -> Result<(), HostRemoteError>
+where
+    F: Future<Output = ()>,
+{
+    serve_networked_membership_until_inner(
+        membership,
+        Some(layout),
+        shutdown,
+        None,
+        connection_mode,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_networked_membership_until_with_layout_and_status<F>(
+    layout: &StateLayout,
+    membership: &HostMembership,
+    shutdown: F,
+    status_tx: watch::Sender<HostNetworkState>,
+) -> Result<(), HostRemoteError>
+where
+    F: Future<Output = ()>,
+{
+    serve_networked_membership_until_inner(
+        membership,
+        Some(layout),
+        shutdown,
+        Some(status_tx),
+        HostConnectionMode::Automatic,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_networked_membership_until_with_layout_and_status_mode<F>(
+    layout: &StateLayout,
+    membership: &HostMembership,
+    shutdown: F,
+    status_tx: watch::Sender<HostNetworkState>,
+    connection_mode: HostConnectionMode,
+) -> Result<(), HostRemoteError>
+where
+    F: Future<Output = ()>,
+{
+    serve_networked_membership_until_inner(
+        membership,
+        Some(layout),
+        shutdown,
+        Some(status_tx),
+        connection_mode,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_networked_membership_until_with_layout_and_status_mode_and_helper_status<F>(
+    layout: &StateLayout,
+    membership: &HostMembership,
+    shutdown: F,
+    status_tx: watch::Sender<HostNetworkState>,
+    helper_status_tx: watch::Sender<HelperTunnelStatus>,
+    connection_mode: HostConnectionMode,
+) -> Result<(), HostRemoteError>
+where
+    F: Future<Output = ()>,
+{
+    serve_networked_membership_until_inner(
+        membership,
+        Some(layout),
+        shutdown,
+        Some(status_tx),
+        connection_mode,
+        Some(helper_status_tx),
+    )
+    .await
 }
 
 async fn serve_networked_membership_until_inner<F>(
     membership: &HostMembership,
     layout: Option<&StateLayout>,
     shutdown: F,
+    status_tx: Option<watch::Sender<HostNetworkState>>,
+    connection_mode: HostConnectionMode,
+    helper_status_tx: Option<watch::Sender<HelperTunnelStatus>>,
 ) -> Result<(), HostRemoteError>
 where
     F: Future<Output = ()>,
 {
+    publish_network_state(status_tx.as_ref(), HostNetworkState::Connecting);
     let (endpoint, service, shell_service, file_transfer_service) =
-        member_remote_config(membership, layout)?;
+        match member_remote_config(membership, layout) {
+            Ok(config) => config,
+            Err(error) => {
+                publish_network_state(status_tx.as_ref(), HostNetworkState::Unavailable);
+                return Err(error);
+            }
+        };
     tokio::pin!(shutdown);
     let outer = tokio::select! {
-        _ = &mut shutdown => return Ok(()),
-        result = IrohOuter::bind() => result?,
+        _ = &mut shutdown => {
+            publish_network_state(status_tx.as_ref(), HostNetworkState::Offline);
+            return Ok(());
+        },
+        result = IrohOuter::bind() => match result {
+            Ok(outer) => outer,
+            Err(error) => {
+                publish_network_state(status_tx.as_ref(), HostNetworkState::Unavailable);
+                return Err(error.into());
+            }
+        },
     };
+    let mut connected_once = false;
     loop {
+        publish_network_state(
+            status_tx.as_ref(),
+            if connected_once {
+                HostNetworkState::Reconnecting
+            } else {
+                HostNetworkState::Connecting
+            },
+        );
         let result = tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            result = serve_networked_membership_with_outer(
+            _ = &mut shutdown => {
+                publish_network_state(status_tx.as_ref(), HostNetworkState::Offline);
+                return Ok(());
+            },
+            result = serve_networked_membership_with_outer_timing_mode(
                 membership,
                 &outer,
                 endpoint.clone(),
@@ -334,16 +610,36 @@ where
                 &shell_service,
                 &file_transfer_service,
                 layout,
+                CONNECTOR_PRESENCE_REFRESH_INTERVAL,
+                status_tx.as_ref(),
+                connection_mode,
+                helper_status_tx.as_ref(),
             ) => result,
         };
+        clear_active_helper_tunnels(helper_status_tx.as_ref());
+        connected_once |= status_tx
+            .as_ref()
+            .is_some_and(|status_tx| *status_tx.borrow() == HostNetworkState::Connected);
         if matches!(
             result,
             Err(HostRemoteError::MissingNetworkConfig | HostRemoteError::ExecutionDisabled)
         ) {
+            publish_network_state(status_tx.as_ref(), HostNetworkState::Unavailable);
             return result;
         }
+        publish_network_state(
+            status_tx.as_ref(),
+            if connected_once {
+                HostNetworkState::Reconnecting
+            } else {
+                HostNetworkState::Connecting
+            },
+        );
         tokio::select! {
-            _ = &mut shutdown => return Ok(()),
+            _ = &mut shutdown => {
+                publish_network_state(status_tx.as_ref(), HostNetworkState::Offline);
+                return Ok(());
+            },
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
@@ -443,11 +739,18 @@ fn member_remote_config(
         } else {
             None
         };
-        (
-            Some(HostReadService::new(policy)?),
-            shell_service,
-            file_transfer_service,
-        )
+        let read_service = match layout {
+            Some(layout) => HostReadService::with_managed_root(
+                policy,
+                layout.host_managed_fs_root(
+                    membership.marker.controller.controller_id,
+                    membership.marker.site_id,
+                    membership.marker.device_id,
+                ),
+            )?,
+            None => HostReadService::new(policy)?,
+        };
+        (Some(read_service), shell_service, file_transfer_service)
     } else {
         (None, None, None)
     };
@@ -592,17 +895,23 @@ async fn connect_bootstrap_channel(
     site_id: SiteId,
     controller_bootstrap_noise_public_key: Option<[u8; 32]>,
     path_window: Duration,
+    connection_mode: HostConnectionMode,
 ) -> Result<HostBootstrapChannel, HostRemoteError> {
     let mut direct_tasks = JoinSet::new();
-    let direct_outer = outer.clone();
-    direct_tasks.spawn(async move {
-        direct_outer
-            .connect_bootstrap(controller_endpoint)
-            .await
-            .map_err(HostRemoteError::from)
-    });
+    if connection_mode == HostConnectionMode::Automatic {
+        let direct_outer = outer.clone();
+        direct_tasks.spawn(async move {
+            direct_outer
+                .connect_bootstrap(controller_endpoint)
+                .await
+                .map_err(HostRemoteError::from)
+        });
+    }
 
     let Some(bootstrap_key) = controller_bootstrap_noise_public_key else {
+        if connection_mode == HostConnectionMode::ConnectorRequired {
+            return Err(HostRemoteError::BootstrapPathUnavailable);
+        }
         return match tokio::time::timeout(path_window, direct_tasks.join_next()).await {
             Ok(Some(Ok(Ok(stream)))) => Ok(HostBootstrapChannel::Direct(stream)),
             Ok(Some(Ok(Err(error)))) => Err(error),
@@ -612,9 +921,15 @@ async fn connect_bootstrap_channel(
     };
 
     let discovery =
-        MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
-    let mut events = discovery.subscribe().await;
+        MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false).ok();
+    let mut events = match discovery.as_ref() {
+        Some(discovery) => Some(discovery.subscribe().await),
+        None => None,
+    };
     let mut candidates = ConnectorCandidateQueue::default();
+    let lan_discovery = discover_lan_connector_candidates(controller.controller_id, site_id);
+    tokio::pin!(lan_discovery);
+    let mut lan_discovery_done = false;
     if let Some(candidate) = NearbyConnectorStore::new(layout.clone())
         .load_import(&controller, site_id)
         .ok()
@@ -634,7 +949,7 @@ async fn connect_bootstrap_channel(
     );
     let deadline = tokio::time::sleep(path_window);
     tokio::pin!(deadline);
-    let mut direct_done = false;
+    let mut direct_done = connection_mode == HostConnectionMode::ConnectorRequired;
 
     loop {
         tokio::select! {
@@ -665,7 +980,26 @@ async fn connect_bootstrap_channel(
                     }
                 }
             }
-            event = events.next() => {
+            discovered = &mut lan_discovery, if !lan_discovery_done => {
+                lan_discovery_done = true;
+                for candidate in discovered {
+                    candidates.push(candidate.addr);
+                }
+                fill_bootstrap_candidate_dials(
+                    &mut candidate_tasks,
+                    &mut candidates,
+                    outer,
+                    controller,
+                    site_id,
+                    bootstrap_key,
+                );
+            }
+            event = async {
+                match events.as_mut() {
+                    Some(events) => events.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let Some(event) = event else {
                     continue;
                 };
@@ -728,19 +1062,28 @@ async fn connect_member_stream(
     controller_endpoint: EndpointAddr,
     controller: ControllerPublicIdentity,
     site_id: SiteId,
+    connection_mode: HostConnectionMode,
 ) -> Result<(clew_transport::IrohStream, MemberOuterPath), HostRemoteError> {
     let mut direct_tasks = JoinSet::new();
-    let direct_outer = outer.clone();
-    direct_tasks.spawn(async move {
-        direct_outer
-            .connect(controller_endpoint)
-            .await
-            .map_err(HostRemoteError::from)
-    });
+    if connection_mode == HostConnectionMode::Automatic {
+        let direct_outer = outer.clone();
+        direct_tasks.spawn(async move {
+            direct_outer
+                .connect(controller_endpoint)
+                .await
+                .map_err(HostRemoteError::from)
+        });
+    }
     let discovery =
-        MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false)?;
-    let mut events = discovery.subscribe().await;
+        MdnsConnectorDiscovery::attach(outer, controller.controller_id, site_id, false).ok();
+    let mut events = match discovery.as_ref() {
+        Some(discovery) => Some(discovery.subscribe().await),
+        None => None,
+    };
     let mut candidates = ConnectorCandidateQueue::default();
+    let lan_discovery = discover_lan_connector_candidates(controller.controller_id, site_id);
+    tokio::pin!(lan_discovery);
+    let mut lan_discovery_done = false;
     if let Some(candidate) = layout
         .and_then(|layout| {
             NearbyConnectorStore::new(layout.clone())
@@ -762,7 +1105,7 @@ async fn connect_member_stream(
     );
     let deadline = tokio::time::sleep(ACTIVE_MEMBER_PATH_WINDOW);
     tokio::pin!(deadline);
-    let mut direct_done = false;
+    let mut direct_done = connection_mode == HostConnectionMode::ConnectorRequired;
 
     loop {
         tokio::select! {
@@ -792,7 +1135,25 @@ async fn connect_member_stream(
                     }
                 }
             }
-            event = events.next() => {
+            discovered = &mut lan_discovery, if !lan_discovery_done => {
+                lan_discovery_done = true;
+                for candidate in discovered {
+                    candidates.push(candidate.addr);
+                }
+                fill_member_candidate_dials(
+                    &mut candidate_tasks,
+                    &mut candidates,
+                    outer,
+                    controller,
+                    site_id,
+                );
+            }
+            event = async {
+                match events.as_mut() {
+                    Some(events) => events.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let Some(event) = event else {
                     continue;
                 };
@@ -850,6 +1211,7 @@ async fn serve_networked_membership_with_outer(
         file_transfer_service,
         layout,
         CONNECTOR_PRESENCE_REFRESH_INTERVAL,
+        None,
     )
     .await
 }
@@ -887,6 +1249,36 @@ async fn serve_networked_membership_with_outer_timing(
     file_transfer_service: &Option<HostFileTransferService>,
     layout: Option<&StateLayout>,
     presence_refresh_interval: Duration,
+    status_tx: Option<&watch::Sender<HostNetworkState>>,
+) -> Result<(), HostRemoteError> {
+    serve_networked_membership_with_outer_timing_mode(
+        membership,
+        outer,
+        endpoint,
+        service,
+        shell_service,
+        file_transfer_service,
+        layout,
+        presence_refresh_interval,
+        status_tx,
+        HostConnectionMode::Automatic,
+        None,
+    )
+    .await
+}
+
+async fn serve_networked_membership_with_outer_timing_mode(
+    membership: &HostMembership,
+    outer: &IrohOuter,
+    endpoint: EndpointAddr,
+    service: &Option<HostReadService>,
+    shell_service: &Option<HostShellService>,
+    file_transfer_service: &Option<HostFileTransferService>,
+    layout: Option<&StateLayout>,
+    presence_refresh_interval: Duration,
+    status_tx: Option<&watch::Sender<HostNetworkState>>,
+    connection_mode: HostConnectionMode,
+    helper_status_tx: Option<&watch::Sender<HelperTunnelStatus>>,
 ) -> Result<(), HostRemoteError> {
     let (mut stream, outer_path) = connect_member_stream(
         layout,
@@ -894,6 +1286,7 @@ async fn serve_networked_membership_with_outer_timing(
         endpoint.clone(),
         membership.marker.controller,
         membership.marker.site_id,
+        connection_mode,
     )
     .await?;
     let mut inner = InnerSession::connect(
@@ -907,6 +1300,7 @@ async fn serve_networked_membership_with_outer_timing(
         membership.device.capabilities.connector && outer_path == MemberOuterPath::Direct;
     let mut connector_discovery = None;
     let mut connector_lease = None;
+    let mut _lan_connector_responder = None;
     let mut presence_refresh_at = Instant::now() + Duration::from_secs(24 * 60 * 60);
     let renew_at = if connector {
         let message = inner.recv(&mut stream).await?;
@@ -924,19 +1318,42 @@ async fn serve_networked_membership_with_outer_timing(
         let remaining_ms = lease.payload.expires_unix_ms.saturating_sub(now);
         let renew_margin_ms = CONNECTOR_LEASE_RENEW_MARGIN.as_millis() as u64;
         let renew_in_ms = remaining_ms.saturating_sub(renew_margin_ms).max(1_000);
-        connector_discovery = Some(MdnsConnectorDiscovery::attach(
+        connector_discovery = MdnsConnectorDiscovery::attach(
             outer,
             membership.marker.controller.controller_id,
             membership.marker.site_id,
             true,
-        )?);
+        )
+        .ok();
+        // mDNS is an optional LAN convenience, not an authority or connectivity gate. Even
+        // when multicast initialization is unavailable, keep the authenticated C->A session
+        // alive and publish the signed nearby-file fallback so private B can still reach C.
         save_connector_export(layout, membership, outer, &lease);
+        _lan_connector_responder = LanConnectorResponder::start(
+            outer.clone(),
+            membership.marker.controller.controller_id,
+            membership.marker.site_id,
+        )
+        .await;
         connector_lease = Some(lease);
         presence_refresh_at = Instant::now() + presence_refresh_interval;
         Instant::now() + Duration::from_millis(renew_in_ms)
     } else {
         Instant::now() + Duration::from_secs(24 * 60 * 60)
     };
+    // InnerSession authentication proves the pinned Controller identity, but r8 only calls the
+    // Host live after A has also registered this exact device generation in RemoteHub. The
+    // Controller sends an immediate session_ping only after register(); older Controllers send
+    // the same heartbeat within five seconds, preserving rolling compatibility.
+    let first_registered_message =
+        tokio::time::timeout(Duration::from_secs(8), inner.recv(&mut stream))
+            .await
+            .map_err(|_| HostRemoteError::ControllerSessionReadyTimeout)??;
+    // A heartbeat is the normal r8 proof, while a valid RPC from an older Controller is equally
+    // strong evidence: Controller commands can only be emitted after that device is registered in
+    // RemoteHub. Preserve the first message so rolling upgrades never drop a real command.
+    let mut pending_registered_message = Some(first_registered_message);
+    publish_network_state(status_tx, HostNetworkState::Connected);
 
     let mut tunnels = JoinSet::new();
     let read_allowed = membership
@@ -979,7 +1396,13 @@ async fn serve_networked_membership_with_outer_timing(
     };
     loop {
         tokio::select! {
-            message = inner.recv(&mut stream) => {
+            message = async {
+                if let Some(message) = pending_registered_message.take() {
+                    Ok(message)
+                } else {
+                    inner.recv(&mut stream).await.map_err(HostRemoteError::from)
+                }
+            } => {
                 let message = message?;
                 if message.kind == "session_ping" {
                     let reply = InnerMessage::new("session_pong", message.payload)?;
@@ -1131,6 +1554,7 @@ async fn serve_networked_membership_with_outer_timing(
                 let controller = membership.marker.controller;
                 let site_id = membership.marker.site_id;
                 let device_id = membership.marker.device_id;
+                let helper_status_tx = helper_status_tx.cloned();
                 tunnels.spawn(async move {
                     serve_one_connector_tunnel(
                         &outer,
@@ -1140,6 +1564,7 @@ async fn serve_networked_membership_with_outer_timing(
                         site_id,
                         device_id,
                         lease,
+                        helper_status_tx,
                     )
                     .await
                 });
@@ -1203,6 +1628,7 @@ async fn serve_one_connector_tunnel(
     site_id: SiteId,
     device_id: DeviceId,
     lease: SignedConnectorLease,
+    helper_status_tx: Option<watch::Sender<HelperTunnelStatus>>,
 ) -> Result<(), HostRemoteError> {
     let request = read_connector_open(&mut inbound).await?;
     let expected_tag = SiteDiscoveryTag::derive(controller.controller_id, site_id);
@@ -1214,6 +1640,7 @@ async fn serve_one_connector_tunnel(
     if lease_device != device_id {
         return Err(HostRemoteError::ConnectorLeaseDeviceMismatch);
     }
+    let _tunnel_guard = publish_helper_tunnel_start(helper_status_tx.as_ref(), request.purpose);
 
     let mut outbound = outer.connect_connector(controller_endpoint).await?;
     write_connector_open(&mut outbound, &request).await?;
@@ -1303,6 +1730,8 @@ pub enum HostRemoteError {
     ActivationScopeMismatch,
     #[error("Controller returned an unexpected bootstrap response")]
     UnexpectedBootstrapResponse,
+    #[error("Controller did not confirm A-side session registration before timeout")]
+    ControllerSessionReadyTimeout,
     #[error("Controller rejected bootstrap ({code:?}): {message}")]
     BootstrapRejected {
         code: BootstrapErrorCode,
@@ -1381,6 +1810,24 @@ mod tests {
     };
     use iroh::{EndpointAddr, SecretKey};
     use tempfile::tempdir;
+
+    #[test]
+    fn helper_tunnel_status_tracks_lifecycle_without_target_plaintext() {
+        let (tx, rx) = watch::channel(HelperTunnelStatus::default());
+        let bootstrap = publish_helper_tunnel_start(Some(&tx), ConnectorTunnelPurpose::Bootstrap);
+        assert_eq!(rx.borrow().active_bootstrap_tunnels, 1);
+        assert_eq!(rx.borrow().active_target_sessions, 0);
+        let target = publish_helper_tunnel_start(Some(&tx), ConnectorTunnelPurpose::InnerSession);
+        assert_eq!(rx.borrow().active_bootstrap_tunnels, 1);
+        assert_eq!(rx.borrow().active_target_sessions, 1);
+        assert_eq!(rx.borrow().total_target_sessions, 1);
+        drop(bootstrap);
+        assert_eq!(rx.borrow().active_bootstrap_tunnels, 0);
+        assert_eq!(rx.borrow().active_target_sessions, 1);
+        drop(target);
+        assert_eq!(rx.borrow().active_target_sessions, 0);
+        assert_eq!(rx.borrow().total_target_sessions, 1);
+    }
 
     async fn rpc_roundtrip(
         inner: &mut InnerSession,
@@ -1596,10 +2043,23 @@ mod tests {
                     .send(&mut stream, &lease.into_message().unwrap())
                     .await
                     .unwrap();
+                let ready_payload = 1_u64.to_le_bytes().to_vec();
+                inner
+                    .send(
+                        &mut stream,
+                        &InnerMessage::new("session_ping", ready_payload.clone()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let ready = inner.recv(&mut stream).await.unwrap();
+                assert_eq!(ready.kind, "session_pong");
+                assert_eq!(ready.payload, ready_payload);
                 let _ = controller_release_rx.await;
             }
         });
 
+        let (status_tx, status_rx) = watch::channel(HostNetworkState::Offline);
+        assert_eq!(*status_rx.borrow(), HostNetworkState::Offline);
         let host_task = tokio::spawn({
             let layout = layout.clone();
             let membership = membership.clone();
@@ -1615,6 +2075,7 @@ mod tests {
                     &None,
                     Some(&layout),
                     Duration::from_millis(100),
+                    Some(&status_tx),
                 )
                 .await
             }
@@ -1628,6 +2089,11 @@ mod tests {
         })
         .await
         .expect("initial Connector export was not created");
+        assert_eq!(
+            *status_rx.borrow(),
+            HostNetworkState::Connected,
+            "Connector C must publish Connected only after the authenticated session and signed lease are ready"
+        );
         std::fs::remove_file(&export_path).unwrap();
         assert!(!export_path.exists());
 
@@ -1657,6 +2123,152 @@ mod tests {
             .expect_err("single-session helper unexpectedly stayed alive after Controller close");
         host_outer.close().await;
         controller_outer.close().await;
+    }
+
+    #[tokio::test]
+    async fn live_status_becomes_reconnecting_after_authenticated_controller_session_drops() {
+        let temp = tempdir().unwrap();
+        let layout = StateLayout::new(temp.path().join("live-status-state"));
+        let controller = ControllerIdentity::from_secret([109_u8; 32]);
+        let controller_public = controller.public_identity();
+        let site_id = SiteId::new();
+        let invite_id = InviteId::new();
+        let now = unix_ms().unwrap();
+        let mut registry =
+            EnrollmentRegistry::new(controller.controller_id(), PermissionGrant::EXECUTE_READ);
+        let bootstrap = registry
+            .issue_bootstrap(
+                &controller,
+                SiteBootstrapSpec {
+                    site_id,
+                    invite_id,
+                    site_name: "Live Status Lab".into(),
+                    grant: PermissionGrant::EXECUTE_READ,
+                    not_before_unix_ms: now.saturating_sub(1_000),
+                    expires_unix_ms: now + 120_000,
+                    deployment_window_ms: 120_000,
+                    max_claims: 1,
+                },
+            )
+            .unwrap();
+        let pending = DeviceIdentityStore::new(layout.clone())
+            .prepare_pending(controller_public, site_id, invite_id)
+            .unwrap();
+        let receipt = registry
+            .claim(&bootstrap, pending.public_identity(), now)
+            .unwrap();
+        let controller_outer = IrohOuter::bind_direct_only().await.unwrap();
+        let controller_addr = controller_outer.addr();
+        let membership = HostMembershipStore::new(layout.clone())
+            .activate_networked(
+                crate::ClientFlavor::clew_original_current(),
+                None,
+                "Live Status Lab",
+                &pending,
+                &receipt,
+                "LIVE-STATUS-TARGET",
+                controller_addr,
+                ReadPolicy::new(
+                    vec![temp.path().to_string_lossy().into_owned()],
+                    4_096,
+                    2_000,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        registry
+            .finalize_host_persist(invite_id, receipt.device_id, receipt.persist_ack_token())
+            .unwrap();
+        DeviceIdentityStore::new(layout.clone())
+            .confirm_controller_activation(controller.controller_id(), site_id, receipt.device_id)
+            .unwrap();
+
+        let expected_device = membership.identity.public_identity();
+        let expected_device_id = membership.marker.device_id;
+        let (controller_release_tx, controller_release_rx) = tokio::sync::oneshot::channel();
+        let controller_task = tokio::spawn({
+            let controller_outer = controller_outer.clone();
+            let controller = controller.clone();
+            async move {
+                let (protocol, mut stream) = controller_outer.accept_classified().await.unwrap();
+                assert_eq!(protocol, IrohProtocol::InnerSession);
+                let mut inner = InnerSession::accept(
+                    &mut stream,
+                    clew_transport::ControllerSessionIdentity {
+                        identity: controller,
+                        noise_static_secret: [110_u8; 32],
+                        expected_device,
+                        device_id: expected_device_id,
+                        site_id,
+                    },
+                )
+                .await
+                .unwrap();
+                let ready_payload = 7_u64.to_le_bytes().to_vec();
+                inner
+                    .send(
+                        &mut stream,
+                        &InnerMessage::new("session_ping", ready_payload.clone()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let ready = inner.recv(&mut stream).await.unwrap();
+                assert_eq!(ready.kind, "session_pong");
+                assert_eq!(ready.payload, ready_payload);
+                let _ = controller_release_rx.await;
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (status_tx, mut status_rx) = watch::channel(HostNetworkState::Offline);
+        let host_task = tokio::spawn({
+            let layout = layout.clone();
+            let membership = membership.clone();
+            async move {
+                serve_networked_membership_until_with_layout_and_status(
+                    &layout,
+                    &membership,
+                    async move {
+                        let mut shutdown_rx = shutdown_rx;
+                        while shutdown_rx.changed().await.is_ok() {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    },
+                    status_tx,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *status_rx.borrow() != HostNetworkState::Connected {
+                status_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Target B never reported an authenticated live Controller session");
+
+        let _ = controller_release_tx.send(());
+        controller_task.await.unwrap();
+        controller_outer.close().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *status_rx.borrow() != HostNetworkState::Reconnecting {
+                status_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Target B kept reporting Connected after Controller session loss");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), host_task)
+            .await
+            .expect("Host reconnect loop did not stop after shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(*status_rx.borrow(), HostNetworkState::Offline);
     }
 
     #[test]
@@ -1842,6 +2454,7 @@ mod tests {
                 bogus_controller,
                 controller_public,
                 site_id,
+                HostConnectionMode::Automatic,
             ),
         )
         .await
@@ -2010,6 +2623,7 @@ mod tests {
                     site_id,
                     helper_a_device,
                     lease_a,
+                    None,
                 )
                 .await
             }
@@ -2029,6 +2643,7 @@ mod tests {
                     site_id,
                     helper_b_device,
                     helper_b_lease,
+                    None,
                 )
                 .await
             }
@@ -2178,6 +2793,7 @@ mod tests {
         MdnsDelayed,
         NearbyFile,
         NearbyFileConnectorOnly,
+        NearbyFileRequireHelperDirectReachable,
     }
 
     #[tokio::test]
@@ -2194,6 +2810,12 @@ mod tests {
     #[tokio::test]
     async fn connector_only_launch_intent_downgrades_the_same_signed_site_kit() {
         run_no_public_connector_flow(NoPublicDiscovery::NearbyFileConnectorOnly).await;
+    }
+
+    #[tokio::test]
+    async fn require_helper_mode_uses_connector_even_when_controller_direct_is_reachable() {
+        run_no_public_connector_flow(NoPublicDiscovery::NearbyFileRequireHelperDirectReachable)
+            .await;
     }
 
     async fn run_no_public_connector_flow(discovery_mode: NoPublicDiscovery) {
@@ -2243,7 +2865,9 @@ mod tests {
         .unwrap();
         if matches!(
             discovery_mode,
-            NoPublicDiscovery::NearbyFile | NoPublicDiscovery::NearbyFileConnectorOnly
+            NoPublicDiscovery::NearbyFile
+                | NoPublicDiscovery::NearbyFileConnectorOnly
+                | NoPublicDiscovery::NearbyFileRequireHelperDirectReachable
         ) {
             let file = NearbyConnectorFile::from_helper(helper_addr.clone(), helper_lease.clone())
                 .unwrap();
@@ -2395,6 +3019,7 @@ mod tests {
                     site_id,
                     helper_device_id,
                     helper_lease,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2402,6 +3027,18 @@ mod tests {
         });
 
         let bogus_controller = EndpointAddr::new(SecretKey::from_bytes(&[113_u8; 32]).public());
+        let site_controller_endpoint =
+            if discovery_mode == NoPublicDiscovery::NearbyFileRequireHelperDirectReachable {
+                controller_addr.clone()
+            } else {
+                bogus_controller
+            };
+        let connection_mode =
+            if discovery_mode == NoPublicDiscovery::NearbyFileRequireHelperDirectReachable {
+                HostConnectionMode::ConnectorRequired
+            } else {
+                HostConnectionMode::Automatic
+            };
         let read_policy = ReadPolicy::new(
             vec![temp.path().join("share").to_string_lossy().into_owned()],
             4_096,
@@ -2414,7 +3051,7 @@ mod tests {
             profile,
             bootstrap,
             crate::HostRoleHint::ExecutePreferred,
-            bogus_controller,
+            site_controller_endpoint,
             read_policy,
             controller_bootstrap_public,
         )
@@ -2437,18 +3074,21 @@ mod tests {
         let activation_started = Instant::now();
         let (activation_timeout, path_window) = match discovery_mode {
             NoPublicDiscovery::MdnsDelayed => (Duration::from_secs(35), Duration::from_secs(8)),
-            NoPublicDiscovery::NearbyFile | NoPublicDiscovery::NearbyFileConnectorOnly => {
+            NoPublicDiscovery::NearbyFile
+            | NoPublicDiscovery::NearbyFileConnectorOnly
+            | NoPublicDiscovery::NearbyFileRequireHelperDirectReachable => {
                 (Duration::from_secs(15), Duration::from_secs(10))
             }
         };
         let activated = tokio::time::timeout(
             activation_timeout,
-            wait_for_networked_activation_until_with_timing(
+            wait_for_networked_activation_until_with_timing_and_mode(
                 &layout,
                 initial,
                 activation_shutdown_rx,
                 path_window,
                 Duration::from_millis(25),
+                connection_mode,
             ),
         )
         .await
@@ -2778,6 +3418,7 @@ mod tests {
                     site_id,
                     helper_device_id,
                     helper_read_lease,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2786,7 +3427,13 @@ mod tests {
         let target_membership = membership.clone();
         let target_layout = layout.clone();
         let target_read_task = tokio::spawn(async move {
-            serve_networked_membership_once_with_layout(&target_layout, &target_membership).await
+            serve_networked_membership_until_with_layout_mode(
+                &target_layout,
+                &target_membership,
+                std::future::pending(),
+                connection_mode,
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(12), controller_read_task)

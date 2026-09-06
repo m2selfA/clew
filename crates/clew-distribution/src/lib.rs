@@ -188,11 +188,14 @@ struct ClientFlavorCacheKeyMaterial<'a> {
     source_commit: &'a str,
     signing_mechanism: &'a str,
     signing_identity: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirty_payload_sha256: Option<&'a str>,
 }
 
-pub fn client_flavor_cache_key(
+fn client_flavor_cache_key_with_dirty_digest(
     client_flavor: &ReleaseClientFlavorInfo,
     payload: &PayloadManifest,
+    dirty_payload_sha256: Option<&str>,
 ) -> Result<String, DistributionError> {
     let (mechanism, identity) = payload
         .signing
@@ -208,11 +211,35 @@ pub fn client_flavor_cache_key(
         source_commit: &payload.source_commit,
         signing_mechanism: mechanism,
         signing_identity: identity,
+        dirty_payload_sha256,
     };
     Ok(format!(
         "client-flavor-v1-{}",
         sha256_bytes(&serde_json::to_vec(&material)?)
     ))
+}
+
+fn legacy_client_flavor_cache_key(
+    client_flavor: &ReleaseClientFlavorInfo,
+    payload: &PayloadManifest,
+) -> Result<String, DistributionError> {
+    client_flavor_cache_key_with_dirty_digest(client_flavor, payload, None)
+}
+
+pub fn client_flavor_cache_key(
+    client_flavor: &ReleaseClientFlavorInfo,
+    payload: &PayloadManifest,
+) -> Result<String, DistributionError> {
+    let dirty_payload_sha256 = payload
+        .dirty
+        .then(|| serde_json::to_vec(payload))
+        .transpose()?
+        .map(|bytes| sha256_bytes(&bytes));
+    client_flavor_cache_key_with_dirty_digest(
+        client_flavor,
+        payload,
+        dirty_payload_sha256.as_deref(),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -274,6 +301,14 @@ pub fn validate_cache_entry_dir(
     root: &Path,
     require_release_ready: bool,
 ) -> Result<ValidatedClientFlavorArtifact, DistributionError> {
+    validate_cache_entry_dir_with_policy(root, require_release_ready, false)
+}
+
+fn validate_cache_entry_dir_with_policy(
+    root: &Path,
+    require_release_ready: bool,
+    allow_dirty_local_acceptance: bool,
+) -> Result<ValidatedClientFlavorArtifact, DistributionError> {
     require_directory(root, "ClientFlavor cache entry")?;
     let dir_name = root
         .file_name()
@@ -313,7 +348,7 @@ pub fn validate_cache_entry_dir(
     {
         return Err(DistributionError::ArtifactMismatch);
     }
-    validate_release_shape(&entry, &release)?;
+    validate_release_shape(&entry, &release, allow_dirty_local_acceptance)?;
     verify_release_zip(&artifact_path, &release)?;
     let platform = ReleasePlatform::from_target(&entry.target)?;
     let arch = target_arch(&entry.target)?.to_owned();
@@ -329,6 +364,7 @@ pub fn validate_cache_entry_dir(
 fn validate_release_shape(
     entry: &ClientFlavorCacheEntry,
     release: &ArtifactManifest,
+    allow_dirty_local_acceptance: bool,
 ) -> Result<(), DistributionError> {
     let payload = &release.payload;
     validate_bounded_text(&payload.product, 32, "product")?;
@@ -347,9 +383,16 @@ fn validate_release_shape(
             validate_bounded_text(id, 128, "notary submission id")?;
         }
     }
+    if payload.dirty
+        && (!allow_dirty_local_acceptance
+            || !payload.unsigned
+            || payload.signing.is_some()
+            || payload.version.split('.').next() != Some("0"))
+    {
+        return Err(DistributionError::ReleaseMetadataMismatch);
+    }
     if payload.product != "clew"
         || payload.archive_format != "zip"
-        || payload.dirty
         || payload.version != entry.version
         || payload.target != entry.target
         || payload.profile != entry.profile
@@ -386,7 +429,13 @@ fn validate_release_shape(
     }
     let expected_key = client_flavor_cache_key(&entry.client_flavor, payload)?;
     if expected_key != entry.cache_key {
-        return Err(DistributionError::SemanticCacheKeyMismatch);
+        let legacy_dirty_key = payload
+            .dirty
+            .then(|| legacy_client_flavor_cache_key(&entry.client_flavor, payload))
+            .transpose()?;
+        if legacy_dirty_key.as_deref() != Some(entry.cache_key.as_str()) {
+            return Err(DistributionError::SemanticCacheKeyMismatch);
+        }
     }
     let platform = ReleasePlatform::from_target(&entry.target)?;
     match (
@@ -398,9 +447,13 @@ fn validate_release_shape(
         (SIGNED_RELEASE_SCHEMA_VERSION, false, Some(_)) => {}
         _ => return Err(DistributionError::InvalidSigningState),
     }
-    let expected_ready = match platform {
-        ReleasePlatform::Linux => payload.unsigned,
-        ReleasePlatform::Windows | ReleasePlatform::Macos => !payload.unsigned,
+    let expected_ready = if payload.dirty {
+        false
+    } else {
+        match platform {
+            ReleasePlatform::Linux => payload.unsigned,
+            ReleasePlatform::Windows | ReleasePlatform::Macos => !payload.unsigned,
+        }
     };
     if entry.release_ready != expected_ready {
         return Err(DistributionError::InvalidReleaseReadyState);
@@ -522,19 +575,46 @@ struct ActivePointer {
 #[derive(Clone, Debug)]
 pub struct ClientFlavorArtifactStore {
     root: PathBuf,
+    allow_dirty_local_acceptance: bool,
 }
 
 impl ClientFlavorArtifactStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, DistributionError> {
+        Self::new_with_policy(root, false)
+    }
+
+    pub fn new_local_acceptance(root: impl Into<PathBuf>) -> Result<Self, DistributionError> {
+        Self::new_with_policy(root, true)
+    }
+
+    fn new_with_policy(
+        root: impl Into<PathBuf>,
+        allow_dirty_local_acceptance: bool,
+    ) -> Result<Self, DistributionError> {
         let root = root.into();
         fs::create_dir_all(root.join("entries"))?;
         fs::create_dir_all(root.join("active"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            allow_dirty_local_acceptance,
+        })
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn validate_entry_dir(
+        &self,
+        root: &Path,
+        require_release_ready: bool,
+    ) -> Result<ValidatedClientFlavorArtifact, DistributionError> {
+        validate_cache_entry_dir_with_policy(
+            root,
+            require_release_ready,
+            self.allow_dirty_local_acceptance,
+        )
     }
 
     pub fn import_release_ready(
@@ -571,7 +651,7 @@ impl ClientFlavorArtifactStore {
         validate_flavor_id(&validated.entry.client_flavor.id)?;
         let destination = self.root.join("entries").join(&validated.entry.cache_key);
         if destination.exists() {
-            let existing = validate_cache_entry_dir(&destination, false)?;
+            let existing = self.validate_entry_dir(&destination, false)?;
             if existing.entry != validated.entry || existing.release != validated.release {
                 return Err(DistributionError::ImmutableCacheConflict);
             }
@@ -595,6 +675,14 @@ impl ClientFlavorArtifactStore {
             MAX_RELEASE_MANIFEST_BYTES,
         )?;
         let payload: PayloadManifest = serde_json::from_slice(&payload_bytes)?;
+        if payload.dirty
+            && (!self.allow_dirty_local_acceptance
+                || !payload.unsigned
+                || payload.signing.is_some()
+                || payload.version.split('.').next() != Some("0"))
+        {
+            return Err(DistributionError::ReleaseMetadataMismatch);
+        }
         if !payload.unsigned {
             return Err(DistributionError::SignedReleaseDirectoryRequiresNativeVerification);
         }
@@ -606,9 +694,13 @@ impl ClientFlavorArtifactStore {
         validate_cache_key(&cache_key)?;
         validate_flavor_id(&client_flavor.id)?;
         let platform = ReleasePlatform::from_target(&payload.target)?;
-        let release_ready = match platform {
-            ReleasePlatform::Linux => payload.unsigned,
-            ReleasePlatform::Windows | ReleasePlatform::Macos => !payload.unsigned,
+        let release_ready = if payload.dirty {
+            false
+        } else {
+            match platform {
+                ReleasePlatform::Linux => payload.unsigned,
+                ReleasePlatform::Windows | ReleasePlatform::Macos => !payload.unsigned,
+            }
         };
         let unsigned_zero_major = payload.unsigned
             && payload.signing.is_none()
@@ -618,7 +710,7 @@ impl ClientFlavorArtifactStore {
         }
         let destination = self.root.join("entries").join(&cache_key);
         if destination.exists() {
-            let existing = validate_cache_entry_dir(&destination, false)?;
+            let existing = self.validate_entry_dir(&destination, false)?;
             if existing.release.payload != payload {
                 return Err(DistributionError::ImmutableCacheConflict);
             }
@@ -681,7 +773,7 @@ impl ClientFlavorArtifactStore {
                 staging.join("cache-entry.json"),
                 serde_json::to_vec_pretty(&entry)?,
             )?;
-            let validated = validate_cache_entry_dir(&staging, false)?;
+            let validated = self.validate_entry_dir(&staging, false)?;
             if validated.entry != entry || validated.release != release {
                 return Err(DistributionError::CopyVerificationFailed);
             }
@@ -712,7 +804,7 @@ impl ClientFlavorArtifactStore {
             if !metadata.is_dir() || metadata.is_symlink() {
                 return Err(DistributionError::UnsafeStoreEntry);
             }
-            let validated = validate_cache_entry_dir(&entry.path(), false)?;
+            let validated = self.validate_entry_dir(&entry.path(), false)?;
             let active = self
                 .read_active_key(&validated.entry.client_flavor.id)?
                 .as_deref()
@@ -731,7 +823,7 @@ impl ClientFlavorArtifactStore {
         let Some(key) = self.read_active_key(client_flavor_id)? else {
             return Ok(None);
         };
-        let artifact = validate_cache_entry_dir(&self.root.join("entries").join(&key), false)?;
+        let artifact = self.validate_entry_dir(&self.root.join("entries").join(&key), false)?;
         if artifact.entry.client_flavor.id != client_flavor_id {
             return Err(DistributionError::ActivePointerFlavorMismatch);
         }
@@ -771,7 +863,7 @@ impl ClientFlavorArtifactStore {
             let file = fs::OpenOptions::new().write(true).open(&output)?;
             file.sync_all()?;
         }
-        let copied = validate_cache_entry_dir(&staging, false)?;
+        let copied = self.validate_entry_dir(&staging, false)?;
         if copied.entry != source.entry || copied.release != source.release {
             let _ = fs::remove_dir_all(&staging_parent);
             return Err(DistributionError::CopyVerificationFailed);
@@ -1395,6 +1487,77 @@ mod tests {
             .unwrap();
         assert_eq!(active.release.payload, release.payload);
         assert_eq!(store.list().unwrap(), vec![imported]);
+    }
+
+    #[test]
+    fn dirty_cache_identity_binds_exact_release_payload_while_clean_identity_stays_legacy() {
+        let source = tempfile::tempdir().unwrap();
+        let (entry_root, entry) = linux_cache_fixture(source.path());
+        let release: ArtifactManifest =
+            serde_json::from_slice(&fs::read(entry_root.join(&entry.manifest_file)).unwrap())
+                .unwrap();
+        assert_eq!(
+            client_flavor_cache_key(&entry.client_flavor, &release.payload).unwrap(),
+            legacy_client_flavor_cache_key(&entry.client_flavor, &release.payload).unwrap(),
+            "clean release cache identity must remain compatible with existing v1 entries"
+        );
+
+        let mut dirty = release.payload.clone();
+        dirty.dirty = true;
+        let first = client_flavor_cache_key(&entry.client_flavor, &dirty).unwrap();
+        assert_ne!(
+            first,
+            legacy_client_flavor_cache_key(&entry.client_flavor, &dirty).unwrap(),
+            "dirty acceptance builds must not collapse onto the legacy source-commit-only identity"
+        );
+        dirty.files[0].sha256 = "f".repeat(64);
+        let second = client_flavor_cache_key(&entry.client_flavor, &dirty).unwrap();
+        assert_ne!(
+            first, second,
+            "dirty runtime file changes must rotate cache identity"
+        );
+    }
+
+    #[test]
+    fn dirty_zero_major_runtime_is_allowed_only_in_explicit_local_acceptance_store() {
+        let source = tempfile::tempdir().unwrap();
+        let strict_root = tempfile::tempdir().unwrap();
+        let acceptance_root = tempfile::tempdir().unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+        let (entry_root, entry) = linux_cache_fixture(source.path());
+        let mut release: ArtifactManifest =
+            serde_json::from_slice(&fs::read(entry_root.join(&entry.manifest_file)).unwrap())
+                .unwrap();
+        release.payload.dirty = true;
+        fs::create_dir_all(extracted.path().join("bin")).unwrap();
+        fs::write(extracted.path().join("bin/clew"), b"elf").unwrap();
+        fs::write(
+            extracted.path().join("release-manifest.json"),
+            serde_json::to_vec_pretty(&release.payload).unwrap(),
+        )
+        .unwrap();
+
+        let strict = ClientFlavorArtifactStore::new(strict_root.path()).unwrap();
+        assert!(matches!(
+            strict.import_runtime_source(extracted.path()),
+            Err(DistributionError::ReleaseMetadataMismatch)
+        ));
+
+        let acceptance =
+            ClientFlavorArtifactStore::new_local_acceptance(acceptance_root.path()).unwrap();
+        let imported = acceptance.import_runtime_source(extracted.path()).unwrap();
+        assert!(imported.active);
+        assert!(!imported.release_ready);
+        let active = acceptance
+            .active_for_flavor(&entry.client_flavor.id)
+            .unwrap()
+            .unwrap();
+        assert!(active.release.payload.dirty);
+        assert_eq!(acceptance.list().unwrap(), vec![imported]);
+        assert!(matches!(
+            validate_cache_entry_dir(&active.root, false),
+            Err(DistributionError::ReleaseMetadataMismatch)
+        ));
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub fn assemble_site_kit(
         contract.start_here_name,
         artifact.platform,
         &profile,
+        request.site_file,
         request.site_bytes,
         &assets,
     )?;
@@ -293,19 +294,22 @@ fn common_files(
     start_here_name: &str,
     platform: ReleasePlatform,
     profile: &OutfitProfile,
+    site: &SignedSiteClew,
     site_bytes: &[u8],
     assets: &BTreeMap<String, SiteKitAsset>,
 ) -> Result<Vec<AssemblyFile>, DistributionError> {
+    let credential_id = site.site_access_credential_id();
+    let invite_id = site.payload.bootstrap.payload.invite_id.to_string();
     let mut files = vec![
         file("site.clew", site_bytes.to_vec(), 0o600),
         file(
             start_here_name,
-            start_html(profile, platform).into_bytes(),
+            start_html(profile, platform, &credential_id, &invite_id).into_bytes(),
             0o644,
         ),
         file(
             "Message to collaborator.txt",
-            format!("{}\n", profile.distribution_copy.chat_message_template).into_bytes(),
+            collaborator_message(profile, platform, &credential_id, &invite_id).into_bytes(),
             0o644,
         ),
     ];
@@ -908,7 +912,12 @@ fn file(path: impl Into<String>, bytes: Vec<u8>, mode: u32) -> AssemblyFile {
     }
 }
 
-fn start_html(profile: &OutfitProfile, platform: ReleasePlatform) -> String {
+fn start_html(
+    profile: &OutfitProfile,
+    platform: ReleasePlatform,
+    credential_id: &str,
+    invite_id: &str,
+) -> String {
     let title = html_escape(&profile.distribution_copy.start_here_title);
     let body = html_escape(&profile.distribution_copy.start_here_body);
     let support = profile
@@ -918,12 +927,34 @@ fn start_html(profile: &OutfitProfile, platform: ReleasePlatform) -> String {
         .map(|value| format!("<p>Support: {}</p>", html_escape(value)))
         .unwrap_or_default();
     let steps = if platform == ReleasePlatform::Windows {
-        "<ol><li>Double-click <b>Clew.exe</b> in this folder.</li><li>Choose <b>Use this computer</b> on the computer you want to access.</li><li>If it needs a nearby online helper, copy the same Site Kit there, open <b>Clew.exe</b>, and choose <b>Help nearby computers connect</b>.</li></ol>"
+        "<h2>Choose the setup that matches your network</h2><h3>A/B setup</h3><p>A is the Controller computer. B is the collaborator's target. If B can access the Internet: extract this Site Kit on B, open <b>Clew.exe</b>, and choose <b>Use this computer</b>.</p><h3>A/B/C setup</h3><p>A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Use this <b>same Site Kit</b> on B and C. On C, open <b>Clew.exe</b> and choose <b>Help nearby computers connect</b>. On B, open <b>Clew.exe</b> and choose <b>Use this computer</b>.</p>"
     } else {
-        "<ol><li>On the computer you want to use remotely, open the <b>1 Use this computer</b> launcher.</li><li>If that computer cannot reach the internet, copy this same Site Kit to a nearby online computer and open the <b>2 Help nearby computers</b> launcher.</li></ol>"
+        "<h2>Choose the setup that matches your network</h2><h3>A/B setup</h3><p>A is the Controller computer. B is the collaborator's target. If B can access the Internet: extract this Site Kit on B and open <b>1 Use this computer</b>.</p><h3>A/B/C setup</h3><p>A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Use this <b>same Site Kit</b> on B and C. On C, open <b>2 Help nearby computers</b>. On B, open <b>1 Use this computer</b>.</p>"
     };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p>{steps}<p>Keep this complete Site Kit together. The helper does not receive file or shell authority and cannot read the end-to-end protected session.</p>{support}</body></html>\n"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p><p><b>Site Access Credential:</b> <code>{}</code><br><b>InviteId:</b> <code>{}</code></p><p>Controller A should show the same Credential ID. If the IDs do not match, stop and confirm you have the intended Site Kit.</p>{steps}<p><b>The connection helper is not a target.</b> It receives no file or shell authority and cannot read the end-to-end protected target session.</p><p>If a private target keeps waiting because local discovery is blocked, use <b>Save Nearby Connection File...</b> on the helper, copy <code>nearby-connection.clew</code> to the target, and drop it onto the target's Clew window.</p>{support}</body></html>\n",
+        html_escape(credential_id),
+        html_escape(invite_id),
+    )
+}
+
+fn collaborator_message(
+    profile: &OutfitProfile,
+    platform: ReleasePlatform,
+    credential_id: &str,
+    invite_id: &str,
+) -> String {
+    let steps = if platform == ReleasePlatform::Windows {
+        "A/B: A is the Controller. B is the collaborator's target. If B can access the Internet, extract this archive on B, open Clew.exe, and choose “Use this computer”.\n\nA/B/C: A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Extract this same archive on B and C. On C, open Clew.exe and choose “Help nearby computers connect”. On B, open Clew.exe and choose “Use this computer”."
+    } else {
+        "A/B: A is the Controller. B is the collaborator's target. If B can access the Internet, extract this archive on B and open “1 Use this computer”.\n\nA/B/C: A is the Controller. B is the collaborator's private target. C is the collaborator's helper that can reach both B and the Internet. Extract this same archive on B and C. On C, open “2 Help nearby computers”. On B, open “1 Use this computer”."
+    };
+    format!(
+        "{}\n\nSite Access Credential: {}\nInviteId: {}\nController A should show the same Credential ID. If it does not match, stop and confirm you have the intended Site Kit.\n\n{}\n\nThe connection helper does not expose its files or commands. If the private target cannot find the helper automatically, use “Save Nearby Connection File...” on the helper and copy nearby-connection.clew to the target.\n",
+        profile.distribution_copy.chat_message_template.trim(),
+        credential_id,
+        invite_id,
+        steps
     )
 }
 
@@ -1220,6 +1251,14 @@ mod tests {
         assert_eq!(read_entry("Clew.exe"), b"signed-role-launcher");
         assert_eq!(read_entry(".clew-runtime/clew.exe"), b"signed-runtime");
         assert_eq!(read_entry("site.clew"), site_bytes);
+        let credential_id = site.site_access_credential_id();
+        let invite_id = site.payload.bootstrap.payload.invite_id.to_string();
+        let start_here = String::from_utf8(read_entry("Start Here.html")).unwrap();
+        assert!(start_here.contains(&credential_id));
+        assert!(start_here.contains(&invite_id));
+        let message = String::from_utf8(read_entry("Message to collaborator.txt")).unwrap();
+        assert!(message.contains(&credential_id));
+        assert!(message.contains(&invite_id));
     }
 
     #[test]

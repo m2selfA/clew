@@ -25,6 +25,7 @@ pub enum ControllerLifecycleOwner {
 pub struct ControllerConfig {
     state_root: PathBuf,
     lifecycle_owner: ControllerLifecycleOwner,
+    local_acceptance_runtime: bool,
 }
 
 impl ControllerConfig {
@@ -33,6 +34,7 @@ impl ControllerConfig {
         Self {
             state_root: state_root.into(),
             lifecycle_owner: ControllerLifecycleOwner::Foreground,
+            local_acceptance_runtime: false,
         }
     }
 
@@ -53,6 +55,17 @@ impl ControllerConfig {
     #[must_use]
     pub fn with_lifecycle_owner(mut self, lifecycle_owner: ControllerLifecycleOwner) -> Self {
         self.lifecycle_owner = lifecycle_owner;
+        self
+    }
+
+    #[must_use]
+    pub fn local_acceptance_runtime(&self) -> bool {
+        self.local_acceptance_runtime
+    }
+
+    #[must_use]
+    pub fn with_local_acceptance_runtime(mut self, enabled: bool) -> Self {
+        self.local_acceptance_runtime = enabled;
         self
     }
 
@@ -207,6 +220,16 @@ mod tests {
     fn endpoint_is_deterministic_for_state_root() {
         let config = ControllerConfig::new("test-state");
         assert_eq!(config.local_endpoint(), config.local_endpoint());
+    }
+
+    #[test]
+    fn local_acceptance_runtime_mode_is_explicit_and_off_by_default() {
+        let normal = ControllerConfig::new("normal-state");
+        assert!(!normal.local_acceptance_runtime());
+
+        let acceptance =
+            ControllerConfig::new("acceptance-state").with_local_acceptance_runtime(true);
+        assert!(acceptance.local_acceptance_runtime());
     }
 
     #[cfg(unix)]

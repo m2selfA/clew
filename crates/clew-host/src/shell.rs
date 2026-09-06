@@ -22,6 +22,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::target_path::expand_target_path;
+
 const WALL_DEADLINE_POLL_MS: u64 = 250;
 
 #[derive(Clone, Debug)]
@@ -222,7 +224,7 @@ impl HostShellService {
         env: BTreeMap<String, String>,
         timeout_ms: u32,
     ) -> ShellTaskReply {
-        let cwd = match self.canonical_allowed_cwd(Path::new(&cwd)).await {
+        let cwd = match self.canonical_allowed_cwd(&cwd).await {
             Ok(cwd) => cwd,
             Err(_) => {
                 return ShellTaskReply::error(
@@ -401,16 +403,23 @@ impl HostShellService {
         Ok(Arc::clone(&entry.state))
     }
 
-    async fn canonical_allowed_cwd(&self, requested: &Path) -> Result<PathBuf, ()> {
+    async fn canonical_allowed_cwd(&self, requested: &str) -> Result<PathBuf, ()> {
+        let requested = expand_target_path(requested).map_err(|_| ())?;
         if !requested.is_absolute() {
             return Err(());
         }
-        let cwd = tokio::fs::canonicalize(requested).await.map_err(|_| ())?;
+        let cwd = tokio::fs::canonicalize(&requested).await.map_err(|_| ())?;
         let metadata = tokio::fs::metadata(&cwd).await.map_err(|_| ())?;
         if !metadata.is_dir() {
             return Err(());
         }
+        if self.policy.all_filesystem {
+            return Ok(cwd);
+        }
         for root in &self.policy.roots {
+            let Ok(root) = expand_target_path(root) else {
+                continue;
+            };
             let Ok(root) = tokio::fs::canonicalize(root).await else {
                 continue;
             };

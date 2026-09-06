@@ -153,6 +153,27 @@ fn host_help_exposes_same_runtime_connector_only_entry() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--connector-only"), "{stdout}");
     assert!(stdout.contains("nearby connection helper"), "{stdout}");
+    assert!(stdout.contains("--require-helper"), "{stdout}");
+    assert!(stdout.contains("disable direct B-to-A dialing"), "{stdout}");
+}
+
+#[test]
+fn connector_only_and_require_helper_are_rejected_as_conflicting_roles() {
+    let output = Command::new(env!("CARGO_BIN_EXE_clew"))
+        .args([
+            "host",
+            "--connector-only",
+            "--require-helper",
+            "--foreground",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--require-helper is only valid for target B"),
+        "{stderr}"
+    );
 }
 
 #[test]

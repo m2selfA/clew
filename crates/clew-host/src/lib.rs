@@ -4,6 +4,8 @@ mod directory_tree;
 mod file_transfer;
 mod forward;
 mod instance;
+mod lan_discovery;
+mod managed_fs;
 mod membership;
 mod naming;
 mod nearby;
@@ -13,6 +15,7 @@ mod remote;
 mod runtime;
 mod shell;
 mod site;
+mod target_path;
 mod ui;
 
 pub use clew_core::{DeviceSelectionError, select_executable_device};
@@ -47,9 +50,15 @@ pub use outfit::{
 };
 pub use read::HostReadService;
 pub use remote::{
-    HostRemoteError, complete_networked_activation, serve_networked_membership_once,
+    HelperTunnelStatus, HostConnectionMode, HostNetworkState, HostRemoteError,
+    complete_networked_activation, serve_networked_membership_once,
     serve_networked_membership_once_with_layout, serve_networked_membership_until,
-    serve_networked_membership_until_with_layout, wait_for_networked_activation_until,
+    serve_networked_membership_until_with_layout,
+    serve_networked_membership_until_with_layout_and_status,
+    serve_networked_membership_until_with_layout_and_status_mode,
+    serve_networked_membership_until_with_layout_and_status_mode_and_helper_status,
+    serve_networked_membership_until_with_layout_mode, wait_for_networked_activation_until,
+    wait_for_networked_activation_until_with_connection_mode,
 };
 pub use runtime::{
     HostLaunchContext, HostLaunchError, HostLaunchMode, HostLaunchState, HostSiteSource,

@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clew_core::{
     ActivityEvent, ActivityResult, ControllerId, ControllerSiteRecord, DeviceId, DeviceRecord,
     DeviceSummary, ForwardId, InviteId, ProxyId, ReadPolicy, SiteId, StateLayout, TaskId,
-    TransferId,
+    TransferId, site_access_credential_id,
 };
 use clew_distribution::{
     ClientFlavorArtifactStore, ClientFlavorArtifactSummary, SITE_KIT_LAUNCHER_SCHEMA_VERSION,
@@ -24,11 +24,12 @@ use clew_host::{
 };
 use clew_identity::{PermissionGrant, RecoveryReview, SiteBootstrapSpec, StoredControllerIdentity};
 use clew_transport::{
-    FileConflictPolicy, FsGlobPage, FsGrepPage, FsMutationErrorBody, FsMutationErrorCode,
-    FsMutationReply, FsMutationRequest, FsMutationResult, FsPathInfo, FsQueryErrorBody,
-    FsQueryErrorCode, FsQueryReply, FsQueryRequest, FsWritePrecondition, IrohOuter, ReadErrorCode,
-    ReadReply, ReadRequest, ShellTaskErrorCode, ShellTaskOutput, ShellTaskPhase, ShellTaskReply,
-    ShellTaskRequest, ShellTaskStatus, TcpForwardDestination, noise_static_public,
+    FileConflictPolicy, FsControlResult, FsGlobPage, FsGrepPage, FsMutationErrorBody,
+    FsMutationErrorCode, FsMutationReply, FsMutationRequest, FsMutationResult, FsPathInfo,
+    FsQueryErrorBody, FsQueryErrorCode, FsQueryReply, FsQueryRequest, FsWritePrecondition,
+    IrohOuter, ReadErrorCode, ReadReply, ReadRequest, ShellTaskErrorCode, ShellTaskOutput,
+    ShellTaskPhase, ShellTaskReply, ShellTaskRequest, ShellTaskStatus, TcpForwardDestination,
+    noise_static_public,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -84,6 +85,38 @@ pub struct DeviceList {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SiteAccessCredentialSummary {
+    pub invite_id: InviteId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_id: Option<SiteId>,
+    pub site_name: String,
+    pub credential_id: String,
+    pub fingerprint_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix_ms: Option<u64>,
+    pub claim_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_claims: Option<u32>,
+    pub closed: bool,
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_write: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_shell: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_tcp_egress: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SiteAccessCredentialList {
+    pub credentials: Vec<SiteAccessCredentialSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InviteIssueRequest {
     pub site_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +125,8 @@ pub struct InviteIssueRequest {
     pub target_platform: Option<TargetPlatform>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_arch: Option<String>,
+    #[serde(default)]
+    pub all_filesystem: bool,
     pub roots: Vec<String>,
     pub max_claims: u32,
     pub valid_for_ms: u64,
@@ -186,6 +221,12 @@ pub struct RemoteEditRequest {
     pub expected_sha256: String,
     pub old: String,
     pub new: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteFsControlRequest {
+    pub device_id: DeviceId,
+    pub request: FsMutationRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -505,12 +546,19 @@ struct LocalRequest {
 enum LocalMethod {
     ControllerStatus,
     DeviceList,
+    CredentialList,
     SessionPathInfo {
         device_id: DeviceId,
     },
     InviteIssue(InviteIssueRequest),
     SiteKitCreate(SiteKitCreateRequest),
     InviteClose {
+        invite_id: InviteId,
+    },
+    InviteRevoke {
+        invite_id: InviteId,
+    },
+    InviteDelete {
         invite_id: InviteId,
     },
     DeviceRename {
@@ -526,6 +574,7 @@ enum LocalMethod {
     Grep(RemoteGrepRequest),
     Write(RemoteWriteRequest),
     Edit(RemoteEditRequest),
+    FsControl(RemoteFsControlRequest),
     ShellStart(RemoteShellStartRequest),
     ShellStatus {
         task_id: TaskId,
@@ -603,6 +652,7 @@ enum LocalMethod {
 enum LocalResponse {
     ControllerStatus(ControllerStatus),
     DeviceList(DeviceList),
+    CredentialList(SiteAccessCredentialList),
     SessionPathInfo(RemoteSessionPathInfo),
     InviteIssued(InviteIssueResult),
     SiteKitCreated(SiteKitCreateResult),
@@ -614,6 +664,7 @@ enum LocalResponse {
     Grep(FsGrepPage),
     FsQueryError(FsQueryErrorBody),
     FsMutationResult(FsMutationResult),
+    FsControlResult(FsControlResult),
     FsMutationError(FsMutationErrorBody),
     ShellTask(ShellTaskReply),
     ForwardInfo(ForwardInfo),
@@ -713,6 +764,7 @@ async fn dispatch(
             (LocalResponse::ControllerStatus(state.status.clone()), false)
         }
         LocalMethod::DeviceList => (device_list_response(state), false),
+        LocalMethod::CredentialList => (credential_list_response(state), false),
         LocalMethod::SessionPathInfo { device_id } => {
             (session_path_info_response(state, device_id), false)
         }
@@ -723,11 +775,51 @@ async fn dispatch(
         LocalMethod::InviteClose { invite_id } => {
             let response = with_control(state, |store| {
                 store.transaction(|snapshot| {
-                    snapshot.registry.close_invite(invite_id);
+                    snapshot.registry.close_invite(invite_id)?;
                     Ok(())
                 })
             })
             .map(|()| LocalResponse::Ack)
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::InviteRevoke { invite_id } => {
+            let response = with_control(state, |store| {
+                store.transaction(|snapshot| {
+                    let device_ids = snapshot.registry.revoke_invite(invite_id)?;
+                    for device_id in &device_ids {
+                        if snapshot.catalog.device(*device_id).is_some() {
+                            snapshot.catalog.revoke_device(*device_id)?;
+                        }
+                    }
+                    Ok(device_ids)
+                })
+            })
+            .map(|device_ids| {
+                for device_id in device_ids {
+                    state.remote.disconnect(device_id);
+                }
+                LocalResponse::Ack
+            })
+            .unwrap_or_else(LocalResponse::Error);
+            (response, false)
+        }
+        LocalMethod::InviteDelete { invite_id } => {
+            let response = with_control(state, |store| {
+                store.transaction(|snapshot| {
+                    let device_ids = snapshot.registry.delete_invite_history(invite_id)?;
+                    for device_id in &device_ids {
+                        snapshot.catalog.remove_device(*device_id);
+                    }
+                    Ok(device_ids)
+                })
+            })
+            .map(|device_ids| {
+                for device_id in device_ids {
+                    state.remote.disconnect(device_id);
+                }
+                LocalResponse::Ack
+            })
             .unwrap_or_else(LocalResponse::Error);
             (response, false)
         }
@@ -765,6 +857,7 @@ async fn dispatch(
         LocalMethod::Grep(request) => (grep_response(state, request).await, false),
         LocalMethod::Write(request) => (write_response(state, request).await, false),
         LocalMethod::Edit(request) => (edit_response(state, request).await, false),
+        LocalMethod::FsControl(request) => (fs_control_response(state, request).await, false),
         LocalMethod::ShellStart(request) => (shell_start_response(state, request).await, false),
         LocalMethod::ShellStatus { task_id } => (
             shell_followup_response(state, ShellTaskRequest::Status { task_id }, "shell_status")
@@ -1069,6 +1162,76 @@ fn device_list_response(state: &LocalApiState) -> LocalResponse {
     LocalResponse::DeviceList(DeviceList { devices })
 }
 
+fn credential_list_response(state: &LocalApiState) -> LocalResponse {
+    let store = match state.control.lock() {
+        Ok(store) => store,
+        Err(_) => {
+            return local_error(
+                LocalApiErrorCode::Internal,
+                "controller state is unavailable",
+            );
+        }
+    };
+    let snapshot = store.snapshot();
+    let mut credentials = snapshot
+        .registry
+        .credential_records()
+        .into_iter()
+        .filter_map(|record| {
+            let fingerprint = record.fingerprint?;
+            let fingerprint_sha256 = fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let credential_id = site_access_credential_id(record.invite_id);
+            let site_name = record
+                .site_name
+                .or_else(|| {
+                    record
+                        .site_id
+                        .and_then(|site_id| snapshot.catalog.site(site_id))
+                        .map(|site| site.site_name.clone())
+                })
+                .unwrap_or_else(|| "Previous Site".into());
+            let (allow_read, allow_write, allow_shell, allow_tcp_egress) = record
+                .grant
+                .map(|grant| {
+                    (
+                        Some(grant.read),
+                        Some(grant.write),
+                        Some(grant.shell),
+                        Some(grant.tcp_egress),
+                    )
+                })
+                .unwrap_or((None, None, None, None));
+            Some(SiteAccessCredentialSummary {
+                invite_id: record.invite_id,
+                site_id: record.site_id,
+                site_name,
+                credential_id,
+                fingerprint_sha256,
+                created_unix_ms: record.not_before_unix_ms,
+                expires_unix_ms: record.expires_unix_ms,
+                claim_count: record.claim_count,
+                max_claims: record.max_claims,
+                closed: record.closed,
+                revoked: record.revoked,
+                allow_read,
+                allow_write,
+                allow_shell,
+                allow_tcp_egress,
+            })
+        })
+        .collect::<Vec<_>>();
+    credentials.sort_by(|left, right| {
+        right
+            .created_unix_ms
+            .cmp(&left.created_unix_ms)
+            .then_with(|| right.invite_id.to_string().cmp(&left.invite_id.to_string()))
+    });
+    LocalResponse::CredentialList(SiteAccessCredentialList { credentials })
+}
+
 fn session_path_info_response(state: &LocalApiState, device_id: DeviceId) -> LocalResponse {
     let known = match state.control.lock() {
         Ok(store) => store.snapshot().catalog.device(device_id).is_some(),
@@ -1098,11 +1261,15 @@ async fn issue_invite_response(
     state: &LocalApiState,
     request: InviteIssueRequest,
 ) -> LocalResponse {
-    let read_policy = match ReadPolicy::new(
-        request.roots,
-        request.max_result_bytes,
-        request.read_timeout_ms,
-    ) {
+    let read_policy = match if request.all_filesystem {
+        ReadPolicy::all_filesystem(request.max_result_bytes, request.read_timeout_ms)
+    } else {
+        ReadPolicy::new(
+            request.roots,
+            request.max_result_bytes,
+            request.read_timeout_ms,
+        )
+    } {
         Ok(policy) => policy,
         Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
     };
@@ -1422,7 +1589,7 @@ fn site_kit_failure_after_issue(
 ) -> LocalResponse {
     match with_control(state, |store| {
         store.transaction(|snapshot| {
-            snapshot.registry.close_invite(invite_id);
+            snapshot.registry.close_invite(invite_id)?;
             Ok(())
         })
     }) {
@@ -1566,6 +1733,68 @@ async fn edit_response(state: &LocalApiState, request: RemoteEditRequest) -> Loc
         Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
     };
     fs_mutation_response(state, request.device_id, wire_request, "edit", request.path).await
+}
+
+async fn fs_control_response(
+    state: &LocalApiState,
+    request: RemoteFsControlRequest,
+) -> LocalResponse {
+    if matches!(
+        request.request,
+        FsMutationRequest::Write { .. } | FsMutationRequest::Edit { .. }
+    ) {
+        return local_error(
+            LocalApiErrorCode::InvalidRequest,
+            "fs_control accepts lifecycle/path-control operations only; use Write/Edit for text mutation",
+        );
+    }
+    if let Err(error) = request.request.validate() {
+        return local_error(LocalApiErrorCode::InvalidRequest, error.to_string());
+    }
+    let summary = fs_control_path_summary(&request.request);
+    fs_mutation_response(
+        state,
+        request.device_id,
+        request.request,
+        "fs_control",
+        summary,
+    )
+    .await
+}
+
+fn fs_control_path_summary(request: &FsMutationRequest) -> String {
+    match request {
+        FsMutationRequest::CreateDirectory { path } | FsMutationRequest::Trash { path } => {
+            path.clone()
+        }
+        FsMutationRequest::Copy {
+            source,
+            destination,
+        }
+        | FsMutationRequest::Move {
+            source,
+            destination,
+        } => format!("{source} -> {destination}"),
+        FsMutationRequest::TrashRestore { trash_id }
+        | FsMutationRequest::TrashPurgePrepare { trash_id }
+        | FsMutationRequest::TrashPurgeConfirm { trash_id, .. } => {
+            format!("trash:{trash_id}")
+        }
+        FsMutationRequest::TempCreate { description, .. } => {
+            let mut summary = description.trim().to_owned();
+            if summary.len() > 160 {
+                summary.truncate(160);
+            }
+            format!("managed-temp:{summary}")
+        }
+        FsMutationRequest::TempRelease { resource_id } => format!("temp:{resource_id}"),
+        FsMutationRequest::TrashList => "trash:list".into(),
+        FsMutationRequest::TempList => "managed-temp:list".into(),
+        FsMutationRequest::TempGc => "managed-temp:gc".into(),
+        FsMutationRequest::Write { path, .. } | FsMutationRequest::Edit { path, .. } => {
+            path.clone()
+        }
+    }
 }
 
 async fn shell_start_response(
@@ -2357,6 +2586,7 @@ async fn fs_mutation_response(
                 || !device.device.capabilities.execute
                 || !enrollment.effective_grant.write
                 || !site.read_policy.allows_read()
+                || !store.snapshot().registry.is_device_active(device_id)
             {
                 return local_error(
                     LocalApiErrorCode::Denied,
@@ -2405,6 +2635,11 @@ async fn fs_mutation_response(
                 bytes,
             )
         }
+        Ok(Ok(FsMutationReply::Control(result))) => (
+            LocalResponse::FsControlResult(result),
+            ActivityResult::Succeeded,
+            0,
+        ),
         Ok(Ok(FsMutationReply::Error(error))) => {
             let result = match error.code {
                 FsMutationErrorCode::Denied => ActivityResult::Denied,
@@ -2455,12 +2690,22 @@ async fn fs_query_response(
                 || !device.device.capabilities.execute
                 || !enrollment.effective_grant.read
                 || !site.read_policy.allows_read()
-                || requested_max_bytes
-                    .is_some_and(|max_bytes| max_bytes > site.read_policy.max_result_bytes)
+                || !store.snapshot().registry.is_device_active(device_id)
             {
                 return local_error(
                     LocalApiErrorCode::Denied,
-                    "read-only filesystem query is not permitted",
+                    "read-only filesystem query is not permitted for this device",
+                );
+            }
+            if let Some(max_bytes) = requested_max_bytes
+                && max_bytes > site.read_policy.max_result_bytes
+            {
+                return local_error(
+                    LocalApiErrorCode::InvalidRequest,
+                    format!(
+                        "filesystem query byte limit {max_bytes} exceeds this Site's signed maximum of {} bytes",
+                        site.read_policy.max_result_bytes
+                    ),
                 );
             }
             (site.site_id, site.read_policy.clone())
@@ -2605,6 +2850,10 @@ async fn fs_query_response(
 }
 
 async fn read_response(state: &LocalApiState, request: RemoteReadRequest) -> LocalResponse {
+    let wire_request = match ReadRequest::new(&request.path, request.offset, request.limit) {
+        Ok(request) => request,
+        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
+    };
     let (site_id, policy) = match state.control.lock() {
         Ok(store) => {
             let Some(device) = store.snapshot().catalog.device(request.device_id) else {
@@ -2621,9 +2870,24 @@ async fn read_response(state: &LocalApiState, request: RemoteReadRequest) -> Loc
                 || !device.device.capabilities.execute
                 || !enrollment.effective_grant.read
                 || !site.read_policy.allows_read()
-                || request.limit > site.read_policy.max_result_bytes
+                || !store
+                    .snapshot()
+                    .registry
+                    .is_device_active(request.device_id)
             {
-                return local_error(LocalApiErrorCode::Denied, "read is not permitted");
+                return local_error(
+                    LocalApiErrorCode::Denied,
+                    "read is not permitted for this device",
+                );
+            }
+            if request.limit > site.read_policy.max_result_bytes {
+                return local_error(
+                    LocalApiErrorCode::InvalidRequest,
+                    format!(
+                        "read limit {} exceeds this Site's signed maximum of {} bytes",
+                        request.limit, site.read_policy.max_result_bytes
+                    ),
+                );
             }
             (site.site_id, site.read_policy.clone())
         }
@@ -2633,11 +2897,6 @@ async fn read_response(state: &LocalApiState, request: RemoteReadRequest) -> Loc
                 "controller state is unavailable",
             );
         }
-    };
-
-    let wire_request = match ReadRequest::new(&request.path, request.offset, request.limit) {
-        Ok(request) => request,
-        Err(error) => return local_error(LocalApiErrorCode::InvalidRequest, error.to_string()),
     };
     let started = Instant::now();
     let remote_timeout = Duration::from_millis(u64::from(policy.timeout_ms).saturating_add(2_000));
@@ -2868,6 +3127,24 @@ impl LocalApiClient {
             .await
     }
 
+    pub async fn credential_list(&self) -> Result<SiteAccessCredentialList, LocalApiClientError> {
+        match self.request(LocalMethod::CredentialList).await? {
+            LocalResponse::CredentialList(credentials) => Ok(credentials),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn invite_revoke(&self, invite_id: InviteId) -> Result<(), LocalApiClientError> {
+        self.expect_ack(LocalMethod::InviteRevoke { invite_id })
+            .await
+    }
+
+    pub async fn invite_delete(&self, invite_id: InviteId) -> Result<(), LocalApiClientError> {
+        self.expect_ack(LocalMethod::InviteDelete { invite_id })
+            .await
+    }
+
     pub async fn device_rename(
         &self,
         device_id: DeviceId,
@@ -2963,6 +3240,21 @@ impl LocalApiClient {
         request: RemoteEditRequest,
     ) -> Result<FsMutationResult, LocalApiClientError> {
         self.fs_mutation(LocalMethod::Edit(request)).await
+    }
+
+    pub async fn fs_control(
+        &self,
+        request: RemoteFsControlRequest,
+    ) -> Result<FsControlResult, LocalApiClientError> {
+        match self.request(LocalMethod::FsControl(request)).await? {
+            LocalResponse::FsControlResult(result) => Ok(result),
+            LocalResponse::FsMutationError(error) => Err(LocalApiClientError::FsMutationRemote {
+                code: error.code,
+                message: error.message,
+            }),
+            LocalResponse::Error(error) => Err(remote_error(error)),
+            _ => Err(LocalApiClientError::UnexpectedResponse),
+        }
     }
 
     async fn fs_mutation(
@@ -3651,6 +3943,7 @@ mod tests {
             outfit_id: None,
             target_platform: None,
             target_arch: None,
+            all_filesystem: false,
             roots: vec!["C:/site-kit-test".into()],
             max_claims: 4,
             valid_for_ms: 60_000,
@@ -3682,6 +3975,157 @@ mod tests {
                 code: LocalApiErrorCode::Unauthorized,
                 ..
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn credential_lifecycle_rejects_unknown_invites() {
+        let state = test_state();
+        let secret = LocalApiSecret("a".repeat(SECRET_HEX_LEN));
+        let invite_id = InviteId::new();
+
+        for method in [
+            LocalMethod::InviteClose { invite_id },
+            LocalMethod::InviteRevoke { invite_id },
+            LocalMethod::InviteDelete { invite_id },
+        ] {
+            let (response, shutdown_after_reply) = dispatch(
+                LocalRequest {
+                    api_version: LOCAL_API_VERSION,
+                    auth: secret.0.clone(),
+                    method,
+                },
+                &secret,
+                &state,
+            )
+            .await;
+            assert!(!shutdown_after_reply);
+            assert!(matches!(
+                response,
+                LocalResponse::Error(LocalApiErrorBody {
+                    code: LocalApiErrorCode::InvalidRequest,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_revoke_and_delete_update_device_projection_and_keep_history_fail_closed() {
+        let state = test_state();
+        let invite_id = InviteId::new();
+        let site_id = SiteId::new();
+        let now = unix_ms_value().unwrap();
+        let controller = state.controller_identity.identity();
+        let bootstrap = with_control(&state, |store| {
+            store.transaction(|snapshot| {
+                snapshot.catalog.upsert_site(ControllerSiteRecord {
+                    site_id,
+                    site_name: "Credential Lifecycle".into(),
+                    read_policy: ReadPolicy::new(vec!["C:/credential-test".into()], 4_096, 1_000)
+                        .unwrap(),
+                    revoked: false,
+                })?;
+                Ok(snapshot.registry.issue_bootstrap(
+                    controller,
+                    SiteBootstrapSpec {
+                        site_id,
+                        invite_id,
+                        site_name: "Credential Lifecycle".into(),
+                        grant: PermissionGrant::EXECUTE_READ,
+                        not_before_unix_ms: now.saturating_sub(1_000),
+                        expires_unix_ms: now + 60_000,
+                        deployment_window_ms: 30_000,
+                        max_claims: 4,
+                    },
+                )?)
+            })
+        })
+        .unwrap();
+        let device_identity = DeviceIdentity::generate().unwrap();
+        let device_id = with_control(&state, |store| {
+            store.transaction(|snapshot| {
+                let receipt =
+                    snapshot
+                        .registry
+                        .claim(&bootstrap, device_identity.public_identity(), now)?;
+                let enrollment = snapshot.registry.finalize_host_persist(
+                    receipt.invite_id,
+                    receipt.device_id,
+                    receipt.persist_ack_token(),
+                )?;
+                snapshot.catalog.register_device(DeviceRecord {
+                    device_id: receipt.device_id,
+                    site_id: receipt.site_id,
+                    display_name: "CREDENTIAL-TARGET".into(),
+                    hostname_observed: "CREDENTIAL-TARGET".into(),
+                    capabilities: enrollment.effective_grant.member,
+                    enrolled_via_invite_id: receipt.invite_id,
+                    name_origin: clew_core::DeviceNameOrigin::Automatic {
+                        base_hostname: "CREDENTIAL-TARGET".into(),
+                        tagged: false,
+                        tag_generation: 0,
+                    },
+                })?;
+                Ok(receipt.device_id)
+            })
+        })
+        .unwrap();
+
+        let LocalResponse::CredentialList(before) = credential_list_response(&state) else {
+            panic!("expected credential list");
+        };
+        assert_eq!(before.credentials.len(), 1);
+        assert_eq!(before.credentials[0].invite_id, invite_id);
+        assert_eq!(before.credentials[0].claim_count, 1);
+        assert!(!before.credentials[0].revoked);
+
+        let secret = LocalApiSecret("a".repeat(SECRET_HEX_LEN));
+        let (revoke, _) = dispatch(
+            LocalRequest {
+                api_version: LOCAL_API_VERSION,
+                auth: secret.0.clone(),
+                method: LocalMethod::InviteRevoke { invite_id },
+            },
+            &secret,
+            &state,
+        )
+        .await;
+        assert!(matches!(revoke, LocalResponse::Ack));
+        let LocalResponse::DeviceList(after_revoke) = device_list_response(&state) else {
+            panic!("expected device list");
+        };
+        let revoked_device = after_revoke
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .unwrap();
+        assert!(!revoked_device.executable);
+        assert!(!revoked_device.connector);
+
+        let (delete, _) = dispatch(
+            LocalRequest {
+                api_version: LOCAL_API_VERSION,
+                auth: secret.0.clone(),
+                method: LocalMethod::InviteDelete { invite_id },
+            },
+            &secret,
+            &state,
+        )
+        .await;
+        assert!(matches!(delete, LocalResponse::Ack));
+        let LocalResponse::CredentialList(after_delete) = credential_list_response(&state) else {
+            panic!("expected credential list");
+        };
+        assert!(after_delete.credentials.is_empty());
+        let LocalResponse::DeviceList(devices_after_delete) = device_list_response(&state) else {
+            panic!("expected device list");
+        };
+        assert!(devices_after_delete.devices.is_empty());
+        let store = state.control.lock().unwrap();
+        assert!(matches!(
+            store.snapshot().registry.clone().register_pass(&bootstrap),
+            Err(EnrollmentError::InviteRevoked)
         ));
     }
 

@@ -23,11 +23,14 @@ use tokio::{
     time::timeout,
 };
 
+use crate::target_path::expand_target_path;
+
 const HARD_MAX_MUTATION_REPLAY_ENTRIES: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct HostReadService {
     policy: ReadPolicy,
+    managed_root: Option<PathBuf>,
     mutation_replay: Arc<Mutex<MutationReplayCache>>,
 }
 
@@ -50,6 +53,19 @@ impl HostReadService {
         policy.validate()?;
         Ok(Self {
             policy,
+            managed_root: None,
+            mutation_replay: Arc::new(Mutex::new(MutationReplayCache::default())),
+        })
+    }
+
+    pub fn with_managed_root(
+        policy: ReadPolicy,
+        managed_root: PathBuf,
+    ) -> Result<Self, clew_core::ControlModelError> {
+        policy.validate()?;
+        Ok(Self {
+            policy,
+            managed_root: Some(managed_root),
             mutation_replay: Arc::new(Mutex::new(MutationReplayCache::default())),
         })
     }
@@ -66,8 +82,14 @@ impl HostReadService {
                 "invalid bounded Read request",
             );
         }
-        if !self.policy.allows_read() || request.limit > self.policy.max_result_bytes {
+        if !self.policy.allows_read() {
             return ReadReply::error(ReadErrorCode::Denied, "Read is outside the allowed policy");
+        }
+        if request.limit > self.policy.max_result_bytes {
+            return ReadReply::error(
+                ReadErrorCode::InvalidRequest,
+                "Read byte limit exceeds the signed Site policy",
+            );
         }
         match timeout(
             Duration::from_millis(self.policy.timeout_ms as u64),
@@ -101,8 +123,8 @@ impl HostReadService {
         };
         if requested_max_bytes.is_some_and(|max_bytes| max_bytes > self.policy.max_result_bytes) {
             return FsQueryReply::error(
-                FsQueryErrorCode::Denied,
-                "filesystem query byte limit exceeds the allowed policy",
+                FsQueryErrorCode::InvalidRequest,
+                "filesystem query byte limit exceeds the signed Site policy",
             );
         }
         let operation = async {
@@ -172,7 +194,7 @@ impl HostReadService {
                 "invalid bounded filesystem mutation",
             );
         }
-        if !allow_write || self.policy.roots.is_empty() {
+        if !allow_write || !self.policy.allows_read() {
             return FsMutationReply::error(
                 FsMutationErrorCode::Denied,
                 "filesystem mutation is outside the allowed policy",
@@ -229,10 +251,11 @@ impl HostReadService {
 
         if launch_worker {
             let policy = self.policy.clone();
+            let managed_root = self.managed_root.clone();
             let replay = Arc::clone(&self.mutation_replay);
             tokio::spawn(async move {
                 let reply = match tokio::task::spawn_blocking(move || {
-                    execute_mutation_blocking(&policy, request)
+                    execute_mutation_blocking(&policy, managed_root.as_deref(), request_id, request)
                 })
                 .await
                 {
@@ -295,8 +318,7 @@ impl HostReadService {
     }
 
     async fn read_once(&self, request: ReadRequest) -> ReadReply {
-        let requested = PathBuf::from(&request.path);
-        let target = match self.canonical_allowed(&requested).await {
+        let target = match self.canonical_allowed(&request.path).await {
             Ok(path) => path,
             Err(PathAccessError::NotAbsolute | PathAccessError::OutsideRoots) => {
                 return ReadReply::error(
@@ -344,8 +366,7 @@ impl HostReadService {
     }
 
     async fn path_info_once(&self, path: String) -> FsQueryReply {
-        let requested = PathBuf::from(&path);
-        let target = match self.canonical_allowed(&requested).await {
+        let target = match self.canonical_allowed(&path).await {
             Ok(path) => path,
             Err(error) => return fs_access_error(error),
         };
@@ -367,8 +388,7 @@ impl HostReadService {
         limit: u32,
         max_bytes: u32,
     ) -> FsQueryReply {
-        let requested = PathBuf::from(&root);
-        let root = match self.canonical_allowed(&requested).await {
+        let root = match self.canonical_allowed(&root).await {
             Ok(path) => path,
             Err(error) => return fs_access_error(error),
         };
@@ -510,8 +530,7 @@ impl HostReadService {
         max_bytes: u32,
         max_scan_bytes: u64,
     ) -> FsQueryReply {
-        let requested = PathBuf::from(&root);
-        let root = match self.canonical_allowed(&requested).await {
+        let root = match self.canonical_allowed(&root).await {
             Ok(path) => path,
             Err(error) => return fs_access_error(error),
         };
@@ -651,18 +670,25 @@ impl HostReadService {
         grep_page(state, false)
     }
 
-    async fn canonical_allowed(&self, requested: &Path) -> Result<PathBuf, PathAccessError> {
+    async fn canonical_allowed(&self, requested: &str) -> Result<PathBuf, PathAccessError> {
+        let requested = expand_target_path(requested).map_err(|_| PathAccessError::NotAbsolute)?;
         if !requested.is_absolute() {
             return Err(PathAccessError::NotAbsolute);
         }
-        let target = tokio::fs::canonicalize(requested).await.map_err(|error| {
+        let target = tokio::fs::canonicalize(&requested).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 PathAccessError::NotFound
             } else {
                 PathAccessError::Io
             }
         })?;
+        if self.policy.all_filesystem {
+            return Ok(target);
+        }
         for root in &self.policy.roots {
+            let Ok(root) = expand_target_path(root) else {
+                continue;
+            };
             let Ok(root) = tokio::fs::canonicalize(root).await else {
                 continue;
             };
@@ -873,7 +899,12 @@ fn mutation_request_fingerprint(request: &FsMutationRequest) -> Result<[u8; 32],
     Ok(fingerprint)
 }
 
-fn execute_mutation_blocking(policy: &ReadPolicy, request: FsMutationRequest) -> FsMutationReply {
+fn execute_mutation_blocking(
+    policy: &ReadPolicy,
+    managed_root: Option<&Path>,
+    request_id: RequestId,
+    request: FsMutationRequest,
+) -> FsMutationReply {
     match request {
         FsMutationRequest::Write {
             path,
@@ -993,6 +1024,7 @@ fn execute_mutation_blocking(policy: &ReadPolicy, request: FsMutationRequest) ->
                 Err(reply) => reply,
             }
         }
+        request => crate::managed_fs::execute_control(policy, managed_root, request_id, request),
     }
 }
 
@@ -1007,9 +1039,12 @@ fn read_existing_mutation_target(
     policy: &ReadPolicy,
     requested: &str,
 ) -> Result<ExistingMutationTarget, FsMutationReply> {
-    let requested = PathBuf::from(requested);
+    let requested = expand_target_path(requested)
+        .map_err(|_| mutation_denied("mutation path must be absolute or use ~/..."))?;
     if !requested.is_absolute() {
-        return Err(mutation_denied("mutation path must be absolute"));
+        return Err(mutation_denied(
+            "mutation path must be absolute or use ~/...",
+        ));
     }
     let metadata = match fs::symlink_metadata(&requested) {
         Ok(metadata) => metadata,
@@ -1061,9 +1096,12 @@ fn read_existing_mutation_target(
 }
 
 fn prepare_create_target(policy: &ReadPolicy, requested: &str) -> Result<PathBuf, FsMutationReply> {
-    let requested = PathBuf::from(requested);
+    let requested = expand_target_path(requested)
+        .map_err(|_| mutation_denied("mutation path must be absolute or use ~/..."))?;
     if !requested.is_absolute() {
-        return Err(mutation_denied("mutation path must be absolute"));
+        return Err(mutation_denied(
+            "mutation path must be absolute or use ~/...",
+        ));
     }
     let Some(Component::Normal(file_name)) = requested.components().next_back() else {
         return Err(FsMutationReply::error(
@@ -1100,7 +1138,13 @@ fn prepare_create_target(policy: &ReadPolicy, requested: &str) -> Result<PathBuf
 }
 
 fn ensure_allowed_path(policy: &ReadPolicy, path: &Path) -> Result<(), FsMutationReply> {
+    if policy.all_filesystem {
+        return Ok(());
+    }
     for root in &policy.roots {
+        let Ok(root) = expand_target_path(root) else {
+            continue;
+        };
         let Ok(root) = fs::canonicalize(root) else {
             continue;
         };
@@ -1746,7 +1790,7 @@ mod tests {
             .await;
         assert!(matches!(
             too_large,
-            ReadReply::Error(error) if error.code == ReadErrorCode::Denied
+            ReadReply::Error(error) if error.code == ReadErrorCode::InvalidRequest
         ));
     }
 }

@@ -19,3 +19,8 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Development snapshot
+local-acceptance
+dist-local-acceptance-current
+dist-local-acceptance

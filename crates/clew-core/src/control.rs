@@ -14,6 +14,8 @@ pub const HARD_ACTIVITY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReadPolicy {
+    #[serde(default)]
+    pub all_filesystem: bool,
     pub roots: Vec<String>,
     pub max_result_bytes: u32,
     pub timeout_ms: u32,
@@ -26,7 +28,22 @@ impl ReadPolicy {
         timeout_ms: u32,
     ) -> Result<Self, ControlModelError> {
         let policy = Self {
+            all_filesystem: false,
             roots,
+            max_result_bytes,
+            timeout_ms,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn all_filesystem(
+        max_result_bytes: u32,
+        timeout_ms: u32,
+    ) -> Result<Self, ControlModelError> {
+        let policy = Self {
+            all_filesystem: true,
+            roots: Vec::new(),
             max_result_bytes,
             timeout_ms,
         };
@@ -37,6 +54,7 @@ impl ReadPolicy {
     #[must_use]
     pub fn deny_all() -> Self {
         Self {
+            all_filesystem: false,
             roots: Vec::new(),
             max_result_bytes: HARD_MAX_READ_RESULT_BYTES,
             timeout_ms: 5_000,
@@ -44,6 +62,9 @@ impl ReadPolicy {
     }
 
     pub fn validate(&self) -> Result<(), ControlModelError> {
+        if self.all_filesystem && !self.roots.is_empty() {
+            return Err(ControlModelError::AmbiguousFilesystemScope);
+        }
         if self.roots.len() > HARD_MAX_READ_ROOTS {
             return Err(ControlModelError::TooManyReadRoots(self.roots.len()));
         }
@@ -66,7 +87,7 @@ impl ReadPolicy {
 
     #[must_use]
     pub fn allows_read(&self) -> bool {
-        !self.roots.is_empty()
+        self.all_filesystem || !self.roots.is_empty()
     }
 }
 
@@ -164,6 +185,10 @@ impl ControllerCatalog {
         Ok(())
     }
 
+    pub fn remove_device(&mut self, device_id: DeviceId) -> Option<ControllerDeviceRecord> {
+        self.devices.remove(&device_id)
+    }
+
     pub fn revoke_site(&mut self, site_id: SiteId) -> Result<Vec<DeviceId>, ControlModelError> {
         let site = self
             .sites
@@ -240,6 +265,8 @@ fn validate_name(value: &str) -> Result<String, ControlModelError> {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ControlModelError {
+    #[error("read policy cannot combine all-filesystem scope with explicit roots")]
+    AmbiguousFilesystemScope,
     #[error("read policy has too many roots: {0}")]
     TooManyReadRoots(usize),
     #[error("read root must be 1..={HARD_MAX_READ_ROOT_BYTES} UTF-8 bytes")]
@@ -286,6 +313,26 @@ mod tests {
             ReadPolicy::new(vec!["D:/shared".into()], HARD_MAX_READ_RESULT_BYTES + 1, 1).is_err()
         );
         assert!(ReadPolicy::new(vec!["x".repeat(HARD_MAX_READ_ROOT_BYTES + 1)], 1, 1).is_err());
+    }
+
+    #[test]
+    fn all_filesystem_is_explicit_and_cannot_mix_with_roots() {
+        let policy = ReadPolicy::all_filesystem(4096, 2000).unwrap();
+        assert!(policy.all_filesystem);
+        assert!(policy.roots.is_empty());
+        assert!(policy.allows_read());
+
+        let ambiguous = ReadPolicy {
+            all_filesystem: true,
+            roots: vec!["D:/shared".into()],
+            max_result_bytes: 4096,
+            timeout_ms: 2000,
+        };
+        assert_eq!(
+            ambiguous.validate(),
+            Err(ControlModelError::AmbiguousFilesystemScope)
+        );
+        assert!(!ReadPolicy::deny_all().allows_read());
     }
 
     #[test]

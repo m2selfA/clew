@@ -47,8 +47,10 @@ pub use file_transfer::{
     MAX_FILE_TRANSFER_RPC_PAYLOAD_BYTES, MIN_FILE_CHUNK_BYTES, sha256_hex as file_sha256_hex,
 };
 pub use fs_mutation::{
-    FsMutationErrorBody, FsMutationErrorCode, FsMutationProtocolError, FsMutationReply,
-    FsMutationRequest, FsMutationResult, FsWritePrecondition, HARD_MAX_EDIT_FRAGMENT_BYTES,
+    FsControlResult, FsManagedTempKind, FsManagedTempResource, FsMutationErrorBody,
+    FsMutationErrorCode, FsMutationProtocolError, FsMutationReply, FsMutationRequest,
+    FsMutationResult, FsTrashItem, FsWritePrecondition, HARD_MAX_EDIT_FRAGMENT_BYTES,
+    HARD_MAX_FS_CONTROL_DESCRIPTION_BYTES, HARD_MAX_FS_CONTROL_ITEMS, HARD_MAX_MANAGED_TEMP_TTL_MS,
     HARD_MAX_WRITE_TEXT_BYTES, normalize_sha256_hex,
 };
 pub use fs_query::{

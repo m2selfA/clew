@@ -112,6 +112,15 @@ define_stable_id!(ForwardId);
 define_stable_id!(ForwardConnectionId);
 define_stable_id!(ProxyId);
 
+#[must_use]
+pub fn site_access_credential_id(invite_id: InviteId) -> String {
+    let bytes = invite_id.as_bytes();
+    format!(
+        "CRED-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +146,13 @@ mod tests {
         assert!(
             serde_json::from_str::<DeviceId>("\"00000000-0000-0000-0000-000000000000\"").is_err()
         );
+    }
+
+    #[test]
+    fn site_access_credential_id_is_short_stable_and_non_secret() {
+        let invite: InviteId = "019c9df1-d5be-7a9e-b9d3-b612e3f6dfd0".parse().unwrap();
+        assert_eq!(site_access_credential_id(invite), "CRED-019C9DF1D5BE");
+        assert_eq!(site_access_credential_id(invite).len(), 17);
     }
 
     #[test]

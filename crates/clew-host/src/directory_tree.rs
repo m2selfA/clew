@@ -15,6 +15,8 @@ use clew_transport::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::target_path::expand_target_path;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannedDirectoryTree {
     canonical_root: PathBuf,
@@ -65,11 +67,13 @@ pub fn scan_authorized_directory_tree(
         return Err(DirectoryTreeScanError::InvalidRoot);
     }
     let canonical = fs::canonicalize(root)?;
-    let allowed = policy.roots.iter().any(|allowed_root| {
-        fs::canonicalize(allowed_root)
-            .map(|allowed_root| canonical.starts_with(allowed_root))
-            .unwrap_or(false)
-    });
+    let allowed = policy.all_filesystem
+        || policy.roots.iter().any(|allowed_root| {
+            expand_target_path(allowed_root)
+                .ok()
+                .and_then(|allowed_root| fs::canonicalize(allowed_root).ok())
+                .is_some_and(|allowed_root| canonical.starts_with(allowed_root))
+        });
     if !allowed {
         return Err(DirectoryTreeScanError::OutsideAllowedRoots);
     }
@@ -252,7 +256,7 @@ impl HostDirectoryTreeService {
                 self.can_get && allow_read
             }
         };
-        if !permitted || self.policy.roots.is_empty() {
+        if !permitted || !self.policy.allows_read() {
             return DirectoryTreeReply::error(
                 DirectoryTreeErrorCode::Denied,
                 "directory transfer is not permitted by this device grant",
@@ -373,11 +377,16 @@ impl HostDirectoryTreeService {
     }
 
     fn get_root(&self, device_root: &str) -> Result<PathBuf, DirectoryTreeReply> {
-        let requested = PathBuf::from(device_root);
+        let requested = expand_target_path(device_root).map_err(|_| {
+            DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "device directory source must be absolute or use ~/...",
+            )
+        })?;
         if !requested.is_absolute() {
             return Err(DirectoryTreeReply::error(
                 DirectoryTreeErrorCode::Denied,
-                "device directory source must be absolute",
+                "device directory source must be absolute or use ~/...",
             ));
         }
         let metadata = fs::symlink_metadata(&requested).map_err(|error| {
@@ -567,11 +576,16 @@ impl HostDirectoryTreeService {
                 "invalid directory Put manifest",
             ));
         }
-        let requested = PathBuf::from(&manifest.device_root);
+        let requested = expand_target_path(&manifest.device_root).map_err(|_| {
+            DirectoryTreeReply::error(
+                DirectoryTreeErrorCode::Denied,
+                "directory destination must be absolute or use ~/...",
+            )
+        })?;
         if !requested.is_absolute() {
             return Err(DirectoryTreeReply::error(
                 DirectoryTreeErrorCode::Denied,
-                "directory destination must be absolute",
+                "directory destination must be absolute or use ~/...",
             ));
         }
         let Some(std::path::Component::Normal(_)) = requested.components().next_back() else {
@@ -592,11 +606,14 @@ impl HostDirectoryTreeService {
                 "directory destination parent was not found",
             )
         })?;
-        if !self.policy.roots.iter().any(|root| {
-            fs::canonicalize(root)
-                .map(|root| parent.starts_with(root))
-                .unwrap_or(false)
-        }) {
+        if !self.policy.all_filesystem
+            && !self.policy.roots.iter().any(|root| {
+                expand_target_path(root)
+                    .ok()
+                    .and_then(|root| fs::canonicalize(root).ok())
+                    .is_some_and(|root| parent.starts_with(root))
+            })
+        {
             return Err(DirectoryTreeReply::error(
                 DirectoryTreeErrorCode::Denied,
                 "directory destination is outside signed roots",

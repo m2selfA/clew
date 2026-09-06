@@ -20,6 +20,8 @@ mod service;
 mod service_gui;
 #[cfg(any(windows, target_os = "macos"))]
 mod studio;
+#[cfg(windows)]
+mod windows_firewall;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -27,10 +29,12 @@ use clew_core::{
     DeviceId, ForwardId, InviteId, ProxyId, TaskId, TransferId, select_executable_device,
 };
 use clew_host::{
-    HostInstanceStart, HostLaunchContext, HostLaunchMode, HostLaunchState, OutfitBuildAsset,
-    OutfitBuildSpec, OutfitPreset, TargetPlatform, acquire_host_instance,
-    resolve_host_launch_with_mode, serve_networked_membership_until_with_layout,
-    verify_outfit_asset_bytes, wait_for_networked_activation_until,
+    HelperTunnelStatus, HostConnectionMode, HostInstanceStart, HostLaunchContext, HostLaunchMode,
+    HostLaunchState, HostNetworkState, OutfitBuildAsset, OutfitBuildSpec, OutfitPreset,
+    TargetPlatform, acquire_host_instance, resolve_host_launch_with_mode,
+    serve_networked_membership_until_with_layout_and_status_mode_and_helper_status,
+    serve_networked_membership_until_with_layout_mode, verify_outfit_asset_bytes,
+    wait_for_networked_activation_until_with_connection_mode,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use clew_host::{HostMembershipStore, HostSiteSource};
@@ -119,7 +123,11 @@ struct MintArgs {
     /// Rust target architecture name for the target runtime, for example x86_64 or aarch64.
     #[arg(long, value_name = "ARCH", requires = "target_platform")]
     target_arch: Option<String>,
-    #[arg(long = "root", value_name = "DIR", required = true)]
+    /// Allow the target's whole filesystem as visible to its OS account instead of Clew roots.
+    #[arg(long)]
+    all_filesystem: bool,
+    /// Restrict Clew to one or more target roots. Required unless --all-filesystem is used.
+    #[arg(long = "root", value_name = "DIR")]
     roots: Vec<PathBuf>,
     #[arg(long, value_name = "FILE", default_value = "site.clew")]
     output: PathBuf,
@@ -133,7 +141,7 @@ struct MintArgs {
     max_result_bytes: u32,
     #[arg(long, default_value_t = 5_000)]
     read_timeout_ms: u32,
-    /// Explicitly grant bounded V2 Edit/Write authority inside the signed roots.
+    /// Explicitly grant V2 Edit/Write authority inside the signed filesystem scope.
     #[arg(long)]
     allow_write: bool,
     /// Explicitly grant V2 Shell task authority. Disabled by default.
@@ -161,16 +169,30 @@ enum Command {
         /// Use this Site Kit only as a nearby connection helper. This can only reduce authority.
         #[arg(long)]
         connector_only: bool,
+        /// Require target B to use a verified nearby helper C and disable direct B-to-A dialing.
+        /// This only reduces connectivity and is intended for private-network validation.
+        #[arg(long)]
+        require_helper: bool,
     },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsHelperFirewallEnsure,
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsHelperFirewallInstall,
     /// Run the persistent local Controller, or attach to the existing owner.
     Controller {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        local_acceptance_runtime: bool,
     },
     /// Open the Controller GUI. Starts the Controller automatically if needed.
     Gui {
         #[arg(long, value_name = "DIR")]
         state_dir: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        local_acceptance_runtime: bool,
     },
     #[command(alias = "invite")]
     /// Create a signed networked site.clew invitation for this Controller platform.
@@ -687,6 +709,45 @@ fn outfit_build_export_cli_from_process_args() -> Option<OutfitBuildExportCli> {
     ))
 }
 
+async fn run_controller(
+    state_dir: Option<PathBuf>,
+    local_acceptance_runtime: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config =
+        controller_config(state_dir)?.with_local_acceptance_runtime(local_acceptance_runtime);
+    let config = match std::env::var_os("CLEW_CONTROLLER_LIFECYCLE") {
+        None => config,
+        Some(value) if value == "systemd-user" => {
+            #[cfg(target_os = "linux")]
+            {
+                config.with_lifecycle_owner(ControllerLifecycleOwner::SystemdUser)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err("systemd-user controller lifecycle is available on Linux only".into());
+            }
+        }
+        Some(_) => return Err("unsupported CLEW_CONTROLLER_LIFECYCLE value".into()),
+    };
+    match start_controller(config).await? {
+        ControllerStart::Primary(runtime) => {
+            let status = runtime.status().clone();
+            println!(
+                "Clew controller ready (pid {}, instance {}).",
+                status.pid, status.instance_id
+            );
+            runtime.serve_until(wait_for_controller_signal()).await?;
+        }
+        ControllerStart::Existing(status) => {
+            println!(
+                "Clew controller already running (pid {}, instance {}).",
+                status.pid, status.instance_id
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run_service(cli: ServiceCli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.action == service::ServiceAction::Gui {
         if cli.scope != service::ServiceScope::Machine {
@@ -759,69 +820,64 @@ fn relaunch_packaged_gui() -> Result<bool, Box<dyn std::error::Error>> {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        #[cfg(windows)]
+        Command::WindowsHelperFirewallEnsure => {
+            windows_firewall::ensure_current_helper_firewall()
+                .map_err(|error| format!("helper firewall setup failed: {error}"))?;
+        }
+        #[cfg(windows)]
+        Command::WindowsHelperFirewallInstall => {
+            windows_firewall::install_current_helper_firewall()
+                .map_err(|error| format!("helper firewall install failed: {error}"))?;
+        }
         Command::Host {
             site,
             state_dir,
             foreground,
             connector_only,
+            require_helper,
         } => {
+            if connector_only && require_helper {
+                return Err("--require-helper is only valid for target B; helper C must connect directly to Controller A".into());
+            }
+            #[cfg(windows)]
+            if connector_only {
+                windows_firewall::ensure_current_helper_firewall()
+                    .map_err(|error| format!("helper firewall setup failed: {error}"))?;
+            }
             let launch_mode = if connector_only {
                 HostLaunchMode::ConnectorOnly
             } else {
                 HostLaunchMode::Default
             };
-            run_host(site, state_dir, foreground, launch_mode).await?
-        }
-        Command::Controller { state_dir } => {
-            let config = controller_config(state_dir)?;
-            let config = match std::env::var_os("CLEW_CONTROLLER_LIFECYCLE") {
-                None => config,
-                Some(value) if value == "systemd-user" => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        config.with_lifecycle_owner(ControllerLifecycleOwner::SystemdUser)
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        return Err(
-                            "systemd-user controller lifecycle is available on Linux only".into(),
-                        );
-                    }
-                }
-                Some(_) => {
-                    return Err("unsupported CLEW_CONTROLLER_LIFECYCLE value".into());
-                }
+            let connection_mode = if require_helper {
+                HostConnectionMode::ConnectorRequired
+            } else {
+                HostConnectionMode::Automatic
             };
-            match start_controller(config).await? {
-                ControllerStart::Primary(runtime) => {
-                    let status = runtime.status().clone();
-                    println!(
-                        "Clew controller ready (pid {}, instance {}).",
-                        status.pid, status.instance_id
-                    );
-                    runtime.serve_until(wait_for_controller_signal()).await?;
-                }
-                ControllerStart::Existing(status) => {
-                    println!(
-                        "Clew controller already running (pid {}, instance {}).",
-                        status.pid, status.instance_id
-                    );
-                }
-            }
+            run_host(site, state_dir, foreground, launch_mode, connection_mode).await?
         }
-        Command::Gui { state_dir } => {
+        Command::Controller {
+            state_dir,
+            local_acceptance_runtime,
+        } => run_controller(state_dir, local_acceptance_runtime).await?,
+        Command::Gui {
+            state_dir,
+            local_acceptance_runtime,
+        } => {
             #[cfg(windows)]
             if state_dir.is_none() && relaunch_packaged_gui()? {
                 return Ok(());
             }
             #[cfg(any(windows, target_os = "macos"))]
             {
-                let config = controller_config(state_dir)?;
+                let config = controller_config(state_dir)?
+                    .with_local_acceptance_runtime(local_acceptance_runtime);
                 gui::run(config).await?;
             }
             #[cfg(not(any(windows, target_os = "macos")))]
             {
-                let _ = state_dir;
+                let _ = (state_dir, local_acceptance_runtime);
                 return Err(
                     "Controller GUI is available on Windows and macOS; use `clew controller` on Linux"
                         .into(),
@@ -833,6 +889,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             outfit,
             target_platform,
             target_arch,
+            all_filesystem,
             roots,
             output,
             max_claims,
@@ -845,6 +902,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             allow_tcp_egress,
             state_dir,
         }) => {
+            if all_filesystem && !roots.is_empty() {
+                return Err("--all-filesystem cannot be combined with --root".into());
+            }
+            if !all_filesystem && roots.is_empty() {
+                return Err(
+                    "mint requires at least one --root unless --all-filesystem is used".into(),
+                );
+            }
             let valid_for_ms = valid_hours
                 .checked_mul(60 * 60 * 1_000)
                 .ok_or("invite validity is too large")?;
@@ -859,6 +924,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     outfit_id: outfit,
                     target_platform: target_platform.map(Into::into),
                     target_arch,
+                    all_filesystem,
                     roots: roots
                         .into_iter()
                         .map(|path| path.to_string_lossy().into_owned())
@@ -1691,20 +1757,21 @@ async fn run_host(
     state_dir: Option<PathBuf>,
     foreground: bool,
     launch_mode: HostLaunchMode,
+    connection_mode: HostConnectionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let layout = controller_config(state_dir)?.state_layout();
     let context = HostLaunchContext::current(site, layout.clone())?;
     let state = resolve_host_launch_with_mode(context.clone(), launch_mode)?;
 
     if foreground {
-        return run_host_foreground(&layout, state).await;
+        return run_host_foreground(&layout, state, connection_mode).await;
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
-    return run_host_foreground(&layout, state).await;
+    return run_host_foreground(&layout, state, connection_mode).await;
 
     #[cfg(any(windows, target_os = "macos"))]
-    return run_host_desktop(layout, context, state, launch_mode).await;
+    return run_host_desktop(layout, context, state, launch_mode, connection_mode).await;
 }
 
 async fn wait_for_host_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -1724,10 +1791,28 @@ async fn run_host_network_lifecycle(
     state: HostLaunchState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     state_tx: Option<tokio::sync::mpsc::UnboundedSender<HostLaunchState>>,
+    network_tx: tokio::sync::watch::Sender<HostNetworkState>,
+    helper_status_tx: tokio::sync::watch::Sender<HelperTunnelStatus>,
+    connection_mode: HostConnectionMode,
 ) -> Result<(), clew_host::HostRemoteError> {
-    let Some(state) = wait_for_networked_activation_until(&layout, state, shutdown.clone()).await?
-    else {
-        return Ok(());
+    network_tx.send_replace(HostNetworkState::Connecting);
+    let state = match wait_for_networked_activation_until_with_connection_mode(
+        &layout,
+        state,
+        shutdown.clone(),
+        connection_mode,
+    )
+    .await
+    {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            network_tx.send_replace(HostNetworkState::Offline);
+            return Ok(());
+        }
+        Err(error) => {
+            network_tx.send_replace(HostNetworkState::Unavailable);
+            return Err(error);
+        }
     };
     if let Some(state_tx) = &state_tx {
         let _ = state_tx.send(state.clone());
@@ -1735,14 +1820,19 @@ async fn run_host_network_lifecycle(
     if let HostLaunchState::Active { membership, .. } = state
         && membership.marker.controller_endpoint.is_some()
     {
-        return serve_networked_membership_until_with_layout(
+        return serve_networked_membership_until_with_layout_and_status_mode_and_helper_status(
             &layout,
             &membership,
             wait_for_host_shutdown(shutdown),
+            network_tx,
+            helper_status_tx,
+            connection_mode,
         )
         .await;
     }
+    network_tx.send_replace(HostNetworkState::Unavailable);
     wait_for_host_shutdown(shutdown).await;
+    network_tx.send_replace(HostNetworkState::Offline);
     Ok(())
 }
 
@@ -1770,6 +1860,7 @@ async fn wait_for_host_process_signal() {
 async fn run_host_foreground(
     layout: &clew_core::StateLayout,
     state: HostLaunchState,
+    connection_mode: HostConnectionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let key = state.instance_key()?;
     let instance = match acquire_host_instance(layout, key).await? {
@@ -1797,8 +1888,13 @@ async fn run_host_foreground(
     });
 
     let result = async {
-        let Some(state) =
-            wait_for_networked_activation_until(layout, state, shutdown_rx.clone()).await?
+        let Some(state) = wait_for_networked_activation_until_with_connection_mode(
+            layout,
+            state,
+            shutdown_rx.clone(),
+            connection_mode,
+        )
+        .await?
         else {
             return Ok::<(), clew_host::HostRemoteError>(());
         };
@@ -1806,10 +1902,11 @@ async fn run_host_foreground(
         if let HostLaunchState::Active { membership, .. } = state
             && membership.marker.controller_endpoint.is_some()
         {
-            serve_networked_membership_until_with_layout(
+            serve_networked_membership_until_with_layout_mode(
                 layout,
                 &membership,
                 wait_for_host_shutdown(shutdown_rx.clone()),
+                connection_mode,
             )
             .await?;
         } else {
@@ -1833,6 +1930,7 @@ async fn run_host_desktop(
     mut context: HostLaunchContext,
     mut state: HostLaunchState,
     launch_mode: HostLaunchMode,
+    connection_mode: HostConnectionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let key = state.instance_key()?;
@@ -1854,6 +1952,17 @@ async fn run_host_desktop(
 
         let (network_shutdown_tx, network_shutdown_rx) = tokio::sync::watch::channel(false);
         let (state_tx, state_rx) = tokio::sync::mpsc::unbounded_channel();
+        let initial_network_state = if matches!(
+            state,
+            HostLaunchState::Active { .. } | HostLaunchState::AwaitingEnrollment { .. }
+        ) {
+            HostNetworkState::Connecting
+        } else {
+            HostNetworkState::Offline
+        };
+        let (network_tx, network_rx) = tokio::sync::watch::channel(initial_network_state);
+        let (helper_status_tx, helper_status_rx) =
+            tokio::sync::watch::channel(HelperTunnelStatus::default());
         let network = if matches!(
             state,
             HostLaunchState::Active { .. } | HostLaunchState::AwaitingEnrollment { .. }
@@ -1866,15 +1975,27 @@ async fn run_host_desktop(
                     network_state,
                     network_shutdown_rx,
                     Some(state_tx),
+                    network_tx,
+                    helper_status_tx,
+                    connection_mode,
                 )
                 .await
             }))
         } else {
             drop(state_tx);
+            drop(network_tx);
+            drop(helper_status_tx);
             None
         };
 
-        let action = host_gui::run(&layout, state, wake_rx, state_rx)?;
+        let action = host_gui::run(
+            &layout,
+            state,
+            wake_rx,
+            state_rx,
+            network_rx,
+            helper_status_rx,
+        )?;
         let _ = network_shutdown_tx.send(true);
         let _ = instance_shutdown_tx.send(());
         server.await??;

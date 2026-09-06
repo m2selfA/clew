@@ -10,6 +10,7 @@ clew-transport = { path = "../clew-transport" }
 getrandom.workspace = true
 hostname.workspace = true
 iroh.workspace = true
+netdev.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,3 +18,4 @@ tempfile.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+trash.workspace = true
